@@ -8,7 +8,7 @@ mod audio;
 
 #[derive(Parser, Debug)]
 #[command(
-    name = "snd-display",
+    name = "snd-review",
     about = "Display an audio file as a scrollable, zoomable multi-channel waveform",
     after_help = "Supports WAV, FLAC, MP3, OGG, M4A, and other formats enabled by Symphonia."
 )]

@@ -1,18 +1,20 @@
 use std::{path::PathBuf, sync::Arc};
 
 use gpui::{
-    canvas, div, fill, point, px, size, AppContext as _, Bounds, Context, DispatchPhase, Entity,
-    InteractiveElement as _, IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, ParentElement as _, PathBuilder, Pixels, Render, ScrollWheelEvent, SharedString,
-    StatefulInteractiveElement as _, Styled as _, TitlebarOptions, Window, WindowBounds,
-    WindowOptions,
+    actions, canvas, div, fill, point, px, size, App, AppContext as _, Bounds, Context,
+    DispatchPhase, Entity, InteractiveElement as _, IntoElement, KeyBinding, Menu, MenuItem,
+    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement as _, PathBuilder,
+    Pixels, Render, ScrollWheelEvent, SharedString, StatefulInteractiveElement as _, Styled as _,
+    TitlebarOptions, Window, WindowBounds, WindowOptions,
 };
 use gpui_component::{
     button::{Button, ButtonVariants as _},
     h_flex,
     plot::scale::{Scale as _, ScaleLinear},
-    v_flex, ActiveTheme as _, Root, Sizable as _, StyledExt as _, Theme, ThemeMode,
+    v_flex, ActiveTheme as _, Root, Sizable as _, StyledExt as _, Theme, ThemeMode, WindowExt as _,
 };
+
+actions!(snd_review, [About, Quit]);
 
 use crate::audio::{self, DecodedAudio};
 
@@ -339,7 +341,7 @@ fn paint_scrollbar(
 }
 
 impl Render for AppView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
         let audio = self.audio.clone();
         let start_sample = self.start_sample;
@@ -355,234 +357,277 @@ impl Render for AppView {
             self.visible_duration_label()
         );
 
-        v_flex()
+        div()
+            .relative()
             .size_full()
-            .bg(theme.background)
-            .text_color(theme.foreground)
             .child(
-                h_flex()
-                    .w_full()
-                    .flex_none()
-                    .px_3()
-                    .py_2()
-                    .gap_2()
-                    .items_center()
-                    .border_b_1()
-                    .border_color(theme.border)
-                    .bg(theme.title_bar)
+                v_flex()
+                    .size_full()
+                    .bg(theme.background)
+                    .text_color(theme.foreground)
+                    .child(
+                        h_flex()
+                            .w_full()
+                            .flex_none()
+                            .px_3()
+                            .py_2()
+                            .gap_2()
+                            .items_center()
+                            .border_b_1()
+                            .border_color(theme.border)
+                            .bg(theme.title_bar)
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .text_sm()
+                                    .text_color(theme.muted_foreground)
+                                    .whitespace_nowrap()
+                                    .overflow_hidden()
+                                    .child(meta),
+                            )
+                            .child(Button::new("zoom-out").small().label("Zoom Out").on_click(
+                                cx.listener(|this, _, _, cx| {
+                                    let anchor = this.start_sample + this.visible_samples() * 0.5;
+                                    this.zoom_at(ZOOM_FACTOR, anchor);
+                                    cx.notify();
+                                }),
+                            ))
+                            .child(Button::new("zoom-in").small().label("Zoom In").on_click(
+                                cx.listener(|this, _, _, cx| {
+                                    let anchor = this.start_sample + this.visible_samples() * 0.5;
+                                    this.zoom_at(1.0 / ZOOM_FACTOR, anchor);
+                                    cx.notify();
+                                }),
+                            ))
+                            .child(
+                                Button::new("zoom-fit")
+                                    .small()
+                                    .primary()
+                                    .label("Fit")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.fit();
+                                        cx.notify();
+                                    })),
+                            ),
+                    )
                     .child(
                         div()
+                            .id("waveform")
                             .flex_1()
-                            .min_w_0()
-                            .text_sm()
-                            .text_color(theme.muted_foreground)
-                            .whitespace_nowrap()
-                            .overflow_hidden()
-                            .child(meta),
-                    )
-                    .child(
-                        Button::new("zoom-out")
-                            .small()
-                            .label("Zoom Out")
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                let anchor = this.start_sample + this.visible_samples() * 0.5;
-                                this.zoom_at(ZOOM_FACTOR, anchor);
-                                cx.notify();
-                            })),
-                    )
-                    .child(
-                        Button::new("zoom-in")
-                            .small()
-                            .label("Zoom In")
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                let anchor = this.start_sample + this.visible_samples() * 0.5;
-                                this.zoom_at(1.0 / ZOOM_FACTOR, anchor);
-                                cx.notify();
-                            })),
-                    )
-                    .child(
-                        Button::new("zoom-fit")
-                            .small()
-                            .primary()
-                            .label("Fit")
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.fit();
-                                cx.notify();
-                            })),
-                    ),
-            )
-            .child(
-                div()
-                    .id("waveform")
-                    .flex_1()
-                    .w_full()
-                    .min_h_0()
-                    .overflow_y_scroll()
-                    .child(
-                        v_flex()
                             .w_full()
-                            .h_full()
-                            .children((0..audio.channel_count()).map(|ch| {
-                                let audio = audio.clone();
-                                let entity = entity.clone();
-                                let color = channel_color(&theme, ch);
-                                let zero = theme.border;
-                                let label = audio.channel_label(ch);
-                                h_flex()
-                                    .id(SharedString::from(format!("lane-{ch}")))
-                                    .w_full()
+                            .min_h_0()
+                            .overflow_y_scroll()
+                            .child(v_flex().w_full().h_full().children(
+                                (0..audio.channel_count()).map(|ch| {
+                                    let audio = audio.clone();
+                                    let entity = entity.clone();
+                                    let color = channel_color(&theme, ch);
+                                    let zero = theme.border;
+                                    let label = audio.channel_label(ch);
+                                    h_flex()
+                                        .id(SharedString::from(format!("lane-{ch}")))
+                                        .w_full()
+                                        .flex_1()
+                                        .min_h(px(MIN_LANE_HEIGHT))
+                                        .border_b_1()
+                                        .border_color(theme.border)
+                                        .child(
+                                            div()
+                                                .w(px(48.))
+                                                .flex_none()
+                                                .h_full()
+                                                .items_center()
+                                                .justify_center()
+                                                .border_r_1()
+                                                .border_color(theme.border)
+                                                .text_xs()
+                                                .font_semibold()
+                                                .text_color(theme.muted_foreground)
+                                                .child(label),
+                                        )
+                                        .child(
+                                            canvas(
+                                                {
+                                                    let entity = entity.clone();
+                                                    move |bounds, _, cx| {
+                                                        entity.update(cx, |this, cx| {
+                                                            this.remember_viewport(bounds, cx);
+                                                        });
+                                                        bounds
+                                                    }
+                                                },
+                                                {
+                                                    let audio = audio.clone();
+                                                    move |bounds, _, window, _cx| {
+                                                        paint_lane(
+                                                            bounds,
+                                                            &audio,
+                                                            ch,
+                                                            start_sample,
+                                                            samples_per_pixel,
+                                                            color,
+                                                            zero,
+                                                            window,
+                                                        );
+                                                    }
+                                                },
+                                            )
+                                            .flex_1()
+                                            .h_full(),
+                                        )
+                                }),
+                            ))
+                            .on_scroll_wheel(cx.listener(
+                                |this, event: &ScrollWheelEvent, _, cx| {
+                                    let delta = event.delta.pixel_delta(px(16.));
+                                    let dx = delta.x.as_f32();
+                                    let dy = delta.y.as_f32();
+                                    if event.modifiers.control || event.modifiers.platform {
+                                        let mag = if dx.abs() > dy.abs() { dx } else { dy };
+                                        let factor = if mag < 0.0 {
+                                            1.0 / ZOOM_FACTOR
+                                        } else {
+                                            ZOOM_FACTOR
+                                        };
+                                        let anchor = this.sample_at_x(event.position.x.as_f32());
+                                        this.zoom_at(factor, anchor);
+                                    } else {
+                                        let pan = if dx.abs() > dy.abs() { dx } else { dy };
+                                        this.pan_pixels(pan);
+                                    }
+                                    cx.notify();
+                                },
+                            ))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, event: &MouseDownEvent, _, cx| {
+                                    this.drag = Some(Drag::Waveform {
+                                        last_x: event.position.x.as_f32(),
+                                    });
+                                    cx.notify();
+                                }),
+                            ),
+                    )
+                    .child({
+                        let frames = audio.frames();
+                        let start = start_sample;
+                        let spp = samples_per_pixel;
+                        let track = theme.scrollbar;
+                        let thumb = theme.scrollbar_thumb;
+                        let entity = entity.clone();
+                        h_flex()
+                            .id("h-scroll")
+                            .w_full()
+                            .h(px(SCROLLBAR_HEIGHT))
+                            .flex_none()
+                            .border_t_1()
+                            .border_color(theme.border)
+                            .child(
+                                div()
+                                    .w(px(48.))
+                                    .h_full()
+                                    .flex_none()
+                                    .border_r_1()
+                                    .border_color(theme.border),
+                            )
+                            .child(
+                                div()
+                                    .id("h-scroll-track")
                                     .flex_1()
-                                    .min_h(px(MIN_LANE_HEIGHT))
-                                    .border_b_1()
-                                    .border_color(theme.border)
-                                    .child(
-                                        div()
-                                            .w(px(48.))
-                                            .flex_none()
-                                            .h_full()
-                                            .items_center()
-                                            .justify_center()
-                                            .border_r_1()
-                                            .border_color(theme.border)
-                                            .text_xs()
-                                            .font_semibold()
-                                            .text_color(theme.muted_foreground)
-                                            .child(label),
-                                    )
+                                    .h_full()
                                     .child(
                                         canvas(
                                             {
                                                 let entity = entity.clone();
                                                 move |bounds, _, cx| {
-                                                    entity.update(cx, |this, cx| {
-                                                        this.remember_viewport(bounds, cx);
+                                                    entity.update(cx, |this, _cx| {
+                                                        this.remember_scrollbar(bounds);
                                                     });
                                                     bounds
                                                 }
                                             },
-                                            {
-                                                let audio = audio.clone();
-                                                move |bounds, _, window, _cx| {
-                                                    paint_lane(
-                                                        bounds,
-                                                        &audio,
-                                                        ch,
-                                                        start_sample,
-                                                        samples_per_pixel,
-                                                        color,
-                                                        zero,
-                                                        window,
-                                                    );
-                                                }
+                                            move |bounds, _, window, _cx| {
+                                                paint_scrollbar(
+                                                    bounds, frames, start, spp, track, thumb,
+                                                    window,
+                                                );
+                                                install_global_drag_listeners(
+                                                    entity.clone(),
+                                                    window,
+                                                );
                                             },
                                         )
-                                        .flex_1()
-                                        .h_full(),
+                                        .size_full(),
                                     )
-                            })),
-                    )
-                    .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, _, cx| {
-                        let delta = event.delta.pixel_delta(px(16.));
-                        let dx = delta.x.as_f32();
-                        let dy = delta.y.as_f32();
-                        if event.modifiers.control || event.modifiers.platform {
-                            let mag = if dx.abs() > dy.abs() { dx } else { dy };
-                            let factor = if mag < 0.0 {
-                                1.0 / ZOOM_FACTOR
-                            } else {
-                                ZOOM_FACTOR
-                            };
-                            let anchor = this.sample_at_x(event.position.x.as_f32());
-                            this.zoom_at(factor, anchor);
-                        } else {
-                            let pan = if dx.abs() > dy.abs() { dx } else { dy };
-                            this.pan_pixels(pan);
-                        }
-                        cx.notify();
-                    }))
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|this, event: &MouseDownEvent, _, cx| {
-                            this.drag = Some(Drag::Waveform {
-                                last_x: event.position.x.as_f32(),
-                            });
-                            cx.notify();
-                        }),
-                    ),
-            )
-            .child({
-                let frames = audio.frames();
-                let start = start_sample;
-                let spp = samples_per_pixel;
-                let track = theme.scrollbar;
-                let thumb = theme.scrollbar_thumb;
-                let entity = entity.clone();
-                h_flex()
-                    .id("h-scroll")
-                    .w_full()
-                    .h(px(SCROLLBAR_HEIGHT))
-                    .flex_none()
-                    .border_t_1()
-                    .border_color(theme.border)
-                    .child(
-                        div()
-                            .w(px(48.))
-                            .h_full()
-                            .flex_none()
-                            .border_r_1()
-                            .border_color(theme.border),
-                    )
-                    .child(
-                        div()
-                            .id("h-scroll-track")
-                            .flex_1()
-                            .h_full()
-                            .child(
-                                canvas(
-                                    {
-                                        let entity = entity.clone();
-                                        move |bounds, _, cx| {
-                                            entity.update(cx, |this, _cx| {
-                                                this.remember_scrollbar(bounds);
-                                            });
-                                            bounds
-                                        }
-                                    },
-                                    move |bounds, _, window, _cx| {
-                                        paint_scrollbar(
-                                            bounds, frames, start, spp, track, thumb, window,
-                                        );
-                                        install_global_drag_listeners(entity.clone(), window);
-                                    },
-                                )
-                                .size_full(),
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(|this, event: &MouseDownEvent, _, cx| {
+                                            let x = event.position.x.as_f32();
+                                            let track_w = this.scrollbar_width.max(1.0);
+                                            let (thumb_w, thumb_x) = scrollbar_geom(
+                                                this.audio.frames(),
+                                                this.start_sample,
+                                                this.samples_per_pixel,
+                                                track_w,
+                                            );
+                                            let local = x - this.scrollbar_origin_x;
+                                            let grab_offset =
+                                                if local >= thumb_x && local <= thumb_x + thumb_w {
+                                                    local - thumb_x
+                                                } else {
+                                                    thumb_w * 0.5
+                                                };
+                                            this.set_start_from_scrollbar_x(x, grab_offset);
+                                            this.drag = Some(Drag::Scrollbar { grab_offset });
+                                            cx.notify();
+                                        }),
+                                    ),
                             )
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(|this, event: &MouseDownEvent, _, cx| {
-                                    let x = event.position.x.as_f32();
-                                    let track_w = this.scrollbar_width.max(1.0);
-                                    let (thumb_w, thumb_x) = scrollbar_geom(
-                                        this.audio.frames(),
-                                        this.start_sample,
-                                        this.samples_per_pixel,
-                                        track_w,
-                                    );
-                                    let local = x - this.scrollbar_origin_x;
-                                    let grab_offset =
-                                        if local >= thumb_x && local <= thumb_x + thumb_w {
-                                            local - thumb_x
-                                        } else {
-                                            thumb_w * 0.5
-                                        };
-                                    this.set_start_from_scrollbar_x(x, grab_offset);
-                                    this.drag = Some(Drag::Scrollbar { grab_offset });
-                                    cx.notify();
-                                }),
-                            ),
-                    )
-            })
+                    }),
+            )
+            .children(Root::render_dialog_layer(window, cx))
     }
+}
+
+fn quit(_: &Quit, cx: &mut App) {
+    cx.quit();
+}
+
+fn about(_: &About, cx: &mut App) {
+    let Some(window) = cx.active_window().and_then(|w| w.downcast::<Root>()) else {
+        return;
+    };
+    cx.defer(move |cx| {
+        let _ = window.update(cx, |_, window, cx| {
+            window.defer(cx, |window, cx| {
+                window.open_alert_dialog(cx, |alert, _, _| {
+                    alert.title("About snd-review").description(format!(
+                        "{}\n\nVersion {}",
+                        env!("CARGO_PKG_DESCRIPTION"),
+                        env!("CARGO_PKG_VERSION"),
+                    ))
+                });
+            });
+        });
+    });
+}
+
+fn install_app_menu(cx: &mut App) {
+    cx.on_action(quit);
+    cx.on_action(about);
+    cx.bind_keys([
+        #[cfg(target_os = "macos")]
+        KeyBinding::new("cmd-q", Quit, None),
+        #[cfg(not(target_os = "macos"))]
+        KeyBinding::new("alt-f4", Quit, None),
+    ]);
+    cx.set_menus([Menu::new("snd-review").items([
+        MenuItem::action("About", About),
+        MenuItem::separator(),
+        MenuItem::action("Quit", Quit),
+    ])]);
+    cx.activate(true);
 }
 
 pub fn run(audio: Arc<DecodedAudio>, path: PathBuf) {
@@ -597,6 +642,7 @@ pub fn run(audio: Arc<DecodedAudio>, path: PathBuf) {
         .run(move |cx| {
             gpui_component::init(cx);
             Theme::change(ThemeMode::Dark, None, cx);
+            install_app_menu(cx);
 
             let title = title.clone();
             let audio = audio.clone();
