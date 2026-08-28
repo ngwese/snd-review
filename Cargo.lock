@@ -6174,7 +6174,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "snd-display"
+name = "snd-review"
 version = "0.1.0"
 dependencies = [
  "anyhow",
