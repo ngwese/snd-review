@@ -11,6 +11,8 @@ use symphonia::core::{
     probe::Hint,
 };
 
+use crate::components::waveform::WaveformDataProvider;
+
 /// Number of samples folded into each overview peak bin.
 pub const PEAK_BLOCK: usize = 256;
 
@@ -38,14 +40,44 @@ impl DecodedAudio {
             self.frames() as f64 / f64::from(self.sample_rate)
         }
     }
+}
 
-    pub fn channel_label(&self, index: usize) -> String {
-        match (self.channel_count(), index) {
+impl WaveformDataProvider for DecodedAudio {
+    fn sample_rate(&self) -> u32 {
+        self.sample_rate
+    }
+
+    fn channel_count(&self) -> usize {
+        self.channels.len()
+    }
+
+    fn frames(&self) -> usize {
+        self.channels.first().map(|c| c.len()).unwrap_or(0)
+    }
+
+    fn duration_secs(&self) -> f64 {
+        if self.sample_rate == 0 {
+            0.0
+        } else {
+            self.frames() as f64 / f64::from(self.sample_rate)
+        }
+    }
+
+    fn channel_label(&self, channel: usize) -> String {
+        match (self.channels.len(), channel) {
             (1, 0) => "Mono".into(),
             (2, 0) => "L".into(),
             (2, 1) => "R".into(),
-            _ => format!("Ch {}", index + 1),
+            _ => format!("Ch {}", channel + 1),
         }
+    }
+
+    fn channel_samples(&self, channel: usize) -> &[f32] {
+        &self.channels[channel]
+    }
+
+    fn channel_peaks(&self, channel: usize) -> &[(f32, f32)] {
+        &self.peaks[channel]
     }
 }
 
