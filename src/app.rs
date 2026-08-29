@@ -1,5 +1,3 @@
-use std::{path::PathBuf, sync::Arc};
-
 use gpui::{
     actions, div, point, prelude::FluentBuilder as _, px, size, App, AppContext as _, Bounds,
     Context, Entity, InteractiveElement as _, IntoElement, KeyBinding, Menu, MenuItem,
@@ -16,24 +14,63 @@ use gpui_component::{
 
 actions!(snd_review, [About, Quit]);
 
-use crate::audio::DecodedAudio;
-use crate::components::waveform::WaveformDisplay;
+use crate::components::waveform::{ToggleZeroCrossing, WaveformDisplay};
+use crate::model::selection::Selection;
+use crate::model::{Buffer, BufferDocument};
 
 pub struct AppView {
-    audio: Arc<DecodedAudio>,
+    document: Entity<BufferDocument>,
     waveform: Entity<WaveformDisplay>,
     app_menu_bar: Option<Entity<AppMenuBar>>,
 }
 
 impl AppView {
-    fn new(audio: Arc<DecodedAudio>, cx: &mut App) -> Self {
-        let waveform = cx.new(|_| WaveformDisplay::new(audio.clone()));
+    fn new(document: Entity<BufferDocument>, cx: &mut Context<Self>) -> Self {
+        cx.observe(&document, |_, _, cx| cx.notify()).detach();
+        let waveform = cx.new(|cx| WaveformDisplay::new(document.clone(), cx));
         Self {
-            audio,
+            document,
             waveform,
             app_menu_bar: (!cfg!(target_os = "macos")).then(|| AppMenuBar::new(cx)),
         }
     }
+}
+
+fn format_secs(secs: f64) -> String {
+    if secs.is_nan() || secs.is_infinite() {
+        return "0.000000s".into();
+    }
+    format!("{secs:.6}s")
+}
+
+fn format_header_meta(doc: &BufferDocument) -> String {
+    let mut parts = vec![
+        format!("{} Hz", doc.buffer.audio.sample_rate),
+        format!("{} ch", doc.buffer.audio.channel_count()),
+        format_duration(doc.buffer.audio.duration_secs()),
+    ];
+
+    if let Some(pos) = &doc.current_position {
+        parts.push(format!("pos {}", format_secs(doc.sample_to_secs(pos.sample))));
+    }
+
+    if let Selection::Region { start, end, .. } = &doc.selection {
+        if end > start {
+            let start_secs = doc.sample_to_secs(*start);
+            let end_secs = doc.sample_to_secs(*end);
+            let len_samples = end - start + 1;
+            let len_secs = len_samples as f64 / f64::from(doc.buffer.audio.sample_rate.max(1));
+            parts.push(format!(
+                "region {}–{}",
+                format_secs(start_secs),
+                format_secs(end_secs)
+            ));
+            parts.push(format!("len {}", format_secs(len_secs)));
+            parts.push(format!("{len_samples} smp"));
+        }
+    }
+
+    parts.join("  ·  ")
 }
 
 fn format_duration(secs: f64) -> String {
@@ -53,18 +90,17 @@ impl Render for AppView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
         let waveform = self.waveform.clone();
+        let doc = self.document.read(cx);
 
-        let meta = format!(
-            "{} Hz  ·  {} ch  ·  {}  ·  {}",
-            self.audio.sample_rate,
-            self.audio.channel_count(),
-            format_duration(self.audio.duration_secs()),
-            self.waveform.read(cx).visible_duration_label(),
-        );
+        let meta = format_header_meta(doc);
 
         div()
             .relative()
             .size_full()
+            .on_action(cx.listener(|this, _: &ToggleZeroCrossing, _, cx| {
+                this.document.update(cx, |doc, _| doc.toggle_zero_crossing_snap());
+                cx.notify();
+            }))
             .child(
                 v_flex()
                     .size_full()
@@ -178,11 +214,13 @@ fn install_app_menu(cx: &mut App) {
     cx.activate(true);
 }
 
-pub fn run(audio: Arc<DecodedAudio>, path: PathBuf) {
-    let title: SharedString = path
-        .file_name()
+pub fn run(buffer: Buffer) {
+    let title: SharedString = buffer
+        .source
+        .as_ref()
+        .and_then(|s| s.path.file_name())
         .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| path.display().to_string())
+        .unwrap_or_else(|| "snd-review".into())
         .into();
 
     gpui_platform::application()
@@ -193,7 +231,6 @@ pub fn run(audio: Arc<DecodedAudio>, path: PathBuf) {
             install_app_menu(cx);
 
             let title = title.clone();
-            let audio = audio.clone();
             cx.spawn(async move |cx| {
                 let options = WindowOptions {
                     titlebar: Some(TitlebarOptions {
@@ -208,7 +245,8 @@ pub fn run(audio: Arc<DecodedAudio>, path: PathBuf) {
                 };
 
                 cx.open_window(options, move |window, cx| {
-                    let view = cx.new(|cx| AppView::new(audio.clone(), cx));
+                    let document = cx.new(|_| BufferDocument::new(buffer));
+                    let view = cx.new(|cx| AppView::new(document, cx));
                     cx.new(|cx| Root::new(view, window, cx).bg(cx.theme().background))
                 })
                 .expect("failed to open window");
