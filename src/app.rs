@@ -1,17 +1,19 @@
 use std::{path::PathBuf, sync::Arc};
 
 use gpui::{
-    actions, canvas, div, fill, point, px, size, App, AppContext as _, Bounds, Context,
-    DispatchPhase, Entity, InteractiveElement as _, IntoElement, KeyBinding, Menu, MenuItem,
-    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement as _, PathBuilder,
-    Pixels, Render, ScrollWheelEvent, SharedString, StatefulInteractiveElement as _, Styled as _,
-    TitlebarOptions, Window, WindowBounds, WindowOptions,
+    actions, canvas, div, fill, point, prelude::FluentBuilder as _, px, size, App, AppContext as _,
+    Bounds, Context, DispatchPhase, Entity, InteractiveElement as _, IntoElement, KeyBinding, Menu,
+    MenuItem, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement as _,
+    PathBuilder, Pixels, Render, ScrollWheelEvent, SharedString, StatefulInteractiveElement as _,
+    Styled as _, TitlebarOptions, Window, WindowBounds, WindowOptions,
 };
 use gpui_component::{
     button::{Button, ButtonVariants as _},
     h_flex,
+    menu::AppMenuBar,
     plot::scale::{Scale as _, ScaleLinear},
-    v_flex, ActiveTheme as _, Root, Sizable as _, StyledExt as _, Theme, ThemeMode, WindowExt as _,
+    v_flex, ActiveTheme as _, GlobalState, Root, Sizable as _, StyledExt as _, Theme, ThemeMode,
+    WindowExt as _, TITLE_BAR_HEIGHT,
 };
 
 actions!(snd_review, [About, Quit]);
@@ -39,10 +41,11 @@ pub struct AppView {
     scrollbar_origin_x: f32,
     scrollbar_width: f32,
     drag: Option<Drag>,
+    app_menu_bar: Option<Entity<AppMenuBar>>,
 }
 
 impl AppView {
-    fn new(audio: Arc<DecodedAudio>, title: SharedString) -> Self {
+    fn new(audio: Arc<DecodedAudio>, title: SharedString, cx: &mut App) -> Self {
         let samples_per_pixel = if audio.frames() == 0 {
             1.0
         } else {
@@ -58,6 +61,8 @@ impl AppView {
             scrollbar_origin_x: 0.0,
             scrollbar_width: 0.0,
             drag: None,
+            // macOS draws these items in the system menu bar.
+            app_menu_bar: (!cfg!(target_os = "macos")).then(|| AppMenuBar::new(cx)),
         }
     }
 
@@ -365,6 +370,21 @@ impl Render for AppView {
                     .size_full()
                     .bg(theme.background)
                     .text_color(theme.foreground)
+                    .when_some(self.app_menu_bar.clone(), |this, menu_bar| {
+                        this.child(
+                            h_flex()
+                                .id("app-menu-bar-row")
+                                .w_full()
+                                .h(TITLE_BAR_HEIGHT)
+                                .flex_none()
+                                .items_center()
+                                .px_2()
+                                .border_b_1()
+                                .border_color(theme.border)
+                                .bg(theme.title_bar)
+                                .child(menu_bar),
+                        )
+                    })
                     .child(
                         h_flex()
                             .w_full()
@@ -613,6 +633,14 @@ fn about(_: &About, cx: &mut App) {
     });
 }
 
+fn app_menus() -> Vec<Menu> {
+    vec![Menu::new("snd-review").items([
+        MenuItem::action("About", About),
+        MenuItem::separator(),
+        MenuItem::action("Quit", Quit),
+    ])]
+}
+
 fn install_app_menu(cx: &mut App) {
     cx.on_action(quit);
     cx.on_action(about);
@@ -622,11 +650,9 @@ fn install_app_menu(cx: &mut App) {
         #[cfg(not(target_os = "macos"))]
         KeyBinding::new("alt-f4", Quit, None),
     ]);
-    cx.set_menus([Menu::new("snd-review").items([
-        MenuItem::action("About", About),
-        MenuItem::separator(),
-        MenuItem::action("Quit", Quit),
-    ])]);
+    cx.set_menus(app_menus());
+    let owned = app_menus().into_iter().map(|menu| menu.owned()).collect();
+    GlobalState::global_mut(cx).set_app_menus(owned);
     cx.activate(true);
 }
 
@@ -660,7 +686,7 @@ pub fn run(audio: Arc<DecodedAudio>, path: PathBuf) {
                 };
 
                 cx.open_window(options, move |window, cx| {
-                    let view = cx.new(|_| AppView::new(audio.clone(), title.clone()));
+                    let view = cx.new(|cx| AppView::new(audio.clone(), title.clone(), cx));
                     cx.new(|cx| Root::new(view, window, cx).bg(cx.theme().background))
                 })
                 .expect("failed to open window");
