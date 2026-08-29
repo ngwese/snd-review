@@ -5,6 +5,7 @@ use clap::Parser;
 
 mod app;
 mod audio;
+mod components;
 
 #[derive(Parser, Debug)]
 #[command(
