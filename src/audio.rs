@@ -1,4 +1,4 @@
-use std::{fs::File, path::Path};
+use std::{fs, fs::File, path::Path, time::SystemTime};
 
 use anyhow::{bail, Context, Result};
 use symphonia::core::{
@@ -12,6 +12,7 @@ use symphonia::core::{
 };
 
 use crate::components::waveform::WaveformDataProvider;
+use crate::model::{Buffer, BufferSource};
 
 /// Number of samples folded into each overview peak bin.
 pub const PEAK_BLOCK: usize = 256;
@@ -81,8 +82,35 @@ impl WaveformDataProvider for DecodedAudio {
     }
 }
 
+struct DecodeMeta {
+    container_format: String,
+    codec: String,
+}
+
 /// Decode `path` into planar f32 samples, one vector per channel.
 pub fn decode(path: &Path) -> Result<DecodedAudio> {
+    decode_with_meta(path).map(|(audio, _)| audio)
+}
+
+/// Load a buffer with file metadata from `path`.
+pub fn load_buffer(path: &Path) -> Result<Buffer> {
+    let metadata = fs::metadata(path).with_context(|| format!("failed to stat {}", path.display()))?;
+    let (audio, meta) = decode_with_meta(path)?;
+    Ok(Buffer {
+        audio,
+        source: Some(BufferSource {
+            path: path.to_path_buf(),
+            modified: metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH),
+            size_bytes: metadata.len(),
+            container_format: meta.container_format,
+            codec: meta.codec,
+        }),
+        regions: Vec::new(),
+        markers: Vec::new(),
+    })
+}
+
+fn decode_with_meta(path: &Path) -> Result<(DecodedAudio, DecodeMeta)> {
     let file = File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
     let mss = MediaSourceStream::new(Box::new(file), Default::default());
 
@@ -101,12 +129,23 @@ pub fn decode(path: &Path) -> Result<DecodedAudio> {
         .with_context(|| format!("unsupported or unreadable audio format: {}", path.display()))?;
 
     let mut format = probed.format;
+    let container_format = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("unknown")
+        .to_string();
+
     let track = format
         .tracks()
         .iter()
         .find(|t| t.codec_params.codec != CODEC_TYPE_NULL)
         .cloned()
         .context("no supported audio track in file")?;
+
+    let codec = track
+        .codec_params
+        .codec
+        .to_string();
 
     let track_id = track.id;
     let mut decoder = symphonia::default::get_codecs()
@@ -157,11 +196,47 @@ pub fn decode(path: &Path) -> Result<DecodedAudio> {
 
     let peaks = channels.iter().map(|ch| build_peaks(ch)).collect();
 
-    Ok(DecodedAudio {
-        sample_rate,
-        channels,
-        peaks,
-    })
+    Ok((
+        DecodedAudio {
+            sample_rate,
+            channels,
+            peaks,
+        },
+        DecodeMeta {
+            container_format,
+            codec,
+        },
+    ))
+}
+
+impl WaveformDataProvider for Buffer {
+    fn sample_rate(&self) -> u32 {
+        self.audio.sample_rate
+    }
+
+    fn channel_count(&self) -> usize {
+        self.audio.channel_count()
+    }
+
+    fn frames(&self) -> usize {
+        self.audio.frames()
+    }
+
+    fn duration_secs(&self) -> f64 {
+        self.audio.duration_secs()
+    }
+
+    fn channel_label(&self, channel: usize) -> String {
+        WaveformDataProvider::channel_label(&self.audio, channel)
+    }
+
+    fn channel_samples(&self, channel: usize) -> &[f32] {
+        WaveformDataProvider::channel_samples(&self.audio, channel)
+    }
+
+    fn channel_peaks(&self, channel: usize) -> &[(f32, f32)] {
+        WaveformDataProvider::channel_peaks(&self.audio, channel)
+    }
 }
 
 fn append_decoded(

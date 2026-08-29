@@ -1,4 +1,4 @@
-use std::{path::PathBuf, sync::Arc};
+use std::path::PathBuf;
 
 use anyhow::{Context as _, Result};
 use clap::Parser;
@@ -6,6 +6,7 @@ use clap::Parser;
 mod app;
 mod audio;
 mod components;
+mod model;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -20,8 +21,8 @@ struct Args {
 
 fn main() -> Result<()> {
     let args = Args::parse();
-    let decoded = audio::decode(&args.file)
-        .with_context(|| format!("failed to decode {}", args.file.display()))?;
-    app::run(Arc::new(decoded), args.file);
+    let buffer = audio::load_buffer(&args.file)
+        .with_context(|| format!("failed to load {}", args.file.display()))?;
+    app::run(buffer);
     Ok(())
 }
