@@ -1,13 +1,13 @@
-use std::time::Duration;
-
+use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
+use std::time::Duration;
 
 use cpal::Device;
 use gpui::{
     actions, div, point, prelude::FluentBuilder as _, px, size, App, AppContext as _, Bounds,
-    Context, Entity, InteractiveElement as _, IntoElement, KeyBinding, Menu, MenuItem,
-    ParentElement as _, Render, SharedString, Styled as _, TitlebarOptions, Window,
-    WindowBounds, WindowOptions,
+    Context, Entity, ExternalPaths, InteractiveElement as _, IntoElement, KeyBinding, Menu,
+    MenuItem, ParentElement as _, PathPromptOptions, Render, SharedString, Styled as _,
+    TitlebarOptions, Window, WindowBounds, WindowOptions,
 };
 use gpui_component::{
     button::{Button, ButtonVariants as _},
@@ -18,6 +18,7 @@ use gpui_component::{
 };
 
 actions!(snd_review, [
+    Open,
     About,
     Quit,
     TransportHome,
@@ -30,12 +31,15 @@ actions!(snd_review, [
     TransportLoop,
 ]);
 
+use crate::audio;
 use crate::components::waveform::{ToggleZeroCrossing, WaveformDisplay};
 use crate::model::selection::Selection;
 use crate::model::{Buffer, BufferDocument};
 use crate::playback::{PlaybackSession, TransportState};
 
 pub struct AppView {
+    buffer: Arc<RwLock<Buffer>>,
+    device: Device,
     document: Entity<BufferDocument>,
     waveform: Entity<WaveformDisplay>,
     playback: PlaybackSession,
@@ -44,6 +48,8 @@ pub struct AppView {
 
 impl AppView {
     fn new(
+        buffer: Arc<RwLock<Buffer>>,
+        device: Device,
         document: Entity<BufferDocument>,
         playback: PlaybackSession,
         cx: &mut Context<Self>,
@@ -79,11 +85,94 @@ impl AppView {
 
         let waveform = cx.new(|cx| WaveformDisplay::new(document.clone(), cx));
         Self {
+            buffer,
+            device,
             document,
             waveform,
             playback,
             app_menu_bar: (!cfg!(target_os = "macos")).then(|| AppMenuBar::new(cx)),
         }
+    }
+
+    fn buffer_title(buffer: &Buffer) -> SharedString {
+        buffer
+            .source
+            .as_ref()
+            .and_then(|s| s.path.file_name())
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "snd-review".into())
+            .into()
+    }
+
+    fn load_buffer(&mut self, buffer: Buffer, window: &mut Window, cx: &mut Context<Self>) {
+        {
+            *self.buffer.write().unwrap() = buffer;
+        }
+        let snapshot = self.buffer.read().unwrap();
+        if let Err(err) = self.playback.reload(&self.device, &snapshot) {
+            eprintln!("failed to reload playback: {err:#}");
+        }
+        drop(snapshot);
+
+        self.document.update(cx, |doc, _| doc.reset_for_new_buffer());
+        self.playback
+            .sync_from_document(self.document.read(cx));
+        self.waveform.update(cx, |view, cx| view.reset_view(cx));
+
+        window.set_window_title(&Self::buffer_title(&self.buffer.read().unwrap()));
+        cx.notify();
+    }
+
+    fn show_load_error(&self, message: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let message = message.to_string();
+        window.open_alert_dialog(cx, move |alert, _, _| {
+            alert
+                .title("Failed to open file")
+                .description(message.clone())
+        });
+    }
+
+    fn open_path(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        let view = cx.entity();
+        cx.spawn_in(window, async move |_, window| {
+            let result = std::thread::spawn(move || audio::load_buffer(&path)).join();
+            let _ = window.update(|window, cx| {
+                view.update(cx, |this, cx| match result {
+                    Ok(Ok(buffer)) => this.load_buffer(buffer, window, cx),
+                    Ok(Err(err)) => this.show_load_error(&format!("{err:#}"), window, cx),
+                    Err(_) => this.show_load_error("failed to load file", window, cx),
+                });
+            });
+        })
+        .detach();
+    }
+
+    fn prompt_open_file(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let receiver = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some("Open".into()),
+        });
+        let view = cx.entity();
+        cx.spawn_in(window, async move |_, window| {
+            let paths = match receiver.await {
+                Ok(Ok(Some(paths))) => paths,
+                _ => return,
+            };
+            let Some(path) = paths.into_iter().next() else {
+                return;
+            };
+            let result = std::thread::spawn(move || audio::load_buffer(&path)).join();
+            let _ = window.update(|window, cx| {
+                view.update(cx, |this, cx| match result {
+                    Ok(Ok(buffer)) => this.load_buffer(buffer, window, cx),
+                    Ok(Err(err)) => this.show_load_error(&format!("{err:#}"), window, cx),
+                    Err(_) => this.show_load_error("failed to load file", window, cx),
+                });
+            });
+        })
+        .detach();
     }
 }
 
@@ -103,10 +192,18 @@ fn transport_state_label(state: TransportState) -> &'static str {
 }
 
 fn format_header_meta(doc: &BufferDocument, transport: TransportState) -> String {
+    let buffer = doc.buffer.read().unwrap();
+    if !buffer.is_loaded() {
+        return format!(
+            "No file open  ·  {}",
+            transport_state_label(transport)
+        );
+    }
+
     let mut parts = vec![
-        format!("{} Hz", doc.buffer.read().unwrap().audio.sample_rate),
-        format!("{} ch", doc.buffer.read().unwrap().audio.channel_count()),
-        format_duration(doc.buffer.read().unwrap().audio.duration_secs()),
+        format!("{} Hz", buffer.audio.sample_rate),
+        format!("{} ch", buffer.audio.channel_count()),
+        format_duration(buffer.audio.duration_secs()),
         transport_state_label(transport).to_string(),
     ];
 
@@ -119,8 +216,8 @@ fn format_header_meta(doc: &BufferDocument, transport: TransportState) -> String
             let start_secs = doc.sample_to_secs(*start);
             let end_secs = doc.sample_to_secs(*end);
             let len_samples = end - start + 1;
-            let len_secs = len_samples as f64
-                / f64::from(doc.buffer.read().unwrap().audio.sample_rate.max(1));
+            let len_secs =
+                len_samples as f64 / f64::from(buffer.audio.sample_rate.max(1));
             parts.push(format!(
                 "region {}–{}",
                 format_secs(start_secs),
@@ -160,10 +257,20 @@ impl Render for AppView {
         };
 
         let meta = format_header_meta(doc, transport_state);
+        let drop_highlight = theme.secondary;
 
         div()
             .relative()
             .size_full()
+            .drag_over::<ExternalPaths>(move |style, _, _, _| style.bg(drop_highlight))
+            .on_drop(cx.listener(|this, paths: &ExternalPaths, window, cx| {
+                if let Some(path) = paths.paths().first() {
+                    this.open_path(path.clone(), window, cx);
+                }
+            }))
+            .on_action(cx.listener(|this, _: &Open, window, cx| {
+                this.prompt_open_file(window, cx);
+            }))
             .on_action(cx.listener(|this, _: &ToggleZeroCrossing, _, cx| {
                 this.document.update(cx, |doc, _| doc.toggle_zero_crossing_snap());
                 cx.notify();
@@ -387,17 +494,24 @@ fn about(_: &About, cx: &mut App) {
 }
 
 fn app_menus() -> Vec<Menu> {
-    vec![Menu::new("snd-review").items([
-        MenuItem::action("About", About),
-        MenuItem::separator(),
-        MenuItem::action("Quit", Quit),
-    ])]
+    vec![
+        Menu::new("File").items([
+            MenuItem::action("Open...", Open),
+            MenuItem::separator(),
+            MenuItem::action("Quit", Quit),
+        ]),
+        Menu::new("snd-review").items([MenuItem::action("About", About)]),
+    ]
 }
 
 fn install_app_menu(cx: &mut App) {
     cx.on_action(quit);
     cx.on_action(about);
     cx.bind_keys([
+        #[cfg(target_os = "macos")]
+        KeyBinding::new("cmd-o", Open, None),
+        #[cfg(not(target_os = "macos"))]
+        KeyBinding::new("ctrl-o", Open, None),
         #[cfg(target_os = "macos")]
         KeyBinding::new("cmd-q", Quit, None),
         #[cfg(not(target_os = "macos"))]
@@ -412,14 +526,9 @@ fn install_app_menu(cx: &mut App) {
     cx.activate(true);
 }
 
-pub fn run(buffer: Buffer, device: Device) {
-    let title: SharedString = buffer
-        .source
-        .as_ref()
-        .and_then(|s| s.path.file_name())
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "snd-review".into())
-        .into();
+pub fn run(initial_buffer: Option<Buffer>, device: Device) {
+    let buffer = initial_buffer.unwrap_or_else(Buffer::empty);
+    let title = AppView::buffer_title(&buffer);
 
     let shared = Arc::new(RwLock::new(buffer));
     let playback = PlaybackSession::open(&device, shared.clone())
@@ -447,8 +556,10 @@ pub fn run(buffer: Buffer, device: Device) {
                 };
 
                 cx.open_window(options, move |window, cx| {
-                    let document = cx.new(|_| BufferDocument::with_shared(shared));
-                    let view = cx.new(|cx| AppView::new(document, playback, cx));
+                    let document = cx.new(|_| BufferDocument::with_shared(shared.clone()));
+                    let view = cx.new(|cx| {
+                        AppView::new(shared.clone(), device, document, playback, cx)
+                    });
                     cx.new(|cx| Root::new(view, window, cx).bg(cx.theme().background))
                 })
                 .expect("failed to open window");

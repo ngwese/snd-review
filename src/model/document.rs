@@ -264,6 +264,12 @@ impl BufferDocument {
         }
         self.set_current_position_sample(sample, scope);
     }
+
+    pub fn reset_for_new_buffer(&mut self) {
+        self.selection = Selection::None;
+        self.current_position = None;
+        self.region_drag_anchor = None;
+    }
 }
 
 #[cfg(test)]

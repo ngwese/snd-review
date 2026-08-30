@@ -36,12 +36,13 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    let file = args
-        .file
-        .as_ref()
-        .context("audio file path is required unless --list-devices is used")?;
-    let buffer = audio::load_buffer(file)
-        .with_context(|| format!("failed to load {}", file.display()))?;
+    let buffer = match &args.file {
+        Some(path) => Some(
+            audio::load_buffer(path)
+                .with_context(|| format!("failed to load {}", path.display()))?,
+        ),
+        None => None,
+    };
     let device = playback::resolve_output_device(args.output_device.as_deref())?;
     app::run(buffer, device);
     Ok(())

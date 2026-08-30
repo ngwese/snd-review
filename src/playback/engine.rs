@@ -135,61 +135,26 @@ pub struct PlaybackEngine {
 
 impl PlaybackEngine {
     pub fn open(device: &Device, provider: Arc<dyn PlaybackDataProvider>) -> Result<Self> {
-        let channels = provider.channel_count().max(1) as u16;
-        let source_rate = provider.sample_rate();
-
         let default_config = device
             .default_output_config()
             .context("failed to get default output config")?;
 
         let sample_format = default_config.sample_format();
-        let mut stream_config = StreamConfig {
-            channels,
-            sample_rate: cpal::SampleRate(source_rate),
-            buffer_size: cpal::BufferSize::Default,
-        };
-
-        let supports_source_rate = device
-            .supported_output_configs()?
-            .any(|c| {
-                c.channels() == channels
-                    && c.min_sample_rate().0 <= source_rate
-                    && c.max_sample_rate().0 >= source_rate
-            });
-
-        if !supports_source_rate {
-            stream_config.sample_rate = default_config.sample_rate();
-        }
-
+        let stream_config = stream_config_for_provider(device, &default_config, &provider)?;
         let output_rate = stream_config.sample_rate.0;
         let shared = Arc::new(PlaybackShared::new(provider, output_rate));
         let shared_cb = shared.clone();
 
-        let stream = match sample_format {
-            SampleFormat::F32 => device.build_output_stream(
-                &stream_config,
-                move |data: &mut [f32], _| shared_cb.fill_output(data),
-                |_| {},
-                None,
-            ),
-            SampleFormat::I16 => {
-                let shared_cb = shared.clone();
-                device.build_output_stream(
-                    &stream_config,
-                    move |data: &mut [i16], _| {
-                        let mut temp = vec![0.0f32; data.len()];
-                        shared_cb.fill_output(&mut temp);
-                        for (out, sample) in data.iter_mut().zip(temp) {
-                            *out = (sample.clamp(-1.0, 1.0) * i16::MAX as f32) as i16;
-                        }
-                    },
-                    |_| {},
-                    None,
-                )
-            }
-            other => anyhow::bail!("unsupported output sample format: {other:?}"),
-        }
-        .context("failed to build output stream")?;
+        let stream = build_output_stream(device, &stream_config, sample_format, shared_cb.clone())
+            .or_else(|_| {
+                let fallback = StreamConfig {
+                    channels: default_config.channels(),
+                    sample_rate: default_config.sample_rate(),
+                    buffer_size: cpal::BufferSize::Default,
+                };
+                build_output_stream(device, &fallback, sample_format, shared_cb)
+            })
+            .context("failed to build output stream")?;
 
         stream.play().context("failed to start output stream")?;
 
@@ -198,4 +163,73 @@ impl PlaybackEngine {
             shared,
         })
     }
+}
+
+fn stream_config_for_provider(
+    device: &Device,
+    default_config: &cpal::SupportedStreamConfig,
+    provider: &Arc<dyn PlaybackDataProvider>,
+) -> Result<StreamConfig> {
+    if provider.frames() == 0 {
+        return Ok(StreamConfig {
+            channels: default_config.channels(),
+            sample_rate: default_config.sample_rate(),
+            buffer_size: cpal::BufferSize::Default,
+        });
+    }
+
+    let channels = provider.channel_count().max(1) as u16;
+    let source_rate = provider.sample_rate();
+    let mut stream_config = StreamConfig {
+        channels,
+        sample_rate: cpal::SampleRate(source_rate),
+        buffer_size: cpal::BufferSize::Default,
+    };
+
+    let supports_source_rate = device
+        .supported_output_configs()?
+        .any(|c| {
+            c.channels() == channels
+                && c.min_sample_rate().0 <= source_rate
+                && c.max_sample_rate().0 >= source_rate
+        });
+
+    if !supports_source_rate {
+        stream_config.sample_rate = default_config.sample_rate();
+    }
+
+    Ok(stream_config)
+}
+
+fn build_output_stream(
+    device: &Device,
+    stream_config: &StreamConfig,
+    sample_format: SampleFormat,
+    shared: Arc<PlaybackShared>,
+) -> Result<Stream> {
+    match sample_format {
+        SampleFormat::F32 => device.build_output_stream(
+            stream_config,
+            move |data: &mut [f32], _| shared.fill_output(data),
+            |_| {},
+            None,
+        ),
+        SampleFormat::I16 => {
+            let shared = shared.clone();
+            device.build_output_stream(
+                stream_config,
+                move |data: &mut [i16], _| {
+                    let mut temp = vec![0.0f32; data.len()];
+                    shared.fill_output(&mut temp);
+                    for (out, sample) in data.iter_mut().zip(temp) {
+                        *out = (sample.clamp(-1.0, 1.0) * i16::MAX as f32) as i16;
+                    }
+                },
+                |_| {},
+                None,
+            )
+        }
+        other => anyhow::bail!("unsupported output sample format: {other:?}"),
+    }
+    .map_err(Into::into)
 }
