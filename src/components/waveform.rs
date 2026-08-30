@@ -70,7 +70,7 @@ pub struct WaveformDisplay {
 
 impl WaveformDisplay {
     pub fn new(document: Entity<BufferDocument>, cx: &App) -> Self {
-        let frames = document.read(cx).buffer.frames();
+        let frames = document.read(cx).buffer.read().unwrap().frames();
         let samples_per_pixel = if frames == 0 {
             1.0
         } else {
@@ -107,7 +107,7 @@ impl WaveformDisplay {
     }
 
     fn frames(&self, cx: &App) -> usize {
-        self.document.read(cx).buffer.frames()
+        self.document.read(cx).buffer.read().unwrap().frames()
     }
 
     fn anchor_sample(&self, cx: &App) -> f64 {
@@ -120,7 +120,7 @@ impl WaveformDisplay {
 
     fn max_samples_per_pixel(&self, cx: &App) -> f64 {
         let width = self.viewport_width.max(1.0) as f64;
-        let frames = self.document.read(cx).buffer.frames() as f64;
+        let frames = self.document.read(cx).buffer.read().unwrap().frames() as f64;
         (frames / width).max(MIN_SAMPLES_PER_PIXEL)
     }
 
@@ -446,13 +446,14 @@ fn paint_lane(
 ) {
     let width = bounds.size.width.as_f32();
     let height = bounds.size.height.as_f32();
-    if width < 1.0 || height < 1.0 || channel >= provider.buffer.audio.channel_count() {
+    let buffer = provider.buffer.read().unwrap();
+    if width < 1.0 || height < 1.0 || channel >= buffer.audio.channel_count() {
         return;
     }
 
-    let audio = &provider.buffer.audio;
+    let audio = &buffer.audio;
 
-    for region in &provider.buffer.regions {
+    for region in &buffer.regions {
         paint_region_overlay(
             bounds,
             region,
@@ -593,7 +594,7 @@ impl Render for WaveformDisplay {
         let start_sample = self.start_sample;
         let samples_per_pixel = self.samples_per_pixel;
         let entity = cx.entity();
-        let channel_count = self.document.read(cx).buffer.audio.channel_count();
+        let channel_count = self.document.read(cx).buffer.read().unwrap().audio.channel_count();
 
         v_flex()
             .size_full()
@@ -639,7 +640,7 @@ impl Render for WaveformDisplay {
                                 let zero = theme.border;
                                 let channel_label =
                                     WaveformDataProvider::channel_label(
-                                        &document.read(cx).buffer,
+                                        &*document.read(cx).buffer.read().unwrap(),
                                         ch,
                                     );
                                 h_flex()
@@ -732,7 +733,7 @@ impl Render for WaveformDisplay {
                     }),
             )
             .child({
-                let frames = self.document.read(cx).buffer.frames();
+                let frames = self.document.read(cx).buffer.read().unwrap().frames();
                 let start = start_sample;
                 let spp = samples_per_pixel;
                 let track = theme.scrollbar;

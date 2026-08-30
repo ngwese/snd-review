@@ -1,3 +1,8 @@
+use std::time::Duration;
+
+use std::sync::{Arc, RwLock};
+
+use cpal::Device;
 use gpui::{
     actions, div, point, prelude::FluentBuilder as _, px, size, App, AppContext as _, Bounds,
     Context, Entity, InteractiveElement as _, IntoElement, KeyBinding, Menu, MenuItem,
@@ -12,25 +17,71 @@ use gpui_component::{
     TITLE_BAR_HEIGHT,
 };
 
-actions!(snd_review, [About, Quit]);
+actions!(snd_review, [
+    About,
+    Quit,
+    TransportHome,
+    TransportPrevious,
+    TransportStart,
+    TransportPlayPause,
+    TransportStop,
+    TransportNext,
+    TransportEnd,
+    TransportLoop,
+]);
 
 use crate::components::waveform::{ToggleZeroCrossing, WaveformDisplay};
 use crate::model::selection::Selection;
 use crate::model::{Buffer, BufferDocument};
+use crate::playback::{PlaybackSession, TransportState};
 
 pub struct AppView {
     document: Entity<BufferDocument>,
     waveform: Entity<WaveformDisplay>,
+    playback: PlaybackSession,
     app_menu_bar: Option<Entity<AppMenuBar>>,
 }
 
 impl AppView {
-    fn new(document: Entity<BufferDocument>, cx: &mut Context<Self>) -> Self {
-        cx.observe(&document, |_, _, cx| cx.notify()).detach();
+    fn new(
+        document: Entity<BufferDocument>,
+        playback: PlaybackSession,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        cx.observe(&document, |this, _, cx| {
+            this.playback.sync_from_document(this.document.read(cx));
+            cx.notify();
+        })
+        .detach();
+
+        let document_for_poll = document.clone();
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(33))
+                    .await;
+                if this
+                    .update(cx, |this, cx| {
+                        this.document.update(cx, |doc, cx| {
+                            this.playback.poll(doc);
+                            cx.notify();
+                        });
+                        cx.notify();
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+                let _ = &document_for_poll;
+            }
+        })
+        .detach();
+
         let waveform = cx.new(|cx| WaveformDisplay::new(document.clone(), cx));
         Self {
             document,
             waveform,
+            playback,
             app_menu_bar: (!cfg!(target_os = "macos")).then(|| AppMenuBar::new(cx)),
         }
     }
@@ -43,11 +94,20 @@ fn format_secs(secs: f64) -> String {
     format!("{secs:.6}s")
 }
 
-fn format_header_meta(doc: &BufferDocument) -> String {
+fn transport_state_label(state: TransportState) -> &'static str {
+    match state {
+        TransportState::Stopped => "Stopped",
+        TransportState::Playing => "Playing",
+        TransportState::Paused => "Paused",
+    }
+}
+
+fn format_header_meta(doc: &BufferDocument, transport: TransportState) -> String {
     let mut parts = vec![
-        format!("{} Hz", doc.buffer.audio.sample_rate),
-        format!("{} ch", doc.buffer.audio.channel_count()),
-        format_duration(doc.buffer.audio.duration_secs()),
+        format!("{} Hz", doc.buffer.read().unwrap().audio.sample_rate),
+        format!("{} ch", doc.buffer.read().unwrap().audio.channel_count()),
+        format_duration(doc.buffer.read().unwrap().audio.duration_secs()),
+        transport_state_label(transport).to_string(),
     ];
 
     if let Some(pos) = &doc.current_position {
@@ -59,7 +119,8 @@ fn format_header_meta(doc: &BufferDocument) -> String {
             let start_secs = doc.sample_to_secs(*start);
             let end_secs = doc.sample_to_secs(*end);
             let len_samples = end - start + 1;
-            let len_secs = len_samples as f64 / f64::from(doc.buffer.audio.sample_rate.max(1));
+            let len_secs = len_samples as f64
+                / f64::from(doc.buffer.read().unwrap().audio.sample_rate.max(1));
             parts.push(format!(
                 "region {}–{}",
                 format_secs(start_secs),
@@ -91,14 +152,52 @@ impl Render for AppView {
         let theme = cx.theme().clone();
         let waveform = self.waveform.clone();
         let doc = self.document.read(cx);
+        let transport_state = self.playback.transport_state();
+        let looping = self.playback.looping();
+        let play_pause_label = match transport_state {
+            TransportState::Playing => "Pause",
+            _ => "Play",
+        };
 
-        let meta = format_header_meta(doc);
+        let meta = format_header_meta(doc, transport_state);
 
         div()
             .relative()
             .size_full()
             .on_action(cx.listener(|this, _: &ToggleZeroCrossing, _, cx| {
                 this.document.update(cx, |doc, _| doc.toggle_zero_crossing_snap());
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &TransportHome, _, cx| {
+                this.playback.home();
+                this.sync_playback_to_document(cx);
+            }))
+            .on_action(cx.listener(|this, _: &TransportPrevious, _, cx| {
+                this.playback.previous();
+                this.sync_playback_to_document(cx);
+            }))
+            .on_action(cx.listener(|this, _: &TransportStart, _, cx| {
+                this.playback.start();
+                this.sync_playback_to_document(cx);
+            }))
+            .on_action(cx.listener(|this, _: &TransportPlayPause, _, cx| {
+                this.playback.toggle_play_pause();
+                this.sync_playback_to_document(cx);
+            }))
+            .on_action(cx.listener(|this, _: &TransportStop, _, cx| {
+                this.playback.stop();
+                this.sync_playback_to_document(cx);
+            }))
+            .on_action(cx.listener(|this, _: &TransportNext, _, cx| {
+                this.playback.next();
+                this.sync_playback_to_document(cx);
+            }))
+            .on_action(cx.listener(|this, _: &TransportEnd, _, cx| {
+                this.playback.end();
+                this.sync_playback_to_document(cx);
+            }))
+            .on_action(cx.listener(|this, _: &TransportLoop, _, cx| {
+                this.playback.toggle_loop();
                 cx.notify();
             }))
             .child(
@@ -162,9 +261,105 @@ impl Render for AppView {
                                     })),
                             ),
                     )
-                    .child(div().flex_1().min_h_0().w_full().child(waveform)),
+                    .child(div().flex_1().min_h_0().w_full().child(waveform))
+                    .child(
+                        h_flex()
+                            .id("transport-bar")
+                            .w_full()
+                            .flex_none()
+                            .px_3()
+                            .py_2()
+                            .gap_2()
+                            .items_center()
+                            .border_t_1()
+                            .border_color(theme.border)
+                            .bg(theme.title_bar)
+                            .child(
+                                Button::new("transport-home")
+                                    .small()
+                                    .label("Home")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.playback.home();
+                                        this.sync_playback_to_document(cx);
+                                    })),
+                            )
+                            .child(
+                                Button::new("transport-prev")
+                                    .small()
+                                    .label("Previous")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.playback.previous();
+                                        this.sync_playback_to_document(cx);
+                                    })),
+                            )
+                            .child(
+                                Button::new("transport-start")
+                                    .small()
+                                    .label("Start")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.playback.start();
+                                        this.sync_playback_to_document(cx);
+                                    })),
+                            )
+                            .child(
+                                Button::new("transport-play-pause")
+                                    .small()
+                                    .primary()
+                                    .label(play_pause_label)
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.playback.toggle_play_pause();
+                                        this.sync_playback_to_document(cx);
+                                    })),
+                            )
+                            .child(
+                                Button::new("transport-stop")
+                                    .small()
+                                    .label("Stop")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.playback.stop();
+                                        this.sync_playback_to_document(cx);
+                                    })),
+                            )
+                            .child(
+                                Button::new("transport-next")
+                                    .small()
+                                    .label("Next")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.playback.next();
+                                        this.sync_playback_to_document(cx);
+                                    })),
+                            )
+                            .child(
+                                Button::new("transport-end")
+                                    .small()
+                                    .label("End")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.playback.end();
+                                        this.sync_playback_to_document(cx);
+                                    })),
+                            )
+                            .child(
+                                Button::new("transport-loop")
+                                    .small()
+                                    .label(if looping { "Loop On" } else { "Loop Off" })
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.playback.toggle_loop();
+                                        cx.notify();
+                                    })),
+                            ),
+                    ),
             )
             .children(Root::render_dialog_layer(window, cx))
+    }
+}
+
+impl AppView {
+    fn sync_playback_to_document(&mut self, cx: &mut Context<Self>) {
+        self.document.update(cx, |doc, cx| {
+            self.playback.sync_document_from_playback(doc);
+            cx.notify();
+        });
+        cx.notify();
     }
 }
 
@@ -207,6 +402,9 @@ fn install_app_menu(cx: &mut App) {
         KeyBinding::new("cmd-q", Quit, None),
         #[cfg(not(target_os = "macos"))]
         KeyBinding::new("alt-f4", Quit, None),
+        KeyBinding::new("space", TransportPlayPause, None),
+        KeyBinding::new("home", TransportHome, None),
+        KeyBinding::new("end", TransportEnd, None),
     ]);
     cx.set_menus(app_menus());
     let owned = app_menus().into_iter().map(|menu| menu.owned()).collect();
@@ -214,7 +412,7 @@ fn install_app_menu(cx: &mut App) {
     cx.activate(true);
 }
 
-pub fn run(buffer: Buffer) {
+pub fn run(buffer: Buffer, device: Device) {
     let title: SharedString = buffer
         .source
         .as_ref()
@@ -222,6 +420,10 @@ pub fn run(buffer: Buffer) {
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| "snd-review".into())
         .into();
+
+    let shared = Arc::new(RwLock::new(buffer));
+    let playback = PlaybackSession::open(&device, shared.clone())
+        .expect("failed to open audio playback device");
 
     gpui_platform::application()
         .with_assets(gpui_component_assets::Assets)
@@ -245,8 +447,8 @@ pub fn run(buffer: Buffer) {
                 };
 
                 cx.open_window(options, move |window, cx| {
-                    let document = cx.new(|_| BufferDocument::new(buffer));
-                    let view = cx.new(|cx| AppView::new(document, cx));
+                    let document = cx.new(|_| BufferDocument::with_shared(shared));
+                    let view = cx.new(|cx| AppView::new(document, playback, cx));
                     cx.new(|cx| Root::new(view, window, cx).bg(cx.theme().background))
                 })
                 .expect("failed to open window");
