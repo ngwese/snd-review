@@ -85,6 +85,7 @@ impl AppView {
         .detach();
 
         let waveform = cx.new(|cx| WaveformDisplay::new(document.clone(), cx));
+        cx.observe(&waveform, |_, _, cx| cx.notify()).detach();
         Self {
             buffer,
             device,
@@ -201,6 +202,13 @@ fn transport_state_label(state: TransportState) -> &'static str {
     }
 }
 
+fn format_hover_meta(doc: &BufferDocument, sample: usize) -> String {
+    format!(
+        "hover {}  ·  {sample} smp",
+        format_secs(doc.sample_to_secs(sample))
+    )
+}
+
 fn format_header_meta(doc: &BufferDocument, transport: TransportState) -> String {
     let buffer = doc.buffer.read().unwrap();
     if !buffer.is_loaded() {
@@ -265,7 +273,9 @@ impl Render for AppView {
             _ => "Play",
         };
 
+        let hover_sample = self.waveform.read(cx).hover_sample();
         let meta = format_header_meta(doc, transport_state);
+        let hover_meta = hover_sample.map(|sample| format_hover_meta(doc, sample));
         let drop_highlight = theme.secondary;
 
         div()
@@ -326,25 +336,16 @@ impl Render for AppView {
                                     .overflow_hidden()
                                     .child(meta),
                             )
-                            .child(Button::new("zoom-out").small().label("Zoom Out").on_click(
-                                cx.listener(|this, _, _, cx| {
-                                    this.waveform.update(cx, |view, cx| view.zoom_out(cx));
-                                }),
-                            ))
-                            .child(Button::new("zoom-in").small().label("Zoom In").on_click(
-                                cx.listener(|this, _, _, cx| {
-                                    this.waveform.update(cx, |view, cx| view.zoom_in(cx));
-                                }),
-                            ))
-                            .child(
-                                Button::new("zoom-fit")
-                                    .small()
-                                    .primary()
-                                    .label("Fit")
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.waveform.update(cx, |view, cx| view.fit(cx));
-                                    })),
-                            ),
+                            .when_some(hover_meta, |this, hover_meta| {
+                                this.child(
+                                    div()
+                                        .flex_none()
+                                        .text_sm()
+                                        .text_color(theme.muted_foreground)
+                                        .whitespace_nowrap()
+                                        .child(hover_meta),
+                                )
+                            }),
                     )
                     .child(div().flex_1().min_h_0().w_full().child(waveform))
                     .child(
@@ -583,6 +584,11 @@ fn app_menus() -> Vec<Menu> {
             MenuItem::action("Open...", Open),
             MenuItem::separator(),
             MenuItem::action("Quit", Quit),
+        ]),
+        Menu::new("View").items([
+            MenuItem::action("Zoom In", ViewZoomIn),
+            MenuItem::action("Zoom Out", ViewZoomOut),
+            MenuItem::action("Reset View", ViewFitAll),
         ]),
         Menu::new("Help").items([MenuItem::action("About...", About)]),
     ]

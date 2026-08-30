@@ -244,6 +244,26 @@ mod tests {
         assert_eq!(map.get("a").map(String::as_str), Some("view.fit_all"));
         assert_eq!(map.get("f").map(String::as_str), Some("view.frame"));
         assert_eq!(
+            map.get("secondary-=").map(String::as_str),
+            Some("view.zoom_in")
+        );
+        assert_eq!(
+            map.get("secondary-+").map(String::as_str),
+            Some("view.zoom_in")
+        );
+        assert_eq!(
+            map.get("secondary-shift-=").map(String::as_str),
+            Some("view.zoom_in")
+        );
+        assert_eq!(
+            map.get("secondary--").map(String::as_str),
+            Some("view.zoom_out")
+        );
+        assert_eq!(
+            map.get("secondary-0").map(String::as_str),
+            Some("view.fit_all")
+        );
+        assert_eq!(
             map.get("space").map(String::as_str),
             Some("transport.play_pause")
         );

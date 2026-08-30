@@ -2,6 +2,11 @@
   "bindings": {
     "a": "view.fit_all",
     "f": "view.frame",
+    "secondary-=": "view.zoom_in",
+    "secondary-+": "view.zoom_in",
+    "secondary-shift-=": "view.zoom_in",
+    "secondary--": "view.zoom_out",
+    "secondary-0": "view.fit_all",
     "space": "transport.play_pause",
     "home": "transport.home",
     "end": "transport.end"

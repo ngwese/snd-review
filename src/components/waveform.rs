@@ -49,6 +49,7 @@ const MIN_THUMB: f32 = 24.0;
 const SCROLLBAR_HEIGHT: f32 = 14.0;
 const DRAG_MOVE_THRESHOLD_PX: f32 = 3.0;
 const POSITION_BAR_COLOR: gpui::Hsla = hsla(0.0, 0.72, 0.55, 1.0);
+const GHOST_BAR_COLOR: gpui::Hsla = hsla(0.0, 0.72, 0.55, 0.35);
 
 enum Drag {
     Pan {
@@ -75,6 +76,7 @@ pub struct WaveformDisplay {
     scrollbar_origin_x: f32,
     scrollbar_width: f32,
     drag: Option<Drag>,
+    hover_sample: Option<usize>,
 }
 
 impl WaveformDisplay {
@@ -94,7 +96,12 @@ impl WaveformDisplay {
             scrollbar_origin_x: 0.0,
             scrollbar_width: 0.0,
             drag: None,
+            hover_sample: None,
         }
+    }
+
+    pub fn hover_sample(&self) -> Option<usize> {
+        self.hover_sample
     }
 
     pub fn zoom_in(&mut self, cx: &mut Context<Self>) {
@@ -151,6 +158,7 @@ impl WaveformDisplay {
 
     pub fn reset_view(&mut self, cx: &mut Context<Self>) {
         self.drag = None;
+        self.hover_sample = None;
         self.start_sample = 0.0;
         let frames = self.frames(cx);
         self.samples_per_pixel = if frames == 0 {
@@ -214,6 +222,27 @@ impl WaveformDisplay {
     fn sample_at_x(&self, x: f32) -> f64 {
         let local = (x - self.content_origin_x).max(0.0) as f64;
         self.start_sample + local * self.samples_per_pixel
+    }
+
+    fn set_hover_at(&mut self, x: f32, cx: &mut Context<Self>) {
+        let next = hover_sample_from_x(
+            x,
+            self.content_origin_x,
+            self.viewport_width,
+            self.start_sample,
+            self.samples_per_pixel,
+            self.frames(cx),
+        );
+        if self.hover_sample != next {
+            self.hover_sample = next;
+            cx.notify();
+        }
+    }
+
+    fn clear_hover(&mut self, cx: &mut Context<Self>) {
+        if self.hover_sample.take().is_some() {
+            cx.notify();
+        }
     }
 
     fn pan_pixels(&mut self, dx: f32, cx: &App) {
@@ -477,11 +506,12 @@ fn paint_region_overlay(
     );
 }
 
-fn paint_position_bar(
+fn paint_vertical_bar(
     bounds: Bounds<Pixels>,
     sample: usize,
     start_sample: f64,
     samples_per_pixel: f64,
+    color: gpui::Hsla,
     window: &mut Window,
 ) {
     let origin_x = bounds.origin.x.as_f32();
@@ -493,7 +523,7 @@ fn paint_position_bar(
             origin: point(px(x), px(origin_y)),
             size: size(px(1.0), px(height)),
         },
-        POSITION_BAR_COLOR,
+        color,
     ));
 }
 
@@ -506,6 +536,7 @@ fn paint_lane(
     color: gpui::Hsla,
     zero_color: gpui::Hsla,
     selection: &Selection,
+    hover_sample: Option<usize>,
     window: &mut Window,
 ) {
     let width = bounds.size.width.as_f32();
@@ -613,9 +644,27 @@ fn paint_lane(
         }
     }
 
+    if let Some(sample) = hover_sample {
+        paint_vertical_bar(
+            bounds,
+            sample,
+            start_sample,
+            samples_per_pixel,
+            GHOST_BAR_COLOR,
+            window,
+        );
+    }
+
     if let Some(pos) = &provider.current_position {
         if pos.channels.applies_to(channel) {
-            paint_position_bar(bounds, pos.sample, start_sample, samples_per_pixel, window);
+            paint_vertical_bar(
+                bounds,
+                pos.sample,
+                start_sample,
+                samples_per_pixel,
+                POSITION_BAR_COLOR,
+                window,
+            );
         }
     }
 }
@@ -653,6 +702,7 @@ impl Render for WaveformDisplay {
         let selection = self.document.read(cx).selection.clone();
         let start_sample = self.start_sample;
         let samples_per_pixel = self.samples_per_pixel;
+        let hover_sample = self.hover_sample;
         let entity = cx.entity();
         let channel_count = self
             .document
@@ -709,18 +759,32 @@ impl Render for WaveformDisplay {
                         )
                     })
                     .when(!is_empty, |this| {
-                        this.child(v_flex().w_full().h_full().children((0..channel_count).map(
-                            |ch| {
-                                let document = document.clone();
-                                let entity = entity.clone();
-                                let selection = selection.clone();
-                                let color = channel_color(&theme, ch);
-                                let zero = theme.border;
-                                let channel_label = WaveformDataProvider::channel_label(
-                                    &*document.read(cx).buffer.read().unwrap(),
-                                    ch,
-                                );
-                                h_flex()
+                        this.child(
+                            v_flex()
+                                .id("waveform-lanes")
+                                .w_full()
+                                .h_full()
+                                .on_mouse_move(cx.listener(
+                                    |this, event: &MouseMoveEvent, _, cx| {
+                                        this.set_hover_at(event.position.x.as_f32(), cx);
+                                    },
+                                ))
+                                .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
+                                    if !*hovered {
+                                        this.clear_hover(cx);
+                                    }
+                                }))
+                                .children((0..channel_count).map(|ch| {
+                                    let document = document.clone();
+                                    let entity = entity.clone();
+                                    let selection = selection.clone();
+                                    let color = channel_color(&theme, ch);
+                                    let zero = theme.border;
+                                    let channel_label = WaveformDataProvider::channel_label(
+                                        &*document.read(cx).buffer.read().unwrap(),
+                                        ch,
+                                    );
+                                    h_flex()
                                     .id(SharedString::from(format!("lane-{ch}")))
                                     .w_full()
                                     .flex_1()
@@ -803,6 +867,7 @@ impl Render for WaveformDisplay {
                                                                 color,
                                                                 zero,
                                                                 &selection,
+                                                                hover_sample,
                                                                 window,
                                                             );
                                                         }
@@ -811,8 +876,8 @@ impl Render for WaveformDisplay {
                                                 .size_full(),
                                             ),
                                     )
-                            },
-                        )))
+                                })),
+                        )
                     })
                     .context_menu(move |menu, _, _| {
                         menu.menu_with_check("Zero Crossing", snap, Box::new(ToggleZeroCrossing))
@@ -894,6 +959,25 @@ impl Render for WaveformDisplay {
                 })
             })
     }
+}
+
+fn hover_sample_from_x(
+    x: f32,
+    content_origin_x: f32,
+    viewport_width: f32,
+    start_sample: f64,
+    samples_per_pixel: f64,
+    frames: usize,
+) -> Option<usize> {
+    if frames == 0 || viewport_width <= 0.0 {
+        return None;
+    }
+    if x < content_origin_x || x > content_origin_x + viewport_width {
+        return None;
+    }
+    let local = (x - content_origin_x).max(0.0) as f64;
+    let sample = start_sample + local * samples_per_pixel;
+    Some(sample.round().clamp(0.0, (frames - 1) as f64) as usize)
 }
 
 fn max_samples_per_pixel_for(frames: f64, viewport_width: f32) -> f64 {
@@ -985,5 +1069,30 @@ mod tests {
         let spp = 10.0;
         apply_scroll_to_frame(&mut start, spp, 100.0, 10_000.0, 4500.0);
         assert!((start - 4000.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn hover_sample_maps_pixel_inside_viewport() {
+        let sample = hover_sample_from_x(150.0, 50.0, 100.0, 1000.0, 10.0, 10_000);
+        assert_eq!(sample, Some(2000));
+    }
+
+    #[test]
+    fn hover_sample_is_none_outside_viewport_or_empty_buffer() {
+        assert_eq!(
+            hover_sample_from_x(40.0, 50.0, 100.0, 0.0, 10.0, 10_000),
+            None
+        );
+        assert_eq!(
+            hover_sample_from_x(160.0, 50.0, 100.0, 0.0, 10.0, 10_000),
+            None
+        );
+        assert_eq!(hover_sample_from_x(80.0, 50.0, 100.0, 0.0, 10.0, 0), None);
+    }
+
+    #[test]
+    fn hover_sample_clamps_to_last_frame() {
+        let sample = hover_sample_from_x(149.0, 50.0, 100.0, 0.0, 100.0, 50);
+        assert_eq!(sample, Some(49));
     }
 }
