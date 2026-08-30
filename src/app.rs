@@ -500,7 +500,7 @@ fn app_menus() -> Vec<Menu> {
             MenuItem::separator(),
             MenuItem::action("Quit", Quit),
         ]),
-        Menu::new("snd-review").items([MenuItem::action("About", About)]),
+        Menu::new("Help").items([MenuItem::action("About...", About)]),
     ]
 }
 
