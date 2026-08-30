@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT
 
 use std::path::PathBuf;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use cpal::Device;
@@ -47,6 +47,7 @@ pub struct AppView {
     waveform: Entity<WaveformDisplay>,
     playback: PlaybackSession,
     app_menu_bar: Option<Entity<AppMenuBar>>,
+    pending_opens: Arc<Mutex<Vec<PathBuf>>>,
 }
 
 impl AppView {
@@ -55,6 +56,8 @@ impl AppView {
         device: Device,
         document: Entity<BufferDocument>,
         playback: PlaybackSession,
+        pending_opens: Arc<Mutex<Vec<PathBuf>>>,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
         cx.observe(&document, |this, _, cx| {
@@ -64,21 +67,22 @@ impl AppView {
         .detach();
 
         let document_for_poll = document.clone();
-        cx.spawn(async move |this, cx| {
+        cx.spawn_in(window, async move |this, cx| {
             loop {
                 cx.background_executor()
                     .timer(Duration::from_millis(33))
                     .await;
-                if this
-                    .update(cx, |this, cx| {
+                let still_alive = cx.update(|window, cx| {
+                    this.update(cx, |this, cx| {
+                        this.drain_pending_opens(window, cx);
                         this.document.update(cx, |doc, cx| {
                             this.playback.poll(doc);
                             cx.notify();
                         });
                         cx.notify();
                     })
-                    .is_err()
-                {
+                });
+                if !matches!(still_alive, Ok(Ok(()))) {
                     break;
                 }
                 let _ = &document_for_poll;
@@ -94,6 +98,7 @@ impl AppView {
             waveform,
             playback,
             app_menu_bar: (!cfg!(target_os = "macos")).then(|| AppMenuBar::new(cx)),
+            pending_opens,
         }
     }
 
@@ -133,6 +138,13 @@ impl AppView {
                 .title("Failed to open file")
                 .description(message.clone())
         });
+    }
+
+    fn drain_pending_opens(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let paths = std::mem::take(&mut *self.pending_opens.lock().unwrap());
+        if let Some(path) = paths.into_iter().next() {
+            self.open_path(path, window, cx);
+        }
     }
 
     fn open_path(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
@@ -529,6 +541,43 @@ fn install_app_menu(cx: &mut App) {
     cx.activate(true);
 }
 
+fn path_from_open_url(url: &str) -> Option<PathBuf> {
+    let decoded = if let Some(rest) = url.strip_prefix("file://") {
+        let path = if rest.starts_with('/') {
+            rest
+        } else {
+            let slash = rest.find('/')?;
+            &rest[slash..]
+        };
+        percent_decode(path)?
+    } else if url.starts_with('/') {
+        url.to_owned()
+    } else {
+        return None;
+    };
+    Some(PathBuf::from(decoded))
+}
+
+fn percent_decode(input: &str) -> Option<String> {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            if i + 2 >= bytes.len() {
+                return None;
+            }
+            let hex = std::str::from_utf8(&bytes[i + 1..i + 3]).ok()?;
+            out.push(u8::from_str_radix(hex, 16).ok()?);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
 pub fn run(initial_buffer: Option<Buffer>, device: Device) {
     let buffer = initial_buffer.unwrap_or_else(Buffer::empty);
     let title = AppView::buffer_title(&buffer);
@@ -536,37 +585,57 @@ pub fn run(initial_buffer: Option<Buffer>, device: Device) {
     let shared = Arc::new(RwLock::new(buffer));
     let playback = PlaybackSession::open(&device, shared.clone())
         .expect("failed to open audio playback device");
+    let pending_opens = Arc::new(Mutex::new(Vec::<PathBuf>::new()));
 
-    gpui_platform::application()
-        .with_assets(gpui_component_assets::Assets)
-        .run(move |cx| {
-            gpui_component::init(cx);
-            Theme::change(ThemeMode::Dark, None, cx);
-            install_app_menu(cx);
+    let app = gpui_platform::application().with_assets(gpui_component_assets::Assets);
+    app.on_open_urls({
+        let pending_opens = pending_opens.clone();
+        move |urls| {
+            let mut pending = pending_opens.lock().unwrap();
+            for url in urls {
+                if let Some(path) = path_from_open_url(&url) {
+                    pending.push(path);
+                }
+            }
+        }
+    });
+    app.run(move |cx| {
+        gpui_component::init(cx);
+        Theme::change(ThemeMode::Dark, None, cx);
+        install_app_menu(cx);
 
-            let title = title.clone();
-            cx.spawn(async move |cx| {
-                let options = WindowOptions {
-                    titlebar: Some(TitlebarOptions {
-                        title: Some(title.clone()),
-                        ..Default::default()
-                    }),
-                    window_bounds: Some(WindowBounds::Windowed(Bounds {
-                        origin: point(px(80.), px(80.)),
-                        size: size(px(1280.), px(760.)),
-                    })),
+        let title = title.clone();
+        let pending_opens = pending_opens.clone();
+        cx.spawn(async move |cx| {
+            let options = WindowOptions {
+                titlebar: Some(TitlebarOptions {
+                    title: Some(title.clone()),
                     ..Default::default()
-                };
+                }),
+                window_bounds: Some(WindowBounds::Windowed(Bounds {
+                    origin: point(px(80.), px(80.)),
+                    size: size(px(1280.), px(760.)),
+                })),
+                ..Default::default()
+            };
 
-                cx.open_window(options, move |window, cx| {
-                    let document = cx.new(|_| BufferDocument::with_shared(shared.clone()));
-                    let view = cx.new(|cx| {
-                        AppView::new(shared.clone(), device, document, playback, cx)
-                    });
-                    cx.new(|cx| Root::new(view, window, cx).bg(cx.theme().background))
-                })
-                .expect("failed to open window");
+            cx.open_window(options, move |window, cx| {
+                let document = cx.new(|_| BufferDocument::with_shared(shared.clone()));
+                let view = cx.new(|cx| {
+                    AppView::new(
+                        shared.clone(),
+                        device,
+                        document,
+                        playback,
+                        pending_opens.clone(),
+                        window,
+                        cx,
+                    )
+                });
+                cx.new(|cx| Root::new(view, window, cx).bg(cx.theme().background))
             })
-            .detach();
-        });
+            .expect("failed to open window");
+        })
+        .detach();
+    });
 }
