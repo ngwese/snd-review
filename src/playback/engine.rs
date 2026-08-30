@@ -20,6 +20,7 @@ pub struct PlaybackShared {
     pub looping: std::sync::atomic::AtomicBool,
     pub in_point: AtomicUsize,
     pub out_point: AtomicUsize,
+    epoch: AtomicUsize,
     source_rate: u32,
     output_rate: u32,
 }
@@ -35,7 +36,12 @@ impl PlaybackShared {
             looping: std::sync::atomic::AtomicBool::new(false),
             in_point: AtomicUsize::new(IN_OUT_NONE),
             out_point: AtomicUsize::new(IN_OUT_NONE),
+            epoch: AtomicUsize::new(0),
         }
+    }
+
+    pub fn bump_epoch(&self) {
+        self.epoch.fetch_add(1, Ordering::SeqCst);
     }
 
     pub fn set_transport(&self, state: TransportState) {
@@ -88,7 +94,7 @@ impl PlaybackShared {
         }
     }
 
-    fn fill_output(&self, output: &mut [f32]) {
+    pub(crate) fn fill_output(&self, output: &mut [f32]) {
         output.fill(0.0);
         if self.transport() != TransportState::Playing {
             return;
@@ -107,9 +113,20 @@ impl PlaybackShared {
         let start_bound = self.playback_start();
         let looping = self.looping.load(Ordering::SeqCst);
         let step = self.source_rate as f64 / self.output_rate as f64;
+        let epoch = self.epoch.load(Ordering::SeqCst);
+        let origin = self.position.load(Ordering::SeqCst);
 
-        let mut pos_f = self.position.load(Ordering::SeqCst) as f64;
+        // A new Play issued while parked on the last sample should start over.
+        // Natural end-of-buffer always sets Stopped, so this only runs on a
+        // fresh Playing transition from the end.
+        let mut pos_f = if !looping && origin >= end {
+            start_bound as f64
+        } else {
+            origin as f64
+        };
+
         let mut frame_buf = vec![0.0f32; channels];
+        let mut reached_end = false;
 
         for out_frame in 0..out_frames {
             let source_pos = pos_f as usize;
@@ -118,8 +135,7 @@ impl PlaybackShared {
                     pos_f = start_bound as f64;
                     continue;
                 }
-                self.set_transport(TransportState::Stopped);
-                self.position.store(end, Ordering::SeqCst);
+                reached_end = true;
                 break;
             }
 
@@ -129,6 +145,20 @@ impl PlaybackShared {
                 output[out_frame * channels + ch] = frame_buf[ch];
             }
             pos_f += step;
+        }
+
+        if !looping && pos_f > end as f64 {
+            reached_end = true;
+        }
+
+        if self.epoch.load(Ordering::SeqCst) != epoch {
+            return;
+        }
+
+        if reached_end {
+            self.set_transport(TransportState::Stopped);
+            self.position.store(end, Ordering::SeqCst);
+            return;
         }
 
         let final_pos = pos_f.min(end as f64) as usize;
@@ -238,4 +268,54 @@ fn build_output_stream(
         other => anyhow::bail!("unsupported output sample format: {other:?}"),
     }
     .map_err(Into::into)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::audio::DecodedAudio;
+
+    fn shared(frames: usize) -> PlaybackShared {
+        let audio = DecodedAudio {
+            sample_rate: 44100,
+            channels: vec![vec![0.0; frames]],
+            peaks: vec![vec![]],
+        };
+        PlaybackShared::new(Arc::new(audio), 44100)
+    }
+
+    #[test]
+    fn play_from_last_sample_without_loop_restarts_from_start() {
+        let shared = shared(100);
+        shared.set_position(99);
+        shared.set_transport(TransportState::Playing);
+        let mut out = vec![0.0; 8];
+        shared.fill_output(&mut out);
+        assert_eq!(shared.transport(), TransportState::Playing);
+        assert_eq!(shared.position(), 8);
+    }
+
+    #[test]
+    fn reaching_end_without_loop_stops_on_last_sample() {
+        let shared = shared(100);
+        shared.set_position(98);
+        shared.set_transport(TransportState::Playing);
+        let mut out = vec![0.0; 16];
+        shared.fill_output(&mut out);
+        assert_eq!(shared.transport(), TransportState::Stopped);
+        assert_eq!(shared.position(), 99);
+    }
+
+    #[test]
+    fn stale_callback_does_not_stop_restarted_play() {
+        let shared = shared(100);
+        shared.set_position(99);
+        shared.set_transport(TransportState::Playing);
+        shared.bump_epoch();
+        shared.set_position(0);
+        let mut out = vec![0.0; 8];
+        shared.fill_output(&mut out);
+        assert_eq!(shared.transport(), TransportState::Playing);
+        assert_eq!(shared.position(), 8);
+    }
 }

@@ -90,6 +90,10 @@ impl Playhead {
         self.in_point.unwrap_or(0)
     }
 
+    pub fn is_at_end(&self) -> bool {
+        self.position >= self.playback_end()
+    }
+
     /// End sample for transport **End** command (region out or buffer end).
     pub fn transport_end(&self) -> usize {
         self.out_point.unwrap_or_else(|| self.max_sample())
@@ -162,5 +166,15 @@ mod tests {
         ph.set_position(995);
         assert_eq!(ph.advance(10), PlayheadEvent::ReachedEnd);
         assert_eq!(ph.position(), 999);
+        assert!(ph.is_at_end());
+    }
+
+    #[test]
+    fn is_at_end_is_false_before_last_sample() {
+        let mut ph = playhead(1000);
+        ph.set_position(998);
+        assert!(!ph.is_at_end());
+        ph.set_position(999);
+        assert!(ph.is_at_end());
     }
 }

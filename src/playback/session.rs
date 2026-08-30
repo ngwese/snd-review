@@ -138,22 +138,24 @@ impl PlaybackSession {
     pub fn start(&mut self) {
         self.playhead.set_position(self.playhead.playback_start());
         self.transport.set_state(TransportState::Playing);
+        self.engine.shared.bump_epoch();
         self.apply_to_engine();
     }
 
     pub fn play(&mut self) {
-        match self.transport.state() {
-            TransportState::Paused => {
-                self.transport.set_state(TransportState::Playing);
-            }
-            TransportState::Stopped => {
-                if self.playhead.in_point().is_some() {
-                    self.playhead.set_position(self.playhead.playback_start());
-                }
-                self.transport.set_state(TransportState::Playing);
-            }
-            TransportState::Playing => {}
+        if self.transport.state() == TransportState::Playing {
+            return;
         }
+        self.playhead.set_position(self.engine.shared.position());
+        if should_restart_from_start(
+            self.transport.state(),
+            self.playhead.is_at_end(),
+            self.playhead.in_point().is_some(),
+        ) {
+            self.playhead.set_position(self.playhead.playback_start());
+        }
+        self.transport.set_state(TransportState::Playing);
+        self.engine.shared.bump_epoch();
         self.apply_to_engine();
     }
 
@@ -233,10 +235,70 @@ impl PlaybackSession {
             && self.transport.state() == TransportState::Playing
         {
             self.transport.set_state(TransportState::Stopped);
-            self.sync_playhead_from_engine();
+            self.playhead.set_position(self.engine.shared.position());
+            doc.set_position_from_playback(self.playhead.position(), ChannelScope::all());
+            return;
         }
         if self.transport.is_playing() {
             self.sync_document_from_playback(doc);
         }
+    }
+}
+
+fn should_restart_from_start(state: TransportState, at_end: bool, has_region: bool) -> bool {
+    match state {
+        TransportState::Stopped => has_region || at_end,
+        TransportState::Paused => at_end,
+        TransportState::Playing => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn play_from_stopped_at_end_restarts_from_start() {
+        assert!(should_restart_from_start(
+            TransportState::Stopped,
+            true,
+            false
+        ));
+    }
+
+    #[test]
+    fn play_from_stopped_mid_buffer_keeps_position() {
+        assert!(!should_restart_from_start(
+            TransportState::Stopped,
+            false,
+            false
+        ));
+    }
+
+    #[test]
+    fn play_from_stopped_with_region_restarts_from_in_point() {
+        assert!(should_restart_from_start(
+            TransportState::Stopped,
+            false,
+            true
+        ));
+    }
+
+    #[test]
+    fn play_from_paused_at_end_restarts_from_start() {
+        assert!(should_restart_from_start(
+            TransportState::Paused,
+            true,
+            false
+        ));
+    }
+
+    #[test]
+    fn play_from_paused_mid_buffer_keeps_position() {
+        assert!(!should_restart_from_start(
+            TransportState::Paused,
+            false,
+            false
+        ));
     }
 }
