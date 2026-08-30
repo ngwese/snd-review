@@ -1,0 +1,114 @@
+#!/usr/bin/env bash
+# SPDX-FileCopyrightText: 2026 Greg Wuller
+# SPDX-License-Identifier: MIT
+#
+# Build a double-clickable snd-review.app and optionally install it for
+# Finder and CLI use.
+
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage: script/bundle-macos [--install]
+
+Build a macOS application bundle at target/release/snd-review.app.
+
+      --install   Copy the bundle to ~/Applications/snd-review.app and
+                  symlink ~/.local/bin/snd-review to the bundled binary
+  -h, --help      Show this help
+EOF
+}
+
+if [[ "$(uname -s)" != "Darwin" ]]; then
+  echo "error: script/bundle-macos only runs on macOS" >&2
+  exit 1
+fi
+
+install=false
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --install)
+      install=true
+      shift
+      ;;
+    -h | --help)
+      usage
+      exit 0
+      ;;
+    *)
+      echo "error: unknown argument: $1" >&2
+      usage >&2
+      exit 1
+      ;;
+  esac
+done
+
+root="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$root"
+
+version="$(awk -F '"' '/^version = / { print $2; exit }' Cargo.toml)"
+if [[ -z "$version" ]]; then
+  echo "error: could not read version from Cargo.toml" >&2
+  exit 1
+fi
+
+echo "Building snd-review ${version} (release)..."
+cargo build --release
+
+binary="$root/target/release/snd-review"
+if [[ ! -x "$binary" ]]; then
+  echo "error: missing release binary: $binary" >&2
+  exit 1
+fi
+
+app="$root/target/release/snd-review.app"
+contents="$app/Contents"
+macos_dir="$contents/MacOS"
+resources="$contents/Resources"
+
+rm -rf "$app"
+mkdir -p "$macos_dir" "$resources"
+
+sed "s/__VERSION__/${version}/g" "$root/macos/Info.plist" > "$contents/Info.plist"
+printf 'APPL????' > "$contents/PkgInfo"
+cp "$binary" "$macos_dir/snd-review"
+chmod +x "$macos_dir/snd-review"
+
+if ! plutil -lint "$contents/Info.plist" >/dev/null; then
+  echo "error: generated Info.plist is invalid" >&2
+  exit 1
+fi
+
+echo "Ad-hoc signing $app..."
+codesign --force --deep --sign - "$app"
+
+echo "Created $app"
+
+if [[ "$install" != true ]]; then
+  exit 0
+fi
+
+app_dest="$HOME/Applications/snd-review.app"
+bin_dir="$HOME/.local/bin"
+cli_link="$bin_dir/snd-review"
+
+mkdir -p "$HOME/Applications" "$bin_dir"
+rm -rf "$app_dest"
+ditto "$app" "$app_dest"
+ln -sfn "$app_dest/Contents/MacOS/snd-review" "$cli_link"
+
+echo "Installed $app_dest"
+echo "Linked $cli_link -> $app_dest/Contents/MacOS/snd-review"
+
+case ":$PATH:" in
+  *":$bin_dir:"*)
+    ;;
+  *)
+    cat <<EOF >&2
+warning: $bin_dir is not on PATH.
+Add the following to ~/.zshrc, then open a new terminal:
+
+  export PATH="\$HOME/.local/bin:\$PATH"
+EOF
+    ;;
+esac
