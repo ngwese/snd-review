@@ -1,3 +1,5 @@
+use std::sync::{Arc, RwLock};
+
 use super::buffer::{Buffer, ChannelScope, MarkerId, Region, RegionId};
 use super::selection::{SamplePosition, Selection};
 use super::snap::nearest_zero_crossing_default;
@@ -6,7 +8,7 @@ use crate::components::waveform::WaveformDataProvider;
 const DRAG_THRESHOLD_SAMPLES: usize = 0;
 
 pub struct BufferDocument {
-    pub buffer: Buffer,
+    pub buffer: Arc<RwLock<Buffer>>,
     pub selection: Selection,
     pub current_position: Option<SamplePosition>,
     pub snap_zero_crossings: bool,
@@ -17,6 +19,18 @@ pub struct BufferDocument {
 
 impl BufferDocument {
     pub fn new(buffer: Buffer) -> Self {
+        Self {
+            buffer: Arc::new(RwLock::new(buffer)),
+            selection: Selection::None,
+            current_position: None,
+            snap_zero_crossings: false,
+            region_drag_anchor: None,
+            next_region_id: 1,
+            next_marker_id: 1,
+        }
+    }
+
+    pub fn with_shared(buffer: Arc<RwLock<Buffer>>) -> Self {
         Self {
             buffer,
             selection: Selection::None,
@@ -32,11 +46,16 @@ impl BufferDocument {
         self.snap_zero_crossings = !self.snap_zero_crossings;
     }
 
+    pub fn is_region_drag_active(&self) -> bool {
+        self.region_drag_anchor.is_some()
+    }
+
     fn snap_channel(&self, channel: usize, sample: usize) -> usize {
         if !self.snap_zero_crossings {
             return sample;
         }
-        let samples = WaveformDataProvider::channel_samples(&self.buffer.audio, channel);
+        let buffer = self.buffer.read().unwrap();
+        let samples = WaveformDataProvider::channel_samples(&buffer.audio, channel);
         nearest_zero_crossing_default(samples, sample)
     }
 
@@ -52,12 +71,12 @@ impl BufferDocument {
     }
 
     fn clamp_sample(&self, sample: usize) -> usize {
-        let max = self.buffer.frames().saturating_sub(1);
+        let max = self.buffer.read().unwrap().frames().saturating_sub(1);
         sample.min(max)
     }
 
     pub fn sample_to_secs(&self, sample: usize) -> f64 {
-        let rate = self.buffer.audio.sample_rate;
+        let rate = self.buffer.read().unwrap().audio.sample_rate;
         if rate == 0 {
             0.0
         } else {
@@ -87,6 +106,8 @@ impl BufferDocument {
 
     pub fn hit_test_region(&self, sample: usize, lane: usize) -> Option<RegionId> {
         self.buffer
+            .read()
+            .unwrap()
             .regions
             .iter()
             .rev()
@@ -104,7 +125,8 @@ impl BufferDocument {
     pub fn select_region_at(&mut self, sample: usize, lane: usize, scope: ChannelScope) {
         let sample = self.clamp_sample(self.snap_sample(&scope, sample));
         if let Some(id) = self.hit_test_region(sample, lane) {
-            if let Some(region) = self.buffer.region(id).cloned() {
+            let region = self.buffer.read().unwrap().region(id).cloned();
+            if let Some(region) = region {
                 self.region_drag_anchor = None;
                 self.set_current_position_sample(region.end, region.channels.clone());
                 self.selection = Selection::Region {
@@ -152,7 +174,6 @@ impl BufferDocument {
             *sel_start = start;
             *sel_end = end;
         }
-        self.set_current_position_sample(end, channels);
     }
 
     pub fn finish_region_drag(&mut self) {
@@ -178,7 +199,7 @@ impl BufferDocument {
         self.set_current_position_sample(end, channels.clone());
 
         if let Some(id) = region_id {
-            if let Some(region) = self.buffer.region_mut(id) {
+            if let Some(region) = self.buffer.write().unwrap().region_mut(id) {
                 region.start = start;
                 region.end = end;
                 region.channels = channels.clone();
@@ -203,7 +224,7 @@ impl BufferDocument {
         let id = RegionId(self.next_region_id);
         self.next_region_id += 1;
         let region = Region::new(id, start, end, channels);
-        self.buffer.regions.push(region);
+        self.buffer.write().unwrap().regions.push(region);
         id
     }
 
@@ -214,7 +235,7 @@ impl BufferDocument {
     ) -> MarkerId {
         let id = MarkerId(self.next_marker_id);
         self.next_marker_id += 1;
-        self.buffer.markers.push(super::buffer::Marker {
+        self.buffer.write().unwrap().markers.push(super::buffer::Marker {
             id,
             sample,
             channels,
@@ -227,6 +248,21 @@ impl BufferDocument {
 
     pub fn selection_position_sample(&self) -> Option<usize> {
         self.current_position.as_ref().map(|pos| pos.sample)
+    }
+
+    pub fn set_position_from_playback(&mut self, sample: usize, scope: ChannelScope) {
+        if self.is_region_drag_active() {
+            return;
+        }
+        let sample = self.clamp_sample(sample);
+        if self
+            .current_position
+            .as_ref()
+            .is_some_and(|pos| pos.sample == sample)
+        {
+            return;
+        }
+        self.set_current_position_sample(sample, scope);
     }
 }
 
@@ -252,7 +288,7 @@ mod tests {
     #[test]
     fn full_region_spans_buffer() {
         let doc = test_document(1000);
-        let region = doc.buffer.full_region();
+        let region = doc.buffer.read().unwrap().full_region();
         assert_eq!(region.start, 0);
         assert_eq!(region.end, 999);
         assert!(region.channels.applies_to(0));
@@ -273,7 +309,8 @@ mod tests {
         }
         doc.update_region_drag(50);
         doc.finish_region_drag();
-        let region = doc.buffer.region(id).unwrap();
+        let buffer = doc.buffer.read().unwrap();
+        let region = buffer.region(id).unwrap();
         assert_eq!(region.start, 10);
         assert_eq!(region.end, 50);
         assert_eq!(doc.current_position.as_ref().map(|p| p.sample), Some(50));
@@ -285,7 +322,7 @@ mod tests {
         doc.begin_region_drag(10, ChannelScope::all());
         doc.update_region_drag(50);
         doc.finish_region_drag();
-        assert!(doc.buffer.regions.is_empty());
+        assert!(doc.buffer.read().unwrap().regions.is_empty());
         assert!(matches!(doc.selection, Selection::Region { region_id: None, .. }));
         assert_eq!(doc.current_position.as_ref().map(|p| p.sample), Some(50));
     }
