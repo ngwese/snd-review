@@ -4,6 +4,7 @@ use gpui::{
     MouseUpEvent, ParentElement as _, PathBuilder, Pixels, Render, ScrollWheelEvent, SharedString,
     StatefulInteractiveElement as _, Styled as _, Window,
 };
+use gpui::prelude::FluentBuilder as _;
 use gpui_component::{
     h_flex,
     menu::ContextMenuExt,
@@ -104,6 +105,22 @@ impl WaveformDisplay {
         self.start_sample = 0.0;
         self.samples_per_pixel = self.max_samples_per_pixel(cx);
         cx.notify();
+    }
+
+    pub fn reset_view(&mut self, cx: &mut Context<Self>) {
+        self.drag = None;
+        self.start_sample = 0.0;
+        let frames = self.frames(cx);
+        self.samples_per_pixel = if frames == 0 {
+            1.0
+        } else {
+            (frames as f64 / 1000.0).max(MIN_SAMPLES_PER_PIXEL)
+        };
+        if frames > 0 {
+            self.fit(cx);
+        } else {
+            cx.notify();
+        }
     }
 
     fn frames(&self, cx: &App) -> usize {
@@ -595,6 +612,7 @@ impl Render for WaveformDisplay {
         let samples_per_pixel = self.samples_per_pixel;
         let entity = cx.entity();
         let channel_count = self.document.read(cx).buffer.read().unwrap().audio.channel_count();
+        let is_empty = channel_count == 0;
 
         v_flex()
             .size_full()
@@ -610,6 +628,9 @@ impl Render for WaveformDisplay {
                         cx.notify();
                     }))
                     .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, _, cx| {
+                        if this.document.read(cx).buffer.read().unwrap().frames() == 0 {
+                            return;
+                        }
                         let delta = event.delta.pixel_delta(px(16.));
                         let dx = delta.x.as_f32();
                         let dy = delta.y.as_f32();
@@ -628,7 +649,19 @@ impl Render for WaveformDisplay {
                         }
                         cx.notify();
                     }))
-                    .child(
+                    .when(is_empty, |this| {
+                        this.flex()
+                            .items_center()
+                            .justify_center()
+                            .child(
+                                div()
+                                    .text_center()
+                                    .text_color(theme.muted_foreground)
+                                    .child("Drop an audio file here or use File → Open…"),
+                            )
+                    })
+                    .when(!is_empty, |this| {
+                        this.child(
                         v_flex()
                             .w_full()
                             .h_full()
@@ -727,12 +760,14 @@ impl Render for WaveformDisplay {
                                             ),
                                     )
                             })),
-                    )
+                        )
+                    })
                     .context_menu(move |menu, _, _| {
                         menu.menu_with_check("Zero Crossing", snap, Box::new(ToggleZeroCrossing))
                     }),
             )
-            .child({
+            .when(!is_empty, |this| {
+                this.child({
                 let frames = self.document.read(cx).buffer.read().unwrap().frames();
                 let start = start_sample;
                 let spp = samples_per_pixel;
@@ -804,6 +839,7 @@ impl Render for WaveformDisplay {
                                 }),
                             ),
                     )
+                })
             })
     }
 }

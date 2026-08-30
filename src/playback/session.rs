@@ -219,6 +219,18 @@ impl PlaybackSession {
         }
     }
 
+    pub fn reload(&mut self, device: &Device, buffer: &Buffer) -> Result<()> {
+        self.stop();
+        self.playhead.set_position(0);
+        self.playhead.clear_in_out();
+        self.active_region = None;
+        self.anchors = collect_anchors(buffer);
+        let provider = self.playhead.provider().clone();
+        self.engine = PlaybackEngine::open(device, provider)?;
+        self.apply_to_engine();
+        Ok(())
+    }
+
     pub fn poll(&mut self, doc: &mut BufferDocument) {
         let engine_state = self.engine.shared.transport();
         if engine_state == TransportState::Stopped

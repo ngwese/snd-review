@@ -87,6 +87,23 @@ pub struct Buffer {
 }
 
 impl Buffer {
+    pub fn empty() -> Self {
+        Self {
+            audio: DecodedAudio {
+                sample_rate: 44100,
+                channels: vec![],
+                peaks: vec![],
+            },
+            source: None,
+            regions: vec![],
+            markers: vec![],
+        }
+    }
+
+    pub fn is_loaded(&self) -> bool {
+        self.frames() > 0
+    }
+
     pub fn frames(&self) -> usize {
         self.audio.frames()
     }
