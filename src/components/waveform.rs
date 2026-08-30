@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Greg Wuller
+// SPDX-License-Identifier: MIT
+
 use gpui::{
     actions, canvas, div, fill, hsla, point, px, size, App, Bounds, Context, DispatchPhase,
     Entity, InteractiveElement as _, IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent,

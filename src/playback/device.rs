@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Greg Wuller
+// SPDX-License-Identifier: MIT
+
 use anyhow::{anyhow, bail, Context, Result};
 use cpal::traits::{DeviceTrait, HostTrait};
 use cpal::Device;

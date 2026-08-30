@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Greg Wuller
+// SPDX-License-Identifier: MIT
+
 use std::{fs, fs::File, path::Path, time::SystemTime};
 
 use anyhow::{bail, Context, Result};

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Greg Wuller
+// SPDX-License-Identifier: MIT
+
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;

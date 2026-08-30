@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Greg Wuller
+// SPDX-License-Identifier: MIT
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransportState {
     Stopped,

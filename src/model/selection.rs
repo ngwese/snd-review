@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Greg Wuller
+// SPDX-License-Identifier: MIT
+
 use super::buffer::{ChannelScope, RegionId};
 
 #[derive(Debug, Clone, PartialEq, Eq)]

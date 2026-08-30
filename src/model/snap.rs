@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Greg Wuller
+// SPDX-License-Identifier: MIT
+
 const DEFAULT_SEARCH_RADIUS: usize = 4096;
 
 fn is_zero_crossing(samples: &[f32], index: usize) -> bool {
