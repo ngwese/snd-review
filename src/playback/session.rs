@@ -28,8 +28,7 @@ pub struct PlaybackSession {
 impl PlaybackSession {
     pub fn open(device: &Device, buffer: Arc<RwLock<Buffer>>) -> Result<Self> {
         let anchors = collect_anchors(&buffer.read().unwrap());
-        let provider: Arc<dyn PlaybackDataProvider> =
-            Arc::new(SharedBufferProvider(buffer));
+        let provider: Arc<dyn PlaybackDataProvider> = Arc::new(SharedBufferProvider(buffer));
         let playhead = Playhead::new(provider.clone());
         let engine = PlaybackEngine::open(device, provider)?;
         Ok(Self {
@@ -67,22 +66,16 @@ impl PlaybackSession {
 
     fn apply_to_engine(&self) {
         self.engine.shared.set_position(self.playhead.position());
+        self.engine.shared.set_looping(self.playhead.looping());
         self.engine
             .shared
-            .set_looping(self.playhead.looping());
-        self.engine.shared.set_in_out(
-            self.playhead.in_point(),
-            self.playhead.out_point(),
-        );
-        self.engine
-            .shared
-            .set_transport(self.transport.state());
+            .set_in_out(self.playhead.in_point(), self.playhead.out_point());
+        self.engine.shared.set_transport(self.transport.state());
     }
 
     fn sync_playhead_from_engine(&mut self) {
         if self.transport.is_playing() {
-            self.playhead
-                .set_position(self.engine.shared.position());
+            self.playhead.set_position(self.engine.shared.position());
         }
     }
 

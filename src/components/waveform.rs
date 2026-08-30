@@ -1,13 +1,13 @@
 // SPDX-FileCopyrightText: 2026 Greg Wuller
 // SPDX-License-Identifier: MIT
 
+use gpui::prelude::FluentBuilder as _;
 use gpui::{
-    actions, canvas, div, fill, hsla, point, px, size, App, Bounds, Context, DispatchPhase,
-    Entity, InteractiveElement as _, IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent,
+    actions, canvas, div, fill, hsla, point, px, size, App, Bounds, Context, DispatchPhase, Entity,
+    InteractiveElement as _, IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent,
     MouseUpEvent, ParentElement as _, PathBuilder, Pixels, Render, ScrollWheelEvent, SharedString,
     StatefulInteractiveElement as _, Styled as _, Window,
 };
-use gpui::prelude::FluentBuilder as _;
 use gpui_component::{
     h_flex,
     menu::ContextMenuExt,
@@ -43,6 +43,7 @@ pub trait WaveformDataProvider: Send + Sync {
 
 const ZOOM_FACTOR: f64 = 1.25;
 const MIN_SAMPLES_PER_PIXEL: f64 = 1.0 / 50.0;
+const FRAME_PADDING: f64 = 0.1;
 const MIN_LANE_HEIGHT: f32 = 96.0;
 const MIN_THUMB: f32 = 24.0;
 const SCROLLBAR_HEIGHT: f32 = 14.0;
@@ -50,7 +51,9 @@ const DRAG_MOVE_THRESHOLD_PX: f32 = 3.0;
 const POSITION_BAR_COLOR: gpui::Hsla = hsla(0.0, 0.72, 0.55, 1.0);
 
 enum Drag {
-    Pan { last_x: f32 },
+    Pan {
+        last_x: f32,
+    },
     SelectRegion {
         lane: usize,
         alt: bool,
@@ -58,7 +61,9 @@ enum Drag {
         origin_x: f32,
         dragging: bool,
     },
-    Scrollbar { grab_offset: f32 },
+    Scrollbar {
+        grab_offset: f32,
+    },
 }
 
 pub struct WaveformDisplay {
@@ -107,6 +112,40 @@ impl WaveformDisplay {
     pub fn fit(&mut self, cx: &mut Context<Self>) {
         self.start_sample = 0.0;
         self.samples_per_pixel = self.max_samples_per_pixel(cx);
+        cx.notify();
+    }
+
+    pub fn frame(&mut self, cx: &mut Context<Self>) {
+        let frames = self.frames(cx) as f64;
+        let (region, position) = {
+            let doc = self.document.read(cx);
+            let region = match &doc.selection {
+                Selection::Region { start, end, .. } if *end > *start => {
+                    Some((*start as f64, *end as f64 + 1.0))
+                }
+                _ => None,
+            };
+            let position = doc.current_position.as_ref().map(|p| p.sample as f64);
+            (region, position)
+        };
+        if let Some((start, end)) = region {
+            apply_fit_range(
+                &mut self.start_sample,
+                &mut self.samples_per_pixel,
+                self.viewport_width,
+                frames,
+                start,
+                end,
+            );
+        } else if let Some(sample) = position {
+            apply_scroll_to_frame(
+                &mut self.start_sample,
+                self.samples_per_pixel,
+                self.viewport_width,
+                frames,
+                sample,
+            );
+        }
         cx.notify();
     }
 
@@ -400,7 +439,12 @@ fn paint_region_overlay(
     let origin_x = bounds.origin.x.as_f32();
     let origin_y = bounds.origin.y.as_f32();
     let height = bounds.size.height.as_f32();
-    let x0 = sample_to_x(region.start as f64, start_sample, samples_per_pixel, origin_x);
+    let x0 = sample_to_x(
+        region.start as f64,
+        start_sample,
+        samples_per_pixel,
+        origin_x,
+    );
     let x1 = sample_to_x(region.end as f64, start_sample, samples_per_pixel, origin_x);
     let left = x0.min(x1);
     let width = (x1 - x0).abs().max(1.0);
@@ -553,12 +597,8 @@ fn paint_lane(
             if bin_start >= samples.len() as f64 {
                 break;
             }
-            let (min, max) = WaveformDataProvider::min_max_in_range(
-                audio,
-                channel,
-                bin_start,
-                bin_end,
-            );
+            let (min, max) =
+                WaveformDataProvider::min_max_in_range(audio, channel, bin_start, bin_end);
             let y_max = y_scale.tick(&(max as f64)).unwrap_or(origin_y);
             let y_min = y_scale.tick(&(min as f64)).unwrap_or(origin_y + height);
             let top = y_max.min(y_min);
@@ -614,7 +654,14 @@ impl Render for WaveformDisplay {
         let start_sample = self.start_sample;
         let samples_per_pixel = self.samples_per_pixel;
         let entity = cx.entity();
-        let channel_count = self.document.read(cx).buffer.read().unwrap().audio.channel_count();
+        let channel_count = self
+            .document
+            .read(cx)
+            .buffer
+            .read()
+            .unwrap()
+            .audio
+            .channel_count();
         let is_empty = channel_count == 0;
 
         v_flex()
@@ -627,7 +674,8 @@ impl Render for WaveformDisplay {
                     .min_h_0()
                     .overflow_y_scroll()
                     .on_action(cx.listener(|this, _: &ToggleZeroCrossing, _, cx| {
-                        this.document.update(cx, |doc, _| doc.toggle_zero_crossing_snap());
+                        this.document
+                            .update(cx, |doc, _| doc.toggle_zero_crossing_snap());
                         cx.notify();
                     }))
                     .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, _, cx| {
@@ -653,32 +701,25 @@ impl Render for WaveformDisplay {
                         cx.notify();
                     }))
                     .when(is_empty, |this| {
-                        this.flex()
-                            .items_center()
-                            .justify_center()
-                            .child(
-                                div()
-                                    .text_center()
-                                    .text_color(theme.muted_foreground)
-                                    .child("Drop an audio file here or use File → Open…"),
-                            )
+                        this.flex().items_center().justify_center().child(
+                            div()
+                                .text_center()
+                                .text_color(theme.muted_foreground)
+                                .child("Drop an audio file here or use File → Open…"),
+                        )
                     })
                     .when(!is_empty, |this| {
-                        this.child(
-                        v_flex()
-                            .w_full()
-                            .h_full()
-                            .children((0..channel_count).map(|ch| {
+                        this.child(v_flex().w_full().h_full().children((0..channel_count).map(
+                            |ch| {
                                 let document = document.clone();
                                 let entity = entity.clone();
                                 let selection = selection.clone();
                                 let color = channel_color(&theme, ch);
                                 let zero = theme.border;
-                                let channel_label =
-                                    WaveformDataProvider::channel_label(
-                                        &*document.read(cx).buffer.read().unwrap(),
-                                        ch,
-                                    );
+                                let channel_label = WaveformDataProvider::channel_label(
+                                    &*document.read(cx).buffer.read().unwrap(),
+                                    ch,
+                                );
                                 h_flex()
                                     .id(SharedString::from(format!("lane-{ch}")))
                                     .w_full()
@@ -706,29 +747,37 @@ impl Render for WaveformDisplay {
                                             .h_full()
                                             .on_mouse_down(
                                                 MouseButton::Left,
-                                                cx.listener(move |this, event: &MouseDownEvent, _, cx| {
-                                                    let x = event.position.x.as_f32();
-                                                    let sample = this.sample_at_x(x).round() as usize;
-                                                    if event.modifiers.shift {
-                                                        this.drag = Some(Drag::Pan { last_x: x });
-                                                    } else {
-                                                        let alt = event.modifiers.alt;
-                                                        let scope = this.document.read(cx)
-                                                            .channel_scope_for_lane(ch, alt);
-                                                        this.document.update(cx, |doc, cx| {
-                                                            doc.begin_region_drag(sample, scope);
-                                                            cx.notify();
-                                                        });
-                                                        this.drag = Some(Drag::SelectRegion {
-                                                            lane: ch,
-                                                            alt,
-                                                            anchor_sample: sample,
-                                                            origin_x: x,
-                                                            dragging: false,
-                                                        });
-                                                    }
-                                                    cx.notify();
-                                                }),
+                                                cx.listener(
+                                                    move |this, event: &MouseDownEvent, _, cx| {
+                                                        let x = event.position.x.as_f32();
+                                                        let sample =
+                                                            this.sample_at_x(x).round() as usize;
+                                                        if event.modifiers.shift {
+                                                            this.drag =
+                                                                Some(Drag::Pan { last_x: x });
+                                                        } else {
+                                                            let alt = event.modifiers.alt;
+                                                            let scope = this
+                                                                .document
+                                                                .read(cx)
+                                                                .channel_scope_for_lane(ch, alt);
+                                                            this.document.update(cx, |doc, cx| {
+                                                                doc.begin_region_drag(
+                                                                    sample, scope,
+                                                                );
+                                                                cx.notify();
+                                                            });
+                                                            this.drag = Some(Drag::SelectRegion {
+                                                                lane: ch,
+                                                                alt,
+                                                                anchor_sample: sample,
+                                                                origin_x: x,
+                                                                dragging: false,
+                                                            });
+                                                        }
+                                                        cx.notify();
+                                                    },
+                                                ),
                                             )
                                             .child(
                                                 canvas(
@@ -762,8 +811,8 @@ impl Render for WaveformDisplay {
                                                 .size_full(),
                                             ),
                                     )
-                            })),
-                        )
+                            },
+                        )))
                     })
                     .context_menu(move |menu, _, _| {
                         menu.menu_with_check("Zero Crossing", snap, Box::new(ToggleZeroCrossing))
@@ -771,78 +820,170 @@ impl Render for WaveformDisplay {
             )
             .when(!is_empty, |this| {
                 this.child({
-                let frames = self.document.read(cx).buffer.read().unwrap().frames();
-                let start = start_sample;
-                let spp = samples_per_pixel;
-                let track = theme.scrollbar;
-                let thumb = theme.scrollbar_thumb;
-                let entity = entity.clone();
-                h_flex()
-                    .id("h-scroll")
-                    .w_full()
-                    .h(px(SCROLLBAR_HEIGHT))
-                    .flex_none()
-                    .border_t_1()
-                    .border_color(theme.border)
-                    .child(
-                        div()
-                            .w(px(48.))
-                            .h_full()
-                            .flex_none()
-                            .border_r_1()
-                            .border_color(theme.border),
-                    )
-                    .child(
-                        div()
-                            .id("h-scroll-track")
-                            .flex_1()
-                            .h_full()
-                            .child(
-                                canvas(
-                                    {
-                                        let entity = entity.clone();
-                                        move |bounds, _, cx| {
-                                            entity.update(cx, |this, _cx| {
-                                                this.remember_scrollbar(bounds);
-                                            });
-                                            bounds
-                                        }
-                                    },
-                                    move |bounds, _, window, _cx| {
-                                        paint_scrollbar(
-                                            bounds, frames, start, spp, track, thumb, window,
-                                        );
-                                        install_global_drag_listeners(entity.clone(), window);
-                                    },
+                    let frames = self.document.read(cx).buffer.read().unwrap().frames();
+                    let start = start_sample;
+                    let spp = samples_per_pixel;
+                    let track = theme.scrollbar;
+                    let thumb = theme.scrollbar_thumb;
+                    let entity = entity.clone();
+                    h_flex()
+                        .id("h-scroll")
+                        .w_full()
+                        .h(px(SCROLLBAR_HEIGHT))
+                        .flex_none()
+                        .border_t_1()
+                        .border_color(theme.border)
+                        .child(
+                            div()
+                                .w(px(48.))
+                                .h_full()
+                                .flex_none()
+                                .border_r_1()
+                                .border_color(theme.border),
+                        )
+                        .child(
+                            div()
+                                .id("h-scroll-track")
+                                .flex_1()
+                                .h_full()
+                                .child(
+                                    canvas(
+                                        {
+                                            let entity = entity.clone();
+                                            move |bounds, _, cx| {
+                                                entity.update(cx, |this, _cx| {
+                                                    this.remember_scrollbar(bounds);
+                                                });
+                                                bounds
+                                            }
+                                        },
+                                        move |bounds, _, window, _cx| {
+                                            paint_scrollbar(
+                                                bounds, frames, start, spp, track, thumb, window,
+                                            );
+                                            install_global_drag_listeners(entity.clone(), window);
+                                        },
+                                    )
+                                    .size_full(),
                                 )
-                                .size_full(),
-                            )
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(|this, event: &MouseDownEvent, _, cx| {
-                                    let x = event.position.x.as_f32();
-                                    let track_w = this.scrollbar_width.max(1.0);
-                                    let frames = this.frames(cx);
-                                    let (thumb_w, thumb_x) = scrollbar_geom(
-                                        frames,
-                                        this.start_sample,
-                                        this.samples_per_pixel,
-                                        track_w,
-                                    );
-                                    let local = x - this.scrollbar_origin_x;
-                                    let grab_offset =
-                                        if local >= thumb_x && local <= thumb_x + thumb_w {
-                                            local - thumb_x
-                                        } else {
-                                            thumb_w * 0.5
-                                        };
-                                    this.set_start_from_scrollbar_x(x, grab_offset, cx);
-                                    this.drag = Some(Drag::Scrollbar { grab_offset });
-                                    cx.notify();
-                                }),
-                            ),
-                    )
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|this, event: &MouseDownEvent, _, cx| {
+                                        let x = event.position.x.as_f32();
+                                        let track_w = this.scrollbar_width.max(1.0);
+                                        let frames = this.frames(cx);
+                                        let (thumb_w, thumb_x) = scrollbar_geom(
+                                            frames,
+                                            this.start_sample,
+                                            this.samples_per_pixel,
+                                            track_w,
+                                        );
+                                        let local = x - this.scrollbar_origin_x;
+                                        let grab_offset =
+                                            if local >= thumb_x && local <= thumb_x + thumb_w {
+                                                local - thumb_x
+                                            } else {
+                                                thumb_w * 0.5
+                                            };
+                                        this.set_start_from_scrollbar_x(x, grab_offset, cx);
+                                        this.drag = Some(Drag::Scrollbar { grab_offset });
+                                        cx.notify();
+                                    }),
+                                ),
+                        )
                 })
             })
+    }
+}
+
+fn max_samples_per_pixel_for(frames: f64, viewport_width: f32) -> f64 {
+    let width = viewport_width.max(1.0) as f64;
+    (frames / width).max(MIN_SAMPLES_PER_PIXEL)
+}
+
+fn clamp_viewport(
+    start_sample: &mut f64,
+    samples_per_pixel: &mut f64,
+    viewport_width: f32,
+    frames: f64,
+) {
+    *samples_per_pixel = samples_per_pixel.clamp(
+        MIN_SAMPLES_PER_PIXEL,
+        max_samples_per_pixel_for(frames, viewport_width),
+    );
+    let visible = *samples_per_pixel * viewport_width.max(1.0) as f64;
+    let max_start = (frames - visible).max(0.0);
+    *start_sample = start_sample.clamp(0.0, max_start);
+}
+
+fn apply_fit_range(
+    start_sample: &mut f64,
+    samples_per_pixel: &mut f64,
+    viewport_width: f32,
+    frames: f64,
+    range_start: f64,
+    range_end: f64,
+) {
+    let width = viewport_width.max(1.0) as f64;
+    let span = (range_end - range_start).max(1.0);
+    let pad = span * FRAME_PADDING;
+    let padded_start = (range_start - pad).max(0.0);
+    let padded_end = (range_end + pad).min(frames.max(padded_start + 1.0));
+    *samples_per_pixel = ((padded_end - padded_start) / width).max(MIN_SAMPLES_PER_PIXEL);
+    *start_sample = padded_start;
+    clamp_viewport(start_sample, samples_per_pixel, viewport_width, frames);
+}
+
+fn apply_scroll_to_frame(
+    start_sample: &mut f64,
+    samples_per_pixel: f64,
+    viewport_width: f32,
+    frames: f64,
+    sample: f64,
+) {
+    let mut spp = samples_per_pixel;
+    let visible = spp * viewport_width.max(1.0) as f64;
+    let margin = visible * FRAME_PADDING;
+    if sample < *start_sample + margin {
+        *start_sample = (sample - margin).max(0.0);
+    } else if sample > *start_sample + visible - margin {
+        *start_sample = sample + margin - visible;
+    }
+    clamp_viewport(start_sample, &mut spp, viewport_width, frames);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fit_range_zooms_to_region_with_padding() {
+        let mut start = 0.0;
+        let mut spp = 10.0;
+        apply_fit_range(&mut start, &mut spp, 100.0, 10_000.0, 1000.0, 2000.0);
+        let span = 1000.0;
+        let pad = span * FRAME_PADDING;
+        let expected_spp = (span + 2.0 * pad) / 100.0;
+        assert!((spp - expected_spp).abs() < 1e-9);
+        assert!((start - (1000.0 - pad)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn scroll_to_frame_pans_without_changing_zoom() {
+        let mut start = 0.0;
+        let spp = 10.0;
+        apply_scroll_to_frame(&mut start, spp, 100.0, 10_000.0, 8000.0);
+        // visible = 1000, margin = 100; start = 8000 + 100 - 1000 = 7100
+        assert!((start - 7100.0).abs() < 1e-9);
+        let visible = spp * 100.0;
+        assert!((visible - 1000.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn scroll_to_frame_is_noop_when_position_already_visible() {
+        let mut start = 4000.0;
+        let spp = 10.0;
+        apply_scroll_to_frame(&mut start, spp, 100.0, 10_000.0, 4500.0);
+        assert!((start - 4000.0).abs() < 1e-9);
     }
 }

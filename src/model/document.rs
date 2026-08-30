@@ -122,7 +122,10 @@ impl BufferDocument {
         let sample = self.clamp_sample(self.snap_sample(&scope, sample));
         self.region_drag_anchor = None;
         self.set_current_position_sample(sample, scope.clone());
-        self.selection = Selection::Position(SamplePosition { sample, channels: scope });
+        self.selection = Selection::Position(SamplePosition {
+            sample,
+            channels: scope,
+        });
     }
 
     pub fn select_region_at(&mut self, sample: usize, lane: usize, scope: ChannelScope) {
@@ -195,7 +198,10 @@ impl BufferDocument {
 
         if end.saturating_sub(start) <= DRAG_THRESHOLD_SAMPLES {
             self.set_current_position_sample(start, channels.clone());
-            self.selection = Selection::Position(SamplePosition { sample: start, channels });
+            self.selection = Selection::Position(SamplePosition {
+                sample: start,
+                channels,
+            });
             return;
         }
 
@@ -231,21 +237,21 @@ impl BufferDocument {
         id
     }
 
-    pub fn add_marker(
-        &mut self,
-        sample: usize,
-        channels: ChannelScope,
-    ) -> MarkerId {
+    pub fn add_marker(&mut self, sample: usize, channels: ChannelScope) -> MarkerId {
         let id = MarkerId(self.next_marker_id);
         self.next_marker_id += 1;
-        self.buffer.write().unwrap().markers.push(super::buffer::Marker {
-            id,
-            sample,
-            channels,
-            color: None,
-            label_type: None,
-            message: None,
-        });
+        self.buffer
+            .write()
+            .unwrap()
+            .markers
+            .push(super::buffer::Marker {
+                id,
+                sample,
+                channels,
+                color: None,
+                label_type: None,
+                message: None,
+            });
         id
     }
 
@@ -332,7 +338,13 @@ mod tests {
         doc.update_region_drag(50);
         doc.finish_region_drag();
         assert!(doc.buffer.read().unwrap().regions.is_empty());
-        assert!(matches!(doc.selection, Selection::Region { region_id: None, .. }));
+        assert!(matches!(
+            doc.selection,
+            Selection::Region {
+                region_id: None,
+                ..
+            }
+        ));
         assert_eq!(doc.current_position.as_ref().map(|p| p.sample), Some(50));
     }
 

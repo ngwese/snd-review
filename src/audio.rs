@@ -97,7 +97,8 @@ pub fn decode(path: &Path) -> Result<DecodedAudio> {
 
 /// Load a buffer with file metadata from `path`.
 pub fn load_buffer(path: &Path) -> Result<Buffer> {
-    let metadata = fs::metadata(path).with_context(|| format!("failed to stat {}", path.display()))?;
+    let metadata =
+        fs::metadata(path).with_context(|| format!("failed to stat {}", path.display()))?;
     let (audio, meta) = decode_with_meta(path)?;
     Ok(Buffer {
         audio,
@@ -145,10 +146,7 @@ fn decode_with_meta(path: &Path) -> Result<(DecodedAudio, DecodeMeta)> {
         .cloned()
         .context("no supported audio track in file")?;
 
-    let codec = track
-        .codec_params
-        .codec
-        .to_string();
+    let codec = track.codec_params.codec.to_string();
 
     let track_id = track.id;
     let mut decoder = symphonia::default::get_codecs()

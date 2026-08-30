@@ -15,9 +15,7 @@ pub fn list_output_devices() -> Result<Vec<OutputDeviceInfo>> {
     let host = cpal::default_host();
     let mut devices = Vec::new();
     for (index, device) in host.output_devices()?.enumerate() {
-        let name = device
-            .name()
-            .unwrap_or_else(|_| format!("output-{index}"));
+        let name = device.name().unwrap_or_else(|_| format!("output-{index}"));
         devices.push(OutputDeviceInfo { index, name });
     }
     Ok(devices)

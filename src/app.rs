@@ -7,9 +7,9 @@ use std::time::Duration;
 
 use cpal::Device;
 use gpui::{
-    actions, div, point, prelude::FluentBuilder as _, px, size, App, AppContext as _, Bounds,
-    Context, Entity, ExternalPaths, Global, InteractiveElement as _, IntoElement, KeyBinding, Menu,
-    MenuItem, ParentElement as _, PathPromptOptions, Render, SharedString, Styled as _,
+    div, point, prelude::FluentBuilder as _, px, size, App, AppContext as _, Bounds, Context,
+    Entity, ExternalPaths, FocusHandle, Focusable, Global, InteractiveElement as _, IntoElement,
+    Menu, MenuItem, ParentElement as _, PathPromptOptions, Render, SharedString, Styled as _,
     TitlebarOptions, Window, WindowBounds, WindowOptions,
 };
 use gpui_component::{
@@ -20,21 +20,12 @@ use gpui_component::{
     TITLE_BAR_HEIGHT,
 };
 
-actions!(snd_review, [
-    Open,
-    About,
-    Quit,
-    TransportHome,
-    TransportPrevious,
-    TransportStart,
-    TransportPlayPause,
-    TransportStop,
-    TransportNext,
-    TransportEnd,
-    TransportLoop,
-]);
-
 use crate::audio;
+use crate::commands::{
+    install_keybindings, About, Open, Quit, TransportEnd, TransportHome, TransportLoop,
+    TransportNext, TransportPlayPause, TransportPrevious, TransportStart, TransportStop,
+    ViewFitAll, ViewFrame, ViewZoomIn, ViewZoomOut,
+};
 use crate::components::waveform::{ToggleZeroCrossing, WaveformDisplay};
 use crate::model::selection::Selection;
 use crate::model::{Buffer, BufferDocument};
@@ -52,6 +43,7 @@ pub struct AppView {
     playback: PlaybackSession,
     app_menu_bar: Option<Entity<AppMenuBar>>,
     pending_opens: Arc<Mutex<Vec<PathBuf>>>,
+    focus_handle: FocusHandle,
 }
 
 impl AppView {
@@ -71,26 +63,24 @@ impl AppView {
         .detach();
 
         let document_for_poll = document.clone();
-        cx.spawn_in(window, async move |this, cx| {
-            loop {
-                cx.background_executor()
-                    .timer(Duration::from_millis(33))
-                    .await;
-                let still_alive = cx.update(|window, cx| {
-                    this.update(cx, |this, cx| {
-                        this.drain_pending_opens(window, cx);
-                        this.document.update(cx, |doc, cx| {
-                            this.playback.poll(doc);
-                            cx.notify();
-                        });
+        cx.spawn_in(window, async move |this, cx| loop {
+            cx.background_executor()
+                .timer(Duration::from_millis(33))
+                .await;
+            let still_alive = cx.update(|window, cx| {
+                this.update(cx, |this, cx| {
+                    this.drain_pending_opens(window, cx);
+                    this.document.update(cx, |doc, cx| {
+                        this.playback.poll(doc);
                         cx.notify();
-                    })
-                });
-                if !matches!(still_alive, Ok(Ok(()))) {
-                    break;
-                }
-                let _ = &document_for_poll;
+                    });
+                    cx.notify();
+                })
+            });
+            if !matches!(still_alive, Ok(Ok(()))) {
+                break;
             }
+            let _ = &document_for_poll;
         })
         .detach();
 
@@ -103,6 +93,7 @@ impl AppView {
             playback,
             app_menu_bar: (!cfg!(target_os = "macos")).then(|| AppMenuBar::new(cx)),
             pending_opens,
+            focus_handle: cx.focus_handle(),
         }
     }
 
@@ -126,9 +117,9 @@ impl AppView {
         }
         drop(snapshot);
 
-        self.document.update(cx, |doc, _| doc.reset_for_new_buffer());
-        self.playback
-            .sync_from_document(self.document.read(cx));
+        self.document
+            .update(cx, |doc, _| doc.reset_for_new_buffer());
+        self.playback.sync_from_document(self.document.read(cx));
         self.waveform.update(cx, |view, cx| view.reset_view(cx));
 
         window.set_window_title(&Self::buffer_title(&self.buffer.read().unwrap()));
@@ -213,10 +204,7 @@ fn transport_state_label(state: TransportState) -> &'static str {
 fn format_header_meta(doc: &BufferDocument, transport: TransportState) -> String {
     let buffer = doc.buffer.read().unwrap();
     if !buffer.is_loaded() {
-        return format!(
-            "No file open  ·  {}",
-            transport_state_label(transport)
-        );
+        return format!("No file open  ·  {}", transport_state_label(transport));
     }
 
     let mut parts = vec![
@@ -227,7 +215,10 @@ fn format_header_meta(doc: &BufferDocument, transport: TransportState) -> String
     ];
 
     if let Some(pos) = &doc.current_position {
-        parts.push(format!("pos {}", format_secs(doc.sample_to_secs(pos.sample))));
+        parts.push(format!(
+            "pos {}",
+            format_secs(doc.sample_to_secs(pos.sample))
+        ));
     }
 
     if let Selection::Region { start, end, .. } = &doc.selection {
@@ -235,8 +226,7 @@ fn format_header_meta(doc: &BufferDocument, transport: TransportState) -> String
             let start_secs = doc.sample_to_secs(*start);
             let end_secs = doc.sample_to_secs(*end);
             let len_samples = end - start + 1;
-            let len_secs =
-                len_samples as f64 / f64::from(buffer.audio.sample_rate.max(1));
+            let len_secs = len_samples as f64 / f64::from(buffer.audio.sample_rate.max(1));
             parts.push(format!(
                 "region {}–{}",
                 format_secs(start_secs),
@@ -279,6 +269,9 @@ impl Render for AppView {
         let drop_highlight = theme.secondary;
 
         div()
+            .id("app-view")
+            .key_context("App")
+            .track_focus(&self.focus_handle)
             .relative()
             .size_full()
             .drag_over::<ExternalPaths>(move |style, _, _, _| style.bg(drop_highlight))
@@ -287,43 +280,9 @@ impl Render for AppView {
                     this.open_path(path.clone(), window, cx);
                 }
             }))
-            .on_action(cx.listener(|this, _: &Open, window, cx| {
-                this.prompt_open_file(window, cx);
-            }))
             .on_action(cx.listener(|this, _: &ToggleZeroCrossing, _, cx| {
-                this.document.update(cx, |doc, _| doc.toggle_zero_crossing_snap());
-                cx.notify();
-            }))
-            .on_action(cx.listener(|this, _: &TransportHome, _, cx| {
-                this.playback.home();
-                this.sync_playback_to_document(cx);
-            }))
-            .on_action(cx.listener(|this, _: &TransportPrevious, _, cx| {
-                this.playback.previous();
-                this.sync_playback_to_document(cx);
-            }))
-            .on_action(cx.listener(|this, _: &TransportStart, _, cx| {
-                this.playback.start();
-                this.sync_playback_to_document(cx);
-            }))
-            .on_action(cx.listener(|this, _: &TransportPlayPause, _, cx| {
-                this.playback.toggle_play_pause();
-                this.sync_playback_to_document(cx);
-            }))
-            .on_action(cx.listener(|this, _: &TransportStop, _, cx| {
-                this.playback.stop();
-                this.sync_playback_to_document(cx);
-            }))
-            .on_action(cx.listener(|this, _: &TransportNext, _, cx| {
-                this.playback.next();
-                this.sync_playback_to_document(cx);
-            }))
-            .on_action(cx.listener(|this, _: &TransportEnd, _, cx| {
-                this.playback.end();
-                this.sync_playback_to_document(cx);
-            }))
-            .on_action(cx.listener(|this, _: &TransportLoop, _, cx| {
-                this.playback.toggle_loop();
+                this.document
+                    .update(cx, |doc, _| doc.toggle_zero_crossing_snap());
                 cx.notify();
             }))
             .child(
@@ -455,15 +414,12 @@ impl Render for AppView {
                                         this.sync_playback_to_document(cx);
                                     })),
                             )
-                            .child(
-                                Button::new("transport-end")
-                                    .small()
-                                    .label("End")
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.playback.end();
-                                        this.sync_playback_to_document(cx);
-                                    })),
-                            )
+                            .child(Button::new("transport-end").small().label("End").on_click(
+                                cx.listener(|this, _, _, cx| {
+                                    this.playback.end();
+                                    this.sync_playback_to_document(cx);
+                                }),
+                            ))
                             .child(
                                 Button::new("transport-loop")
                                     .small()
@@ -476,6 +432,12 @@ impl Render for AppView {
                     ),
             )
             .children(Root::render_dialog_layer(window, cx))
+    }
+}
+
+impl Focusable for AppView {
+    fn focus_handle(&self, _: &App) -> FocusHandle {
+        self.focus_handle.clone()
     }
 }
 
@@ -528,6 +490,93 @@ fn about(_: &About, cx: &mut App) {
     });
 }
 
+fn with_app_view(cx: &mut App, f: impl FnOnce(&mut AppView, &mut Context<AppView>)) {
+    let Some(view) = cx.try_global::<OpenTarget>().map(|target| target.0.clone()) else {
+        return;
+    };
+    view.update(cx, f);
+}
+
+fn transport_home(_: &TransportHome, cx: &mut App) {
+    with_app_view(cx, |this, cx| {
+        this.playback.home();
+        this.sync_playback_to_document(cx);
+    });
+}
+
+fn transport_previous(_: &TransportPrevious, cx: &mut App) {
+    with_app_view(cx, |this, cx| {
+        this.playback.previous();
+        this.sync_playback_to_document(cx);
+    });
+}
+
+fn transport_start(_: &TransportStart, cx: &mut App) {
+    with_app_view(cx, |this, cx| {
+        this.playback.start();
+        this.sync_playback_to_document(cx);
+    });
+}
+
+fn transport_play_pause(_: &TransportPlayPause, cx: &mut App) {
+    with_app_view(cx, |this, cx| {
+        this.playback.toggle_play_pause();
+        this.sync_playback_to_document(cx);
+    });
+}
+
+fn transport_stop(_: &TransportStop, cx: &mut App) {
+    with_app_view(cx, |this, cx| {
+        this.playback.stop();
+        this.sync_playback_to_document(cx);
+    });
+}
+
+fn transport_next(_: &TransportNext, cx: &mut App) {
+    with_app_view(cx, |this, cx| {
+        this.playback.next();
+        this.sync_playback_to_document(cx);
+    });
+}
+
+fn transport_end(_: &TransportEnd, cx: &mut App) {
+    with_app_view(cx, |this, cx| {
+        this.playback.end();
+        this.sync_playback_to_document(cx);
+    });
+}
+
+fn transport_loop(_: &TransportLoop, cx: &mut App) {
+    with_app_view(cx, |this, cx| {
+        this.playback.toggle_loop();
+        cx.notify();
+    });
+}
+
+fn view_fit_all(_: &ViewFitAll, cx: &mut App) {
+    with_app_view(cx, |this, cx| {
+        this.waveform.update(cx, |view, cx| view.fit(cx));
+    });
+}
+
+fn view_frame(_: &ViewFrame, cx: &mut App) {
+    with_app_view(cx, |this, cx| {
+        this.waveform.update(cx, |view, cx| view.frame(cx));
+    });
+}
+
+fn view_zoom_in(_: &ViewZoomIn, cx: &mut App) {
+    with_app_view(cx, |this, cx| {
+        this.waveform.update(cx, |view, cx| view.zoom_in(cx));
+    });
+}
+
+fn view_zoom_out(_: &ViewZoomOut, cx: &mut App) {
+    with_app_view(cx, |this, cx| {
+        this.waveform.update(cx, |view, cx| view.zoom_out(cx));
+    });
+}
+
 fn app_menus() -> Vec<Menu> {
     vec![
         Menu::new("File").items([
@@ -543,19 +592,19 @@ fn install_app_menu(cx: &mut App) {
     cx.on_action(open);
     cx.on_action(quit);
     cx.on_action(about);
-    cx.bind_keys([
-        #[cfg(target_os = "macos")]
-        KeyBinding::new("cmd-o", Open, None),
-        #[cfg(not(target_os = "macos"))]
-        KeyBinding::new("ctrl-o", Open, None),
-        #[cfg(target_os = "macos")]
-        KeyBinding::new("cmd-q", Quit, None),
-        #[cfg(not(target_os = "macos"))]
-        KeyBinding::new("alt-f4", Quit, None),
-        KeyBinding::new("space", TransportPlayPause, None),
-        KeyBinding::new("home", TransportHome, None),
-        KeyBinding::new("end", TransportEnd, None),
-    ]);
+    cx.on_action(transport_home);
+    cx.on_action(transport_previous);
+    cx.on_action(transport_start);
+    cx.on_action(transport_play_pause);
+    cx.on_action(transport_stop);
+    cx.on_action(transport_next);
+    cx.on_action(transport_end);
+    cx.on_action(transport_loop);
+    cx.on_action(view_fit_all);
+    cx.on_action(view_frame);
+    cx.on_action(view_zoom_in);
+    cx.on_action(view_zoom_out);
+    install_keybindings(cx);
     cx.set_menus(app_menus());
     let owned = app_menus().into_iter().map(|menu| menu.owned()).collect();
     GlobalState::global_mut(cx).set_app_menus(owned);
@@ -654,6 +703,7 @@ pub fn run(initial_buffer: Option<Buffer>, device: Device) {
                     )
                 });
                 cx.set_global(OpenTarget(view.clone()));
+                window.focus(&view.focus_handle(cx), cx);
                 cx.new(|cx| Root::new(view, window, cx).bg(cx.theme().background))
             })
             .expect("failed to open window");

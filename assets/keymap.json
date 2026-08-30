@@ -1,0 +1,21 @@
+{
+  "bindings": {
+    "a": "view.fit_all",
+    "f": "view.frame",
+    "space": "transport.play_pause",
+    "home": "transport.home",
+    "end": "transport.end"
+  },
+  "macos": {
+    "cmd-o": "file.open",
+    "cmd-q": "file.quit"
+  },
+  "linux": {
+    "ctrl-o": "file.open",
+    "alt-f4": "file.quit"
+  },
+  "windows": {
+    "ctrl-o": "file.open",
+    "alt-f4": "file.quit"
+  }
+}

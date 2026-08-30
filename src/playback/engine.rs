@@ -59,14 +59,19 @@ impl PlaybackShared {
     }
 
     pub fn set_in_out(&self, in_point: Option<usize>, out_point: Option<usize>) {
-        self.in_point.store(in_point.unwrap_or(IN_OUT_NONE), Ordering::SeqCst);
+        self.in_point
+            .store(in_point.unwrap_or(IN_OUT_NONE), Ordering::SeqCst);
         self.out_point
             .store(out_point.unwrap_or(IN_OUT_NONE), Ordering::SeqCst);
     }
 
     fn playback_start(&self) -> usize {
         let v = self.in_point.load(Ordering::SeqCst);
-        if v == IN_OUT_NONE { 0 } else { v }
+        if v == IN_OUT_NONE {
+            0
+        } else {
+            v
+        }
     }
 
     fn playback_end(&self) -> usize {
@@ -189,13 +194,11 @@ fn stream_config_for_provider(
         buffer_size: cpal::BufferSize::Default,
     };
 
-    let supports_source_rate = device
-        .supported_output_configs()?
-        .any(|c| {
-            c.channels() == channels
-                && c.min_sample_rate().0 <= source_rate
-                && c.max_sample_rate().0 >= source_rate
-        });
+    let supports_source_rate = device.supported_output_configs()?.any(|c| {
+        c.channels() == channels
+            && c.min_sample_rate().0 <= source_rate
+            && c.max_sample_rate().0 >= source_rate
+    });
 
     if !supports_source_rate {
         stream_config.sample_rate = default_config.sample_rate();

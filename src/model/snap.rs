@@ -17,11 +17,7 @@ fn is_zero_crossing(samples: &[f32], index: usize) -> bool {
 }
 
 /// Find the nearest zero crossing to `sample`, searching outward up to `search_radius`.
-pub fn nearest_zero_crossing(
-    samples: &[f32],
-    sample: usize,
-    search_radius: usize,
-) -> usize {
+pub fn nearest_zero_crossing(samples: &[f32], sample: usize, search_radius: usize) -> usize {
     if samples.is_empty() {
         return 0;
     }

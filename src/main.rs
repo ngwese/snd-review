@@ -8,6 +8,7 @@ use clap::Parser;
 
 mod app;
 mod audio;
+mod commands;
 mod components;
 mod model;
 mod playback;
