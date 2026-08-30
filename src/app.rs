@@ -8,7 +8,7 @@ use std::time::Duration;
 use cpal::Device;
 use gpui::{
     actions, div, point, prelude::FluentBuilder as _, px, size, App, AppContext as _, Bounds,
-    Context, Entity, ExternalPaths, InteractiveElement as _, IntoElement, KeyBinding, Menu,
+    Context, Entity, ExternalPaths, Global, InteractiveElement as _, IntoElement, KeyBinding, Menu,
     MenuItem, ParentElement as _, PathPromptOptions, Render, SharedString, Styled as _,
     TitlebarOptions, Window, WindowBounds, WindowOptions,
 };
@@ -39,6 +39,10 @@ use crate::components::waveform::{ToggleZeroCrossing, WaveformDisplay};
 use crate::model::selection::Selection;
 use crate::model::{Buffer, BufferDocument};
 use crate::playback::{PlaybackSession, TransportState};
+
+struct OpenTarget(Entity<AppView>);
+
+impl Global for OpenTarget {}
 
 pub struct AppView {
     buffer: Arc<RwLock<Buffer>>,
@@ -489,6 +493,22 @@ fn quit(_: &Quit, cx: &mut App) {
     cx.quit();
 }
 
+fn open(_: &Open, cx: &mut App) {
+    let Some(view) = cx.try_global::<OpenTarget>().map(|target| target.0.clone()) else {
+        return;
+    };
+    let Some(window) = cx.active_window() else {
+        return;
+    };
+    cx.defer(move |cx| {
+        let _ = window.update(cx, |_, window, cx| {
+            view.update(cx, |this, cx| {
+                this.prompt_open_file(window, cx);
+            });
+        });
+    });
+}
+
 fn about(_: &About, cx: &mut App) {
     let Some(window) = cx.active_window().and_then(|w| w.downcast::<Root>()) else {
         return;
@@ -520,6 +540,7 @@ fn app_menus() -> Vec<Menu> {
 }
 
 fn install_app_menu(cx: &mut App) {
+    cx.on_action(open);
     cx.on_action(quit);
     cx.on_action(about);
     cx.bind_keys([
@@ -632,6 +653,7 @@ pub fn run(initial_buffer: Option<Buffer>, device: Device) {
                         cx,
                     )
                 });
+                cx.set_global(OpenTarget(view.clone()));
                 cx.new(|cx| Root::new(view, window, cx).bg(cx.theme().background))
             })
             .expect("failed to open window");
