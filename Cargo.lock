@@ -6391,6 +6391,7 @@ dependencies = [
  "serde",
  "serde_json",
  "symphonia",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

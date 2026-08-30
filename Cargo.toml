@@ -17,6 +17,9 @@ gpui-component-assets = { git = "https://github.com/longbridge/gpui-component" }
 symphonia = { version = "0.5", features = ["all"] }
 cpal = "0.15"
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_System_Console"] }
+
 [profile.dev.package]
 gpui = { opt-level = 3 }
 gpui_platform = { opt-level = 3 }

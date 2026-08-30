@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: 2026 Greg Wuller
 // SPDX-License-Identifier: MIT
 
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 use std::path::PathBuf;
 
 use anyhow::{Context as _, Result};
@@ -33,6 +35,9 @@ struct Args {
 }
 
 fn main() -> Result<()> {
+    #[cfg(windows)]
+    attach_parent_console();
+
     let args = Args::parse();
 
     if args.list_devices {
@@ -50,4 +55,39 @@ fn main() -> Result<()> {
     let device = playback::resolve_output_device(args.output_device.as_deref())?;
     app::run(buffer, device);
     Ok(())
+}
+
+/// Attach to the parent terminal when launched from a console so clap and
+/// `println!` still work. Double-click has no parent console; this is a no-op.
+#[cfg(windows)]
+fn attach_parent_console() {
+    use std::fs::OpenOptions;
+    use std::os::windows::io::IntoRawHandle;
+    use windows_sys::Win32::System::Console::{
+        AttachConsole, SetStdHandle, ATTACH_PARENT_PROCESS, STD_ERROR_HANDLE, STD_OUTPUT_HANDLE,
+    };
+
+    extern "C" {
+        fn _dup2(fd1: i32, fd2: i32) -> i32;
+        fn _open_osfhandle(osfhandle: isize, flags: i32) -> i32;
+    }
+    const O_TEXT: i32 = 0x4000;
+
+    if unsafe { AttachConsole(ATTACH_PARENT_PROCESS) } == 0 {
+        return;
+    }
+
+    let Ok(out) = OpenOptions::new().read(true).write(true).open("CONOUT$") else {
+        return;
+    };
+    let handle = out.into_raw_handle();
+    unsafe {
+        SetStdHandle(STD_OUTPUT_HANDLE, handle);
+        SetStdHandle(STD_ERROR_HANDLE, handle);
+        let fd = _open_osfhandle(handle as isize, O_TEXT);
+        if fd >= 0 {
+            _dup2(fd, 1);
+            _dup2(fd, 2);
+        }
+    }
 }
