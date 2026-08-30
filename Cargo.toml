@@ -3,6 +3,7 @@ name = "snd-review"
 version = "0.1.0"
 edition = "2021"
 description = "Scrollable, zoomable multi-channel waveform display"
+license = "MIT"
 
 [dependencies]
 anyhow = "1"

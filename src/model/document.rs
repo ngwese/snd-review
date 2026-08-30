@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Greg Wuller
+// SPDX-License-Identifier: MIT
+
 use std::sync::{Arc, RwLock};
 
 use super::buffer::{Buffer, ChannelScope, MarkerId, Region, RegionId};
