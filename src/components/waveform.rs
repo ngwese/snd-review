@@ -423,6 +423,13 @@ fn sample_to_x(sample: f64, start_sample: f64, samples_per_pixel: f64, origin_x:
     origin_x + ((sample - start_sample) / samples_per_pixel) as f32
 }
 
+/// Keep a 1px vertical marker inside the lane so the last sample stays visible
+/// instead of painting on (or past) the clip edge.
+fn clamp_bar_x(x: f32, origin_x: f32, width: f32) -> f32 {
+    let max_x = (origin_x + width - 1.0).max(origin_x);
+    x.clamp(origin_x, max_x)
+}
+
 fn region_tint(base_color: gpui::Hsla, alpha: f32) -> gpui::Hsla {
     rotate_hue(base_color, 10.0).alpha(alpha)
 }
@@ -443,7 +450,11 @@ fn paint_region_endpoint(
     let origin_x = bounds.origin.x.as_f32();
     let origin_y = bounds.origin.y.as_f32();
     let height = bounds.size.height.as_f32();
-    let x = sample_to_x(sample as f64, start_sample, samples_per_pixel, origin_x);
+    let x = clamp_bar_x(
+        sample_to_x(sample as f64, start_sample, samples_per_pixel, origin_x),
+        origin_x,
+        bounds.size.width.as_f32(),
+    );
     window.paint_quad(fill(
         Bounds {
             origin: point(px(x), px(origin_y)),
@@ -517,7 +528,11 @@ fn paint_vertical_bar(
     let origin_x = bounds.origin.x.as_f32();
     let origin_y = bounds.origin.y.as_f32();
     let height = bounds.size.height.as_f32();
-    let x = sample_to_x(sample as f64, start_sample, samples_per_pixel, origin_x);
+    let x = clamp_bar_x(
+        sample_to_x(sample as f64, start_sample, samples_per_pixel, origin_x),
+        origin_x,
+        bounds.size.width.as_f32(),
+    );
     window.paint_quad(fill(
         Bounds {
             origin: point(px(x), px(origin_y)),
@@ -1094,5 +1109,16 @@ mod tests {
     fn hover_sample_clamps_to_last_frame() {
         let sample = hover_sample_from_x(149.0, 50.0, 100.0, 0.0, 100.0, 50);
         assert_eq!(sample, Some(49));
+    }
+
+    #[test]
+    fn bar_x_stays_on_last_pixel_at_buffer_end() {
+        // Fitted: 1000 frames across 100px → last sample is 0.1px short of the
+        // right edge, which would clip a 1px bar. Keep it on the last pixel.
+        let origin = 10.0;
+        let width = 100.0;
+        let x = sample_to_x(999.0, 0.0, 10.0, origin);
+        assert!((x - 109.9).abs() < 1e-3);
+        assert_eq!(clamp_bar_x(x, origin, width), origin + width - 1.0);
     }
 }
