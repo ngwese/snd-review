@@ -73,11 +73,16 @@ impl AppView {
             let still_alive = cx.update(|window, cx| {
                 this.update(cx, |this, cx| {
                     this.drain_pending_opens(window, cx);
+                    let mut dirty = false;
                     this.document.update(cx, |doc, cx| {
-                        this.playback.poll(doc);
-                        cx.notify();
+                        if this.playback.poll(doc) {
+                            dirty = true;
+                            cx.notify();
+                        }
                     });
-                    cx.notify();
+                    if dirty {
+                        cx.notify();
+                    }
                 })
             });
             if !matches!(still_alive, Ok(Ok(()))) {

@@ -230,7 +230,7 @@ impl PlaybackSession {
         Ok(())
     }
 
-    pub fn poll(&mut self, doc: &mut BufferDocument) {
+    pub fn poll(&mut self, doc: &mut BufferDocument) -> bool {
         let engine_state = self.engine.shared.transport();
         if engine_state == TransportState::Stopped
             && self.transport.state() == TransportState::Playing
@@ -238,11 +238,13 @@ impl PlaybackSession {
             self.transport.set_state(TransportState::Stopped);
             self.playhead.set_position(self.engine.shared.position());
             doc.set_position_from_playback(self.playhead.position(), ChannelScope::all());
-            return;
+            return true;
         }
         if self.transport.is_playing() {
             self.sync_document_from_playback(doc);
+            return true;
         }
+        false
     }
 }
 

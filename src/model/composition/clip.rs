@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT
 
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 
 use super::media::MediaId;
 
@@ -203,7 +204,7 @@ fn split_markers(markers: &[ClipMarker], at: u64) -> (Vec<ClipMarker>, Vec<ClipM
 #[derive(Debug, Clone, PartialEq)]
 pub struct ClipSpan {
     pub start: u64,
-    pub clip: Clip,
+    pub clip: Arc<Clip>,
 }
 
 impl ClipSpan {

@@ -9,7 +9,7 @@ const BALANCE_RATIO: usize = 4;
 
 #[derive(Debug, Clone)]
 enum Node {
-    Leaf(Clip),
+    Leaf(Arc<Clip>),
     Branch {
         left: Arc<Node>,
         right: Arc<Node>,
@@ -49,7 +49,7 @@ impl ClipTree {
             Self::empty()
         } else {
             Self {
-                root: Some(Arc::new(Node::Leaf(clip))),
+                root: Some(Arc::new(Node::Leaf(Arc::new(clip)))),
             }
         }
     }
@@ -132,7 +132,10 @@ impl ClipTree {
         let len = len.min(self.frames().saturating_sub(start));
         let (_, rest) = self.split(start, new_id);
         let (mid, _) = rest.split(len, new_id);
-        mid.spans().into_iter().map(|span| span.clip).collect()
+        mid.spans()
+            .into_iter()
+            .map(|span| (*span.clip).clone())
+            .collect()
     }
 
     pub fn map_clip_at(&self, frame: u64, map: impl FnOnce(&Clip) -> Clip) -> Self {
@@ -211,7 +214,7 @@ fn nonempty_leaf(clip: Clip) -> Option<Arc<Node>> {
     if clip.len == 0 {
         None
     } else {
-        Some(Arc::new(Node::Leaf(clip)))
+        Some(Arc::new(Node::Leaf(Arc::new(clip))))
     }
 }
 
@@ -289,7 +292,7 @@ fn rotate(node: Arc<Node>) -> Arc<Node> {
 
 fn map_clip_at_node(node: &Node, frame: u64, map: impl FnOnce(&Clip) -> Clip) -> Arc<Node> {
     match node {
-        Node::Leaf(clip) => Arc::new(Node::Leaf(map(clip))),
+        Node::Leaf(clip) => Arc::new(Node::Leaf(Arc::new(map(clip.as_ref())))),
         Node::Branch { left, right, .. } => {
             let left_frames = left.frames();
             if frame < left_frames {

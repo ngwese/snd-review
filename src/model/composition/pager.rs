@@ -12,7 +12,9 @@ use super::media::{MediaId, MediaPool, MediaRef};
 use crate::audio;
 
 pub const BLOCK_FRAMES: u64 = 65_536;
-const RAM_BLOCKS: usize = 32;
+/// Decoded sample cache budget. Large enough for smooth playback and
+/// overview paints without keeping a whole file in RAM.
+pub const RAM_CACHE_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct BlockKey {
@@ -24,16 +26,24 @@ struct BlockKey {
 pub struct BlockPager {
     ram: HashMap<BlockKey, Arc<Vec<Vec<f32>>>>,
     order: VecDeque<BlockKey>,
+    ram_bytes: usize,
+    ram_limit: usize,
     spill_dir: PathBuf,
 }
 
 impl BlockPager {
     pub fn new(spill_dir: PathBuf) -> Result<Self> {
+        Self::with_cache_bytes(spill_dir, RAM_CACHE_BYTES)
+    }
+
+    pub fn with_cache_bytes(spill_dir: PathBuf, ram_limit: usize) -> Result<Self> {
         fs::create_dir_all(&spill_dir)
             .with_context(|| format!("failed to create block cache {}", spill_dir.display()))?;
         Ok(Self {
             ram: HashMap::new(),
             order: VecDeque::new(),
+            ram_bytes: 0,
+            ram_limit: ram_limit.max(1),
             spill_dir,
         })
     }
@@ -42,6 +52,8 @@ impl BlockPager {
         Self {
             ram: HashMap::new(),
             order: VecDeque::new(),
+            ram_bytes: 0,
+            ram_limit: RAM_CACHE_BYTES,
             spill_dir: PathBuf::new(),
         }
     }
@@ -77,15 +89,47 @@ impl BlockPager {
             }
             let take = remaining.min(available);
             for (ch, dest_ch) in dest.iter_mut().enumerate() {
-                let src_ch = block.get(ch).map(|c| c.as_slice()).unwrap_or(&[]);
-                let src_end = (block_off + take as usize).min(src_ch.len());
-                if block_off < src_end {
-                    let n = src_end - block_off;
-                    let dst_end = (dst + n).min(dest_ch.len());
-                    let n = dst_end.saturating_sub(dst);
-                    dest_ch[dst..dst + n].copy_from_slice(&src_ch[block_off..block_off + n]);
-                }
+                copy_block_channel(&block, ch, block_off, take, dest_ch, dst);
             }
+            remaining -= take;
+            src += take;
+            dst += take as usize;
+        }
+        Ok(())
+    }
+
+    pub fn fill_channel(
+        &mut self,
+        pool: &MediaPool,
+        media_id: MediaId,
+        src_offset: u64,
+        count: u64,
+        channel: usize,
+        dest: &mut [f32],
+    ) -> Result<()> {
+        if count == 0 || dest.is_empty() {
+            return Ok(());
+        }
+        let media = pool
+            .get(media_id)
+            .with_context(|| format!("unknown media {}", media_id.0))?;
+        let mut remaining = count;
+        let mut src = src_offset;
+        let mut dst = 0usize;
+        while remaining > 0 {
+            let block_index = src / BLOCK_FRAMES;
+            let block_off = (src % BLOCK_FRAMES) as usize;
+            let block = self.load_block(media, block_index)?;
+            let available = block
+                .get(channel)
+                .map(|ch| ch.len().saturating_sub(block_off))
+                .or_else(|| block.first().map(|ch| ch.len().saturating_sub(block_off)))
+                .unwrap_or(0) as u64;
+            if available == 0 {
+                break;
+            }
+            let take = remaining.min(available);
+            copy_block_channel(&block, channel, block_off, take, dest, dst);
             remaining -= take;
             src += take;
             dst += take as usize;
@@ -125,13 +169,22 @@ impl BlockPager {
     }
 
     fn insert_ram(&mut self, key: BlockKey, block: Arc<Vec<Vec<f32>>>) -> Result<()> {
-        if self.ram.len() >= RAM_BLOCKS {
+        if let Some(old) = self.ram.remove(&key) {
+            self.ram_bytes = self.ram_bytes.saturating_sub(block_ram_bytes(&old));
+            self.order.retain(|k| k != &key);
+        }
+        let incoming = block_ram_bytes(&block);
+        while !self.ram.is_empty() && self.ram_bytes + incoming > self.ram_limit {
             if let Some(old) = self.order.pop_front() {
                 if let Some(evicted) = self.ram.remove(&old) {
+                    self.ram_bytes = self.ram_bytes.saturating_sub(block_ram_bytes(&evicted));
                     self.spill(&old, &evicted)?;
                 }
+            } else {
+                break;
             }
         }
+        self.ram_bytes = self.ram_bytes.saturating_add(incoming);
         self.ram.insert(key, block);
         self.touch(key);
         Ok(())
@@ -162,6 +215,31 @@ impl BlockPager {
             return Ok(None);
         }
         Ok(Some(Arc::new(read_block(&path, channel_count)?)))
+    }
+}
+
+fn block_ram_bytes(block: &Arc<Vec<Vec<f32>>>) -> usize {
+    block
+        .iter()
+        .map(|ch| ch.len() * std::mem::size_of::<f32>())
+        .sum()
+}
+
+fn copy_block_channel(
+    block: &[Vec<f32>],
+    channel: usize,
+    block_off: usize,
+    take: u64,
+    dest: &mut [f32],
+    dst: usize,
+) {
+    let src_ch = block.get(channel).map(|c| c.as_slice()).unwrap_or(&[]);
+    let src_end = (block_off + take as usize).min(src_ch.len());
+    if block_off < src_end {
+        let n = src_end - block_off;
+        let dst_end = (dst + n).min(dest.len());
+        let n = dst_end.saturating_sub(dst);
+        dest[dst..dst + n].copy_from_slice(&src_ch[block_off..block_off + n]);
     }
 }
 
@@ -259,18 +337,19 @@ mod tests {
                 .as_nanos()
         ));
         let mut pool = MediaPool::new();
-        let frames = BLOCK_FRAMES as usize * (RAM_BLOCKS + 1);
+        let frames = BLOCK_FRAMES as usize * 2;
         let samples = vec![(0..frames).map(|i| i as f32).collect::<Vec<_>>()];
         let id = pool.insert(MediaRef::from_memory(MediaId(0), 44100, samples));
-        let mut pager = BlockPager::new(dir.clone()).unwrap();
+        let mut pager = BlockPager::with_cache_bytes(dir.clone(), 1024).unwrap();
         let mut buf = [0.0; 1];
-        for i in 0..=RAM_BLOCKS {
-            let start = i as u64 * BLOCK_FRAMES;
-            pager
-                .fill_planar(&pool, id, start, 1, &mut [&mut buf[..]], 0)
-                .unwrap();
-            assert_eq!(buf[0], start as f32);
-        }
+        pager
+            .fill_planar(&pool, id, 0, 1, &mut [&mut buf[..]], 0)
+            .unwrap();
+        assert_eq!(buf[0], 0.0);
+        pager
+            .fill_planar(&pool, id, BLOCK_FRAMES, 1, &mut [&mut buf[..]], 0)
+            .unwrap();
+        assert_eq!(buf[0], BLOCK_FRAMES as f32);
         let spilled = dir.join(format!("m{}_b0.blk", id.0));
         assert!(
             spilled.is_file(),
@@ -278,7 +357,7 @@ mod tests {
             spilled.display()
         );
         drop(pager);
-        let mut pager = BlockPager::new(dir.clone()).unwrap();
+        let mut pager = BlockPager::with_cache_bytes(dir.clone(), 1024).unwrap();
         pager
             .fill_planar(&pool, id, 0, 1, &mut [&mut buf[..]], 0)
             .unwrap();

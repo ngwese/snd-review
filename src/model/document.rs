@@ -488,6 +488,17 @@ impl WaveformDataProvider for BufferDocument {
             .unwrap()
             .min_max_in_range(channel, start, end)
     }
+
+    fn fill_minmax_columns(
+        &self,
+        channel: usize,
+        start: f64,
+        samples_per_pixel: f64,
+        dest: &mut [(f32, f32)],
+    ) {
+        let composition = self.composition.read().unwrap();
+        composition.fill_minmax_columns(channel, start, samples_per_pixel, dest);
+    }
 }
 
 #[cfg(test)]

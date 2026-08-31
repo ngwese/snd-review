@@ -15,6 +15,7 @@ use gpui_component::{
     v_flex, ActiveTheme as _, StyledExt as _,
 };
 
+use crate::audio::PEAK_BLOCK;
 use crate::model::buffer::Region;
 use crate::model::document::BufferDocument;
 use crate::model::selection::Selection;
@@ -29,6 +30,18 @@ pub trait WaveformDataProvider: Send + Sync {
     fn channel_label(&self, channel: usize) -> String;
     fn read_channel(&self, channel: usize, start: usize, dest: &mut [f32]);
     fn min_max_in_range(&self, channel: usize, start: f64, end: f64) -> (f32, f32);
+    fn fill_minmax_columns(
+        &self,
+        channel: usize,
+        start: f64,
+        samples_per_pixel: f64,
+        dest: &mut [(f32, f32)],
+    ) {
+        for (i, slot) in dest.iter_mut().enumerate() {
+            let a = start + i as f64 * samples_per_pixel;
+            *slot = self.min_max_in_range(channel, a, a + samples_per_pixel);
+        }
+    }
 }
 
 const ZOOM_FACTOR: f64 = 1.25;
@@ -358,6 +371,9 @@ fn install_global_drag_listeners(entity: Entity<WaveformDisplay>, window: &mut W
                 return;
             }
             entity.update(cx, |this, cx| {
+                if this.drag.is_none() {
+                    return;
+                }
                 this.handle_drag_move(event.position.x.as_f32(), cx);
             });
         }
@@ -630,25 +646,51 @@ fn paint_lane(
             window.paint_path(path, color);
         }
     } else {
-        for col in 0..cols {
-            let bin_start = start_sample + col as f64 * samples_per_pixel;
-            let bin_end = bin_start + samples_per_pixel;
-            if bin_start >= frames as f64 {
-                break;
+        let first = start_sample.max(0.0).floor() as usize;
+        let last = ((start_sample + cols as f64 * samples_per_pixel).ceil() as usize).min(frames);
+        let visible = last.saturating_sub(first);
+        let fold_from_samples = samples_per_pixel < PEAK_BLOCK as f64
+            && visible > 0
+            && visible <= cols.saturating_mul(64);
+
+        if fold_from_samples {
+            let mut samples = vec![0.0; visible];
+            WaveformDataProvider::read_channel(provider, channel, first, &mut samples);
+            for col in 0..cols {
+                let bin_start = start_sample + col as f64 * samples_per_pixel;
+                let bin_end = bin_start + samples_per_pixel;
+                if bin_start >= frames as f64 {
+                    break;
+                }
+                let a = (bin_start.floor() as usize)
+                    .saturating_sub(first)
+                    .min(samples.len());
+                let b = (bin_end.ceil() as usize)
+                    .saturating_sub(first)
+                    .clamp(a, samples.len());
+                let (min, max) = min_max_of(&samples[a..b]);
+                paint_column(
+                    origin_x, col, min, max, &y_scale, origin_y, height, color, window,
+                );
             }
-            let (min, max) =
-                WaveformDataProvider::min_max_in_range(provider, channel, bin_start, bin_end);
-            let y_max = y_scale.tick(&(max as f64)).unwrap_or(origin_y);
-            let y_min = y_scale.tick(&(min as f64)).unwrap_or(origin_y + height);
-            let top = y_max.min(y_min);
-            let bar_h = (y_max - y_min).abs().max(1.0);
-            window.paint_quad(fill(
-                Bounds {
-                    origin: point(px(origin_x + col as f32), px(top)),
-                    size: size(px(1.0), px(bar_h)),
-                },
-                color,
-            ));
+        } else {
+            let mut columns = vec![(0.0f32, 0.0f32); cols];
+            WaveformDataProvider::fill_minmax_columns(
+                provider,
+                channel,
+                start_sample,
+                samples_per_pixel,
+                &mut columns,
+            );
+            for (col, &(min, max)) in columns.iter().enumerate() {
+                let bin_start = start_sample + col as f64 * samples_per_pixel;
+                if bin_start >= frames as f64 {
+                    break;
+                }
+                paint_column(
+                    origin_x, col, min, max, &y_scale, origin_y, height, color, window,
+                );
+            }
         }
     }
 
@@ -675,6 +717,44 @@ fn paint_lane(
             );
         }
     }
+}
+
+fn min_max_of(samples: &[f32]) -> (f32, f32) {
+    let mut min = f32::MAX;
+    let mut max = f32::MIN;
+    for &s in samples {
+        min = min.min(s);
+        max = max.max(s);
+    }
+    if min > max {
+        (0.0, 0.0)
+    } else {
+        (min, max)
+    }
+}
+
+fn paint_column(
+    origin_x: f32,
+    col: usize,
+    min: f32,
+    max: f32,
+    y_scale: &ScaleLinear<f64>,
+    origin_y: f32,
+    height: f32,
+    color: gpui::Hsla,
+    window: &mut Window,
+) {
+    let y_max = y_scale.tick(&(max as f64)).unwrap_or(origin_y);
+    let y_min = y_scale.tick(&(min as f64)).unwrap_or(origin_y + height);
+    let top = y_max.min(y_min);
+    let bar_h = (y_max - y_min).abs().max(1.0);
+    window.paint_quad(fill(
+        Bounds {
+            origin: point(px(origin_x + col as f32), px(top)),
+            size: size(px(1.0), px(bar_h)),
+        },
+        color,
+    ));
 }
 
 fn paint_scrollbar(

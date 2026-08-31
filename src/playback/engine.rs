@@ -13,6 +13,9 @@ use super::transport::TransportState;
 
 const IN_OUT_NONE: usize = usize::MAX;
 
+/// Source frames fetched per provider call while filling the output device.
+pub const PLAYBACK_READ_FRAMES: usize = 128;
+
 pub struct PlaybackShared {
     pub provider: Arc<dyn PlaybackDataProvider>,
     pub position: AtomicUsize,
@@ -125,7 +128,9 @@ impl PlaybackShared {
             origin as f64
         };
 
-        let mut frame_buf = vec![0.0f32; channels];
+        let mut read_buf = vec![0.0f32; PLAYBACK_READ_FRAMES * channels];
+        let mut buf_origin = 0usize;
+        let mut buf_frames = 0usize;
         let mut reached_end = false;
 
         for out_frame in 0..out_frames {
@@ -133,16 +138,29 @@ impl PlaybackShared {
             if source_pos > end {
                 if looping && end > start_bound {
                     pos_f = start_bound as f64;
+                    buf_frames = 0;
                     continue;
                 }
                 reached_end = true;
                 break;
             }
 
-            self.provider
-                .read_interleaved(source_pos, 1, &mut frame_buf);
+            if buf_frames == 0 || source_pos < buf_origin || source_pos - buf_origin >= buf_frames {
+                let remaining = end.saturating_add(1).saturating_sub(source_pos);
+                let take = remaining.min(PLAYBACK_READ_FRAMES).max(1);
+                let n = take * channels;
+                if read_buf.len() < n {
+                    read_buf.resize(n, 0.0);
+                }
+                self.provider
+                    .read_interleaved(source_pos, take, &mut read_buf[..n]);
+                buf_origin = source_pos;
+                buf_frames = take;
+            }
+            let local = source_pos - buf_origin;
+            let base = local * channels;
             for ch in 0..channels {
-                output[out_frame * channels + ch] = frame_buf[ch];
+                output[out_frame * channels + ch] = read_buf[base + ch];
             }
             pos_f += step;
         }
@@ -317,5 +335,23 @@ mod tests {
         shared.fill_output(&mut out);
         assert_eq!(shared.transport(), TransportState::Playing);
         assert_eq!(shared.position(), 8);
+    }
+
+    #[test]
+    fn block_reads_preserve_source_samples() {
+        let samples: Vec<f32> = (0..300).map(|i| i as f32).collect();
+        let audio = DecodedAudio {
+            sample_rate: 44100,
+            channels: vec![samples.clone()],
+            peaks: vec![vec![]],
+        };
+        let shared = PlaybackShared::new(Arc::new(audio), 44100);
+        shared.set_transport(TransportState::Playing);
+        let mut out = vec![0.0; 200];
+        shared.fill_output(&mut out);
+        assert_eq!(&out[..], &samples[..200]);
+        assert_eq!(shared.position(), 200);
+        assert!(PLAYBACK_READ_FRAMES >= 1);
+        assert_eq!(PLAYBACK_READ_FRAMES, 128);
     }
 }

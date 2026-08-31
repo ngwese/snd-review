@@ -78,7 +78,7 @@ impl Composition {
         let clip = Clip::from_media(ClipId(next_clip_id), media_id, 0, frame_count);
         next_clip_id += 1;
         let tree = ClipTree::from_clip(clip);
-        Ok(Self {
+        let mut composed = Self {
             sample_rate,
             channel_count,
             edl: Edl::new(tree.clone()),
@@ -94,7 +94,10 @@ impl Composition {
             initial: InitialState::FromMedia {
                 media_id: media_id.0,
             },
-        })
+        };
+        composed.ensure_clip_peaks().ok();
+        composed.edl = Edl::new(composed.tree.clone());
+        Ok(composed)
     }
 
     pub fn load_from_path(path: &Path) -> Result<Self> {
@@ -192,6 +195,7 @@ impl Composition {
 
     fn commit(&mut self, op: EditOp, tree: ClipTree) {
         self.tree = tree;
+        let _ = self.ensure_clip_peaks();
         self.edl.push(op, self.tree.clone());
     }
 
@@ -442,7 +446,7 @@ impl Composition {
             };
             let local = pos - span.start;
             let take = remaining.min(span.clip.len - local);
-            self.read_clip(&span.clip, local, take, dest, dest_off)?;
+            self.read_clip(span.clip.as_ref(), local, take, dest, dest_off)?;
             remaining -= take;
             pos += take;
             dest_off += take as usize;
@@ -451,20 +455,29 @@ impl Composition {
     }
 
     pub fn read_channel(&self, channel: usize, start: u64, dest: &mut [f32]) -> Result<()> {
-        let count = dest.len() as u64;
-        let mut planes: Vec<Vec<f32>> = (0..self.channel_count)
-            .map(|_| vec![0.0; dest.len()])
-            .collect();
-        if planes.is_empty() {
-            dest.fill(0.0);
+        dest.fill(0.0);
+        if dest.is_empty() || channel >= self.channel_count || self.tree.is_empty() {
             return Ok(());
         }
-        let mut refs: Vec<&mut [f32]> = planes.iter_mut().map(|p| p.as_mut_slice()).collect();
-        self.read_planar(start, count, &mut refs)?;
-        if channel < planes.len() {
-            dest.copy_from_slice(&planes[channel][..dest.len().min(planes[channel].len())]);
-        } else {
-            dest.fill(0.0);
+        let start = start.min(self.frames());
+        let mut remaining = (dest.len() as u64).min(self.frames().saturating_sub(start));
+        let mut pos = start;
+        let mut dest_off = 0usize;
+        while remaining > 0 {
+            let Some(span) = self.tree.at(pos) else {
+                break;
+            };
+            let local = pos - span.start;
+            let take = remaining.min(span.clip.len - local) as usize;
+            self.read_clip_channel(
+                span.clip.as_ref(),
+                channel,
+                local,
+                &mut dest[dest_off..dest_off + take],
+            )?;
+            remaining -= take as u64;
+            pos += take as u64;
+            dest_off += take;
         }
         Ok(())
     }
@@ -477,19 +490,38 @@ impl Composition {
             bail!("destination is shorter than interleaved frame count");
         }
         dest[..need].fill(0.0);
-        let mut planes: Vec<Vec<f32>> =
-            (0..self.channel_count).map(|_| vec![0.0; frames]).collect();
-        if planes.is_empty() {
+        if count == 0 || self.channel_count == 0 {
             return Ok(());
         }
-        let mut refs: Vec<&mut [f32]> = planes.iter_mut().map(|p| p.as_mut_slice()).collect();
-        self.read_planar(start, count, &mut refs)?;
-        for frame in 0..frames {
-            for (c, plane) in planes.iter().enumerate() {
+        let mut plane = vec![0.0; frames];
+        for c in 0..self.channel_count {
+            self.read_channel(c, start, &mut plane)?;
+            for frame in 0..frames {
                 dest[frame * ch + c] = plane[frame];
             }
         }
         Ok(())
+    }
+
+    pub fn fill_minmax_columns(
+        &self,
+        channel: usize,
+        start: f64,
+        samples_per_pixel: f64,
+        dest: &mut [(f32, f32)],
+    ) {
+        dest.fill((0.0, 0.0));
+        if samples_per_pixel <= 0.0 || dest.is_empty() || channel >= self.channel_count {
+            return;
+        }
+        let frames = self.frames() as f64;
+        for (col, slot) in dest.iter_mut().enumerate() {
+            let a = start + col as f64 * samples_per_pixel;
+            if a >= frames {
+                break;
+            }
+            *slot = self.min_max_in_range(channel, a, a + samples_per_pixel);
+        }
     }
 
     pub fn frames_iter(&self, start: u64) -> FramesIter<'_> {
@@ -518,7 +550,7 @@ impl Composition {
             };
             let local = pos - span.start;
             let take = (end_i - pos).min(span.clip.len - local);
-            let (cmin, cmax) = self.clip_min_max(&span.clip, channel, local, take);
+            let (cmin, cmax) = self.clip_min_max(span.clip.as_ref(), channel, local, take);
             min = min.min(cmin);
             max = max.max(cmax);
             pos += take;
@@ -534,12 +566,12 @@ impl Composition {
         if clip.source.is_none() {
             return (0.0, 0.0);
         }
-        if !clip.cache.peaks.is_empty() {
-            if let Some(peaks) = clip.cache.peaks.get(channel) {
-                if len as usize >= PEAK_BLOCK * 2 && !peaks.is_empty() {
-                    let peak_start = local as usize / PEAK_BLOCK;
-                    let peak_end =
-                        (((local + len) as usize + PEAK_BLOCK - 1) / PEAK_BLOCK).min(peaks.len());
+        if let Some(peaks) = clip.cache.peaks.get(channel) {
+            if !peaks.is_empty() {
+                let peak_start = local as usize / PEAK_BLOCK;
+                let peak_end =
+                    (((local + len) as usize + PEAK_BLOCK - 1) / PEAK_BLOCK).min(peaks.len());
+                if peak_start < peak_end {
                     let mut min = f32::MAX;
                     let mut max = f32::MIN;
                     for &(pmin, pmax) in &peaks[peak_start..peak_end] {
@@ -574,13 +606,29 @@ impl Composition {
         local: u64,
         dest: &mut [f32],
     ) -> Result<()> {
-        let mut planes: Vec<Vec<f32>> = (0..self.channel_count)
-            .map(|_| vec![0.0; dest.len()])
-            .collect();
-        let mut refs: Vec<&mut [f32]> = planes.iter_mut().map(|p| p.as_mut_slice()).collect();
-        self.read_clip(clip, local, dest.len() as u64, &mut refs, 0)?;
-        if channel < planes.len() {
-            dest.copy_from_slice(&planes[channel]);
+        dest.fill(0.0);
+        if dest.is_empty() {
+            return Ok(());
+        }
+        if let Some(source) = &clip.source {
+            let mut pager = self.pager.lock().unwrap();
+            pager.fill_channel(
+                &self.pool,
+                source.media_id,
+                source.offset + local,
+                dest.len() as u64,
+                channel,
+                dest,
+            )?;
+        }
+        if clip.fade_in == 0 && clip.fade_out == 0 {
+            return Ok(());
+        }
+        for (frame, sample) in dest.iter_mut().enumerate() {
+            let gain = clip.gain_at(local + frame as u64);
+            if (gain - 1.0).abs() >= f32::EPSILON {
+                *sample *= gain;
+            }
         }
         Ok(())
     }
@@ -604,6 +652,9 @@ impl Composition {
                 dest_offset,
             )?;
         }
+        if clip.fade_in == 0 && clip.fade_out == 0 {
+            return Ok(());
+        }
         for frame in 0..count as usize {
             let gain = clip.gain_at(local + frame as u64);
             if (gain - 1.0).abs() < f32::EPSILON {
@@ -626,19 +677,33 @@ impl Composition {
             if !span.clip.cache.peaks.is_empty() || span.clip.source.is_none() {
                 continue;
             }
-            let mut peaks = Vec::new();
+            let mut peaks = vec![Vec::new(); self.channel_count];
             let mut min = f32::MAX;
             let mut max = f32::MIN;
-            for ch in 0..self.channel_count {
-                let mut samples = vec![0.0; span.clip.len as usize];
-                self.read_clip_channel(&span.clip, ch, 0, &mut samples)?;
-                for &s in &samples {
-                    min = min.min(s);
-                    max = max.max(s);
+            let mut pos = 0u64;
+            let mut chunk = vec![0.0; PEAK_BLOCK];
+            while pos < span.clip.len {
+                let take = ((span.clip.len - pos) as usize).min(PEAK_BLOCK);
+                for ch in 0..self.channel_count {
+                    let dest = &mut chunk[..take];
+                    self.read_clip_channel(span.clip.as_ref(), ch, pos, dest)?;
+                    let mut pmin = f32::MAX;
+                    let mut pmax = f32::MIN;
+                    for &s in dest.iter() {
+                        pmin = pmin.min(s);
+                        pmax = pmax.max(s);
+                        min = min.min(s);
+                        max = max.max(s);
+                    }
+                    peaks[ch].push(if pmin <= pmax {
+                        (pmin, pmax)
+                    } else {
+                        (0.0, 0.0)
+                    });
                 }
-                peaks.push(crate::audio::build_peaks(&samples));
+                pos += take as u64;
             }
-            let mut clip = span.clip.clone();
+            let mut clip = (*span.clip).clone();
             clip.cache = super::clip::ClipCache {
                 min: if min <= max { Some(min) } else { None },
                 max: if min <= max { Some(max) } else { None },
@@ -829,6 +894,8 @@ mod tests {
         assert_eq!(comp.frames(), 64);
         let got = materialize(&comp);
         assert_eq!(got, *expected);
+        let clip = comp.clip_at(0).unwrap().clip;
+        assert!(!clip.cache.peaks.is_empty());
     }
 
     #[test]
@@ -878,9 +945,19 @@ mod tests {
         rolled.roll(0, 1);
         rolled.assert_invariants();
         let clip = rolled.clip_at(0).unwrap();
-        assert_eq!(clip.clip.source.unwrap().offset, 1);
+        assert_eq!(clip.clip.source.as_ref().unwrap().offset, 1);
         rolled.roll(0, 100);
-        assert_eq!(rolled.clip_at(0).unwrap().clip.source.unwrap().offset, 2);
+        assert_eq!(
+            rolled
+                .clip_at(0)
+                .unwrap()
+                .clip
+                .source
+                .as_ref()
+                .unwrap()
+                .offset,
+            2
+        );
     }
 
     #[test]
@@ -1000,7 +1077,7 @@ mod tests {
         let media = sine_media(8, 1, 44100);
         let original = media.samples.as_ref().unwrap()[0].clone();
         let mut comp = Composition::from_media(media).unwrap();
-        let mut clip = comp.clip_at(0).unwrap().clip;
+        let mut clip = (*comp.clip_at(0).unwrap().clip).clone();
         clip.fade_in = 4;
         let len = clip.len;
         comp.replace_range(0, len, vec![clip]);
@@ -1025,12 +1102,12 @@ mod tests {
         let live_spans: Vec<_> = live
             .spans()
             .into_iter()
-            .map(|s| (s.start, s.clip.len, s.clip.source))
+            .map(|s| (s.start, s.clip.len, s.clip.source.clone()))
             .collect();
         let restored_spans: Vec<_> = restored
             .spans()
             .into_iter()
-            .map(|s| (s.start, s.clip.len, s.clip.source))
+            .map(|s| (s.start, s.clip.len, s.clip.source.clone()))
             .collect();
         assert_eq!(restored_spans, live_spans);
     }
