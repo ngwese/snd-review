@@ -39,6 +39,7 @@ pub struct BufferSource {
     pub path: PathBuf,
     pub modified: SystemTime,
     pub size_bytes: u64,
+    pub bits_per_sample: Option<u32>,
     pub container_format: String,
     pub codec: String,
 }

@@ -6,12 +6,13 @@ use std::{fs, fs::File, path::Path, time::SystemTime};
 use anyhow::{bail, Context, Result};
 use symphonia::core::{
     audio::{AudioBufferRef, SampleBuffer, SignalSpec},
-    codecs::{DecoderOptions, CODEC_TYPE_NULL},
+    codecs::{CodecParameters, DecoderOptions, CODEC_TYPE_NULL},
     errors::Error as SymphoniaError,
     formats::FormatOptions,
     io::MediaSourceStream,
     meta::MetadataOptions,
     probe::Hint,
+    sample::SampleFormat,
 };
 
 use crate::components::waveform::WaveformDataProvider;
@@ -88,6 +89,7 @@ impl WaveformDataProvider for DecodedAudio {
 struct DecodeMeta {
     container_format: String,
     codec: String,
+    bits_per_sample: Option<u32>,
 }
 
 /// Decode `path` into planar f32 samples, one vector per channel.
@@ -106,6 +108,7 @@ pub fn load_buffer(path: &Path) -> Result<Buffer> {
             path: path.to_path_buf(),
             modified: metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH),
             size_bytes: metadata.len(),
+            bits_per_sample: meta.bits_per_sample,
             container_format: meta.container_format,
             codec: meta.codec,
         }),
@@ -147,6 +150,7 @@ fn decode_with_meta(path: &Path) -> Result<(DecodedAudio, DecodeMeta)> {
         .context("no supported audio track in file")?;
 
     let codec = track.codec_params.codec.to_string();
+    let mut bits_per_sample = codec_bits_per_sample(&track.codec_params);
 
     let track_id = track.id;
     let mut decoder = symphonia::default::get_codecs()
@@ -196,6 +200,9 @@ fn decode_with_meta(path: &Path) -> Result<(DecodedAudio, DecodeMeta)> {
     }
 
     let peaks = channels.iter().map(|ch| build_peaks(ch)).collect();
+    if bits_per_sample.is_none() {
+        bits_per_sample = codec_bits_per_sample(decoder.codec_params());
+    }
 
     Ok((
         DecodedAudio {
@@ -206,8 +213,24 @@ fn decode_with_meta(path: &Path) -> Result<(DecodedAudio, DecodeMeta)> {
         DecodeMeta {
             container_format,
             codec,
+            bits_per_sample,
         },
     ))
+}
+
+fn codec_bits_per_sample(params: &CodecParameters) -> Option<u32> {
+    params
+        .bits_per_sample
+        .or(params.bits_per_coded_sample)
+        .or_else(|| {
+            params.sample_format.map(|format| match format {
+                SampleFormat::U8 | SampleFormat::S8 => 8,
+                SampleFormat::U16 | SampleFormat::S16 => 16,
+                SampleFormat::U24 | SampleFormat::S24 => 24,
+                SampleFormat::U32 | SampleFormat::S32 | SampleFormat::F32 => 32,
+                SampleFormat::F64 => 64,
+            })
+        })
 }
 
 impl WaveformDataProvider for Buffer {
@@ -391,6 +414,18 @@ mod tests {
         assert_eq!(audio.frames(), 4410);
         assert_eq!(audio.channels[0].len(), audio.channels[1].len());
         assert!(audio.channels[0].iter().any(|s| s.abs() > 0.1));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn load_buffer_captures_wav_source_meta() {
+        let dir = std::env::temp_dir();
+        let path = dir.join("snd-display-source-meta-test.wav");
+        write_sine_wav(&path, 2, 4410, 44100);
+        let buffer = load_buffer(&path).expect("load wav");
+        let source = buffer.source.expect("source metadata");
+        assert_eq!(source.bits_per_sample, Some(16));
+        assert_eq!(source.size_bytes, std::fs::metadata(&path).unwrap().len());
         let _ = std::fs::remove_file(path);
     }
 }
