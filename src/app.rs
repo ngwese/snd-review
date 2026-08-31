@@ -24,6 +24,7 @@ use crate::commands::{
     TransportNext, TransportPlayPause, TransportPrevious, TransportStart, TransportStop,
     ViewFitAll, ViewFrame, ViewZoomIn, ViewZoomOut,
 };
+use crate::components::status_bar::{FileStatus, FileStatusBar};
 use crate::components::transport::Transport;
 use crate::components::waveform::{ToggleZeroCrossing, WaveformDisplay};
 use crate::model::selection::Selection;
@@ -214,12 +215,7 @@ fn format_header_meta(doc: &BufferDocument, transport: TransportState) -> String
         return format!("No file open  ·  {}", transport_state_label(transport));
     }
 
-    let mut parts = vec![
-        format!("{} Hz", buffer.audio.sample_rate),
-        format!("{} ch", buffer.audio.channel_count()),
-        format_duration(buffer.audio.duration_secs()),
-        transport_state_label(transport).to_string(),
-    ];
+    let mut parts = vec![transport_state_label(transport).to_string()];
 
     if let Some(pos) = &doc.current_position {
         parts.push(format!(
@@ -247,19 +243,6 @@ fn format_header_meta(doc: &BufferDocument, transport: TransportState) -> String
     parts.join("  ·  ")
 }
 
-fn format_duration(secs: f64) -> String {
-    if secs.is_nan() || secs.is_infinite() {
-        return "0.00s".into();
-    }
-    if secs < 60.0 {
-        format!("{secs:.2}s")
-    } else {
-        let m = (secs / 60.0).floor() as u32;
-        let s = secs % 60.0;
-        format!("{m}m {s:05.2}s")
-    }
-}
-
 impl Render for AppView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
@@ -271,6 +254,7 @@ impl Render for AppView {
         let hover_sample = self.waveform.read(cx).hover_sample();
         let meta = format_header_meta(doc, transport_state);
         let hover_meta = hover_sample.map(|sample| format_hover_meta(doc, sample));
+        let file_status = FileStatus::from_buffer(&doc.buffer.read().unwrap());
         let drop_highlight = theme.secondary;
 
         div()
@@ -343,7 +327,8 @@ impl Render for AppView {
                             }),
                     )
                     .child(div().flex_1().min_h_0().w_full().child(waveform))
-                    .child(Transport::new(transport_state, looping)),
+                    .child(Transport::new(transport_state, looping))
+                    .child(FileStatusBar::new(file_status)),
             )
             .children(Root::render_dialog_layer(window, cx))
     }
