@@ -13,19 +13,18 @@ use gpui::{
     TitlebarOptions, Window, WindowBounds, WindowOptions,
 };
 use gpui_component::{
-    button::{Button, ButtonVariants as _},
-    h_flex,
-    menu::AppMenuBar,
-    v_flex, ActiveTheme as _, GlobalState, Root, Sizable as _, Theme, ThemeMode, WindowExt as _,
-    TITLE_BAR_HEIGHT,
+    h_flex, menu::AppMenuBar, v_flex, ActiveTheme as _, GlobalState, Root, Theme, ThemeMode,
+    WindowExt as _, TITLE_BAR_HEIGHT,
 };
 
+use crate::assets::AppAssets;
 use crate::audio;
 use crate::commands::{
     install_keybindings, About, Open, Quit, TransportEnd, TransportHome, TransportLoop,
     TransportNext, TransportPlayPause, TransportPrevious, TransportStart, TransportStop,
     ViewFitAll, ViewFrame, ViewZoomIn, ViewZoomOut,
 };
+use crate::components::transport::Transport;
 use crate::components::waveform::{ToggleZeroCrossing, WaveformDisplay};
 use crate::model::selection::Selection;
 use crate::model::{Buffer, BufferDocument};
@@ -268,10 +267,6 @@ impl Render for AppView {
         let doc = self.document.read(cx);
         let transport_state = self.playback.transport_state();
         let looping = self.playback.looping();
-        let play_pause_label = match transport_state {
-            TransportState::Playing => "Pause",
-            _ => "Play",
-        };
 
         let hover_sample = self.waveform.read(cx).hover_sample();
         let meta = format_header_meta(doc, transport_state);
@@ -348,89 +343,7 @@ impl Render for AppView {
                             }),
                     )
                     .child(div().flex_1().min_h_0().w_full().child(waveform))
-                    .child(
-                        h_flex()
-                            .id("transport-bar")
-                            .w_full()
-                            .flex_none()
-                            .px_3()
-                            .py_2()
-                            .gap_2()
-                            .items_center()
-                            .border_t_1()
-                            .border_color(theme.border)
-                            .bg(theme.title_bar)
-                            .child(
-                                Button::new("transport-home")
-                                    .small()
-                                    .label("Home")
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.playback.home();
-                                        this.sync_playback_to_document(cx);
-                                    })),
-                            )
-                            .child(
-                                Button::new("transport-prev")
-                                    .small()
-                                    .label("Previous")
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.playback.previous();
-                                        this.sync_playback_to_document(cx);
-                                    })),
-                            )
-                            .child(
-                                Button::new("transport-start")
-                                    .small()
-                                    .label("Start")
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.playback.start();
-                                        this.sync_playback_to_document(cx);
-                                    })),
-                            )
-                            .child(
-                                Button::new("transport-play-pause")
-                                    .small()
-                                    .primary()
-                                    .label(play_pause_label)
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.playback.toggle_play_pause();
-                                        this.sync_playback_to_document(cx);
-                                    })),
-                            )
-                            .child(
-                                Button::new("transport-stop")
-                                    .small()
-                                    .label("Stop")
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.playback.stop();
-                                        this.sync_playback_to_document(cx);
-                                    })),
-                            )
-                            .child(
-                                Button::new("transport-next")
-                                    .small()
-                                    .label("Next")
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.playback.next();
-                                        this.sync_playback_to_document(cx);
-                                    })),
-                            )
-                            .child(Button::new("transport-end").small().label("End").on_click(
-                                cx.listener(|this, _, _, cx| {
-                                    this.playback.end();
-                                    this.sync_playback_to_document(cx);
-                                }),
-                            ))
-                            .child(
-                                Button::new("transport-loop")
-                                    .small()
-                                    .label(if looping { "Loop On" } else { "Loop Off" })
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.playback.toggle_loop();
-                                        cx.notify();
-                                    })),
-                            ),
-                    ),
+                    .child(Transport::new(transport_state, looping)),
             )
             .children(Root::render_dialog_layer(window, cx))
     }
@@ -663,7 +576,7 @@ pub fn run(initial_buffer: Option<Buffer>, device: Device) {
         .expect("failed to open audio playback device");
     let pending_opens = Arc::new(Mutex::new(Vec::<PathBuf>::new()));
 
-    let app = gpui_platform::application().with_assets(gpui_component_assets::Assets);
+    let app = gpui_platform::application().with_assets(AppAssets);
     app.on_open_urls({
         let pending_opens = pending_opens.clone();
         move |urls| {
