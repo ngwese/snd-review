@@ -376,6 +376,14 @@ impl BufferDocument {
         ok
     }
 
+    pub fn jump_to_edit(&mut self, id: EditId) -> bool {
+        let ok = self.composition.write().unwrap().jump_to_edit(id);
+        if ok {
+            self.after_edit();
+        }
+        ok
+    }
+
     pub fn edit_copy(&mut self) {
         let Some((start, len)) = self.selection_span() else {
             return;

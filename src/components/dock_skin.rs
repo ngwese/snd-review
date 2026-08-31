@@ -1,0 +1,264 @@
+// SPDX-FileCopyrightText: 2026 Greg Wuller
+// SPDX-License-Identifier: MIT
+
+use std::rc::Rc;
+use std::sync::Arc;
+
+use gpui::{
+    div, prelude::FluentBuilder as _, rems, AnyElement, AnyView, App, AppContext as _, Axis, Div,
+    Entity, InteractiveElement as _, IntoElement, ParentElement as _, SharedString, Stateful,
+    StatefulInteractiveElement as _, Styled as _, WeakEntity, Window,
+};
+use gpui_component::{
+    dock::{
+        BasePanelView, DockArea, DockAreaRenderer, DockContext, DockPlacement, DockSkin, NodeId,
+        PanelHandle, TabGroupContext, TabGroupRenderer, TilesRenderer,
+    },
+    h_flex,
+    tab::{Tab, TabBar},
+    ActiveTheme as _, Selectable as _, Sizable as _,
+};
+
+/// Dock appearance with small tabs, built on [`DockSkin`].
+pub struct CompactDockSkin {
+    skin: Rc<DockSkin>,
+    area: WeakEntity<DockArea>,
+}
+
+impl CompactDockSkin {
+    pub fn dock_area(
+        id: impl Into<SharedString>,
+        version: Option<usize>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (Entity<DockArea>, Rc<DockSkin>) {
+        let mut skin = None;
+        let area = cx.new(|cx| {
+            let this = DockSkin::new(cx);
+            skin = Some(this.clone());
+            DockArea::new(id, version, window, cx).with_renderer(Rc::new(Self {
+                skin: this,
+                area: cx.weak_entity(),
+            })
+                as Rc<dyn DockAreaRenderer>)
+        });
+        (
+            area,
+            skin.expect("DockSkin::new ran inside the constructor"),
+        )
+    }
+}
+
+impl DockAreaRenderer for CompactDockSkin {
+    fn frame(&self, window: &mut Window, cx: &mut App) -> Stateful<Div> {
+        DockAreaRenderer::frame(self.skin.as_ref(), window, cx)
+    }
+
+    fn center_frame(&self, window: &mut Window, cx: &mut App) -> Stateful<Div> {
+        DockAreaRenderer::center_frame(self.skin.as_ref(), window, cx)
+    }
+
+    fn split_frame(
+        &self,
+        node: NodeId,
+        axis: Axis,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Stateful<Div> {
+        DockAreaRenderer::split_frame(self.skin.as_ref(), node, axis, window, cx)
+    }
+
+    fn render_dock(
+        &self,
+        dock: &DockContext,
+        content: AnyElement,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> AnyElement {
+        DockAreaRenderer::render_dock(self.skin.as_ref(), dock, content, window, cx)
+    }
+
+    fn tab_group_renderer(&self) -> Rc<dyn TabGroupRenderer> {
+        Rc::new(CompactTabGroup {
+            inner: DockAreaRenderer::tab_group_renderer(self.skin.as_ref()),
+            area: self.area.clone(),
+        })
+    }
+
+    fn tiles_renderer(&self) -> Rc<dyn TilesRenderer> {
+        DockAreaRenderer::tiles_renderer(self.skin.as_ref())
+    }
+}
+
+struct CompactTabGroup {
+    inner: Rc<dyn TabGroupRenderer>,
+    area: WeakEntity<DockArea>,
+}
+
+impl CompactTabGroup {
+    fn is_right_dock_group(&self, group: &TabGroupContext, cx: &App) -> bool {
+        self.area.upgrade().is_some_and(|area| {
+            area.read(cx)
+                .layout(DockPlacement::Right)
+                .and_then(|tree| tree.find_node(group.node()))
+                .is_some()
+        })
+    }
+
+    fn panel_title(
+        panel: &Arc<dyn BasePanelView>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> AnyElement {
+        match PanelHandle::of(panel) {
+            Some(handle) => handle
+                .tab_name(cx)
+                .map(|name| name.into_any_element())
+                .unwrap_or_else(|| handle.title(window, cx)),
+            None => SharedString::from(panel.panel_name(cx)).into_any_element(),
+        }
+    }
+
+    fn render_right_tab_bar(
+        &self,
+        group: &TabGroupContext,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> AnyElement {
+        let active_id = group.active_panel().map(|panel| panel.panel_id(cx));
+        let muted = cx.theme().muted_foreground;
+        let active = cx.theme().foreground;
+        let selected_bg = active.opacity(0.05);
+        let radius = cx.theme().radius;
+        let visible: Vec<usize> = group
+            .panels()
+            .iter()
+            .enumerate()
+            .filter(|(_, panel)| panel.visible(cx))
+            .map(|(ix, _)| ix)
+            .collect();
+        let mut tabs = Vec::with_capacity(visible.len());
+        for ix in visible {
+            let panel = &group.panels()[ix];
+            let title = Self::panel_title(panel, window, cx);
+            let selected = !group.is_collapsed() && Some(panel.panel_id(cx)) == active_id;
+            let group = group.clone();
+            tabs.push(
+                div()
+                    .id(("right-tab", panel.panel_id(cx).as_u64()))
+                    .flex()
+                    .flex_none()
+                    .items_center()
+                    .px_1p5()
+                    .py_0p5()
+                    .rounded(radius)
+                    .cursor_pointer()
+                    .text_sm()
+                    .when(selected, |this| this.text_color(active).bg(selected_bg))
+                    .when(!selected, |this| {
+                        this.text_color(muted).hover(|this| this.text_color(active))
+                    })
+                    .on_click(move |_, window, cx| {
+                        group.select_tab(ix, window, cx);
+                    })
+                    .child(title),
+            );
+        }
+        h_flex()
+            .id("right-tab-bar")
+            .w_full()
+            .flex_none()
+            .items_center()
+            .gap_1()
+            .py_1()
+            .children(tabs)
+            .into_any_element()
+    }
+}
+
+impl TabGroupRenderer for CompactTabGroup {
+    fn frame(&self, group: &TabGroupContext, window: &mut Window, cx: &mut App) -> Stateful<Div> {
+        let frame = self.inner.frame(group, window, cx);
+        if self.is_right_dock_group(group, cx) {
+            frame.px(rems(0.5))
+        } else {
+            frame
+        }
+    }
+
+    fn content_frame(
+        &self,
+        group: &TabGroupContext,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Stateful<Div> {
+        self.inner.content_frame(group, window, cx)
+    }
+
+    fn render_tab_bar(
+        &self,
+        group: &TabGroupContext,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> AnyElement {
+        if self.is_right_dock_group(group, cx) {
+            return self.render_right_tab_bar(group, window, cx);
+        }
+
+        let active_id = group.active_panel().map(|panel| panel.panel_id(cx));
+        let visible: Vec<usize> = group
+            .panels()
+            .iter()
+            .enumerate()
+            .filter(|(_, panel)| panel.visible(cx))
+            .map(|(ix, _)| ix)
+            .collect();
+        let mut tabs = Vec::with_capacity(visible.len());
+        for ix in visible {
+            let panel = &group.panels()[ix];
+            let selected = !group.is_collapsed() && Some(panel.panel_id(cx)) == active_id;
+            let group = group.clone();
+            tabs.push(
+                Tab::new()
+                    .small()
+                    .child(Self::panel_title(panel, window, cx))
+                    .selected(selected)
+                    .on_click(move |_, window, cx| {
+                        group.select_tab(ix, window, cx);
+                    }),
+            );
+        }
+        TabBar::new("tab-bar")
+            .small()
+            .children(tabs)
+            .into_any_element()
+    }
+
+    fn render_active_panel(
+        &self,
+        panel: AnyView,
+        group: &TabGroupContext,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> AnyElement {
+        self.inner.render_active_panel(panel, group, window, cx)
+    }
+
+    fn render_drop_indicator(
+        &self,
+        indicator: gpui_component::dock::DropIndicator,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Option<AnyElement> {
+        self.inner.render_drop_indicator(indicator, window, cx)
+    }
+
+    fn render_empty(
+        &self,
+        group: &TabGroupContext,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Option<AnyElement> {
+        self.inner.render_empty(group, window, cx)
+    }
+}

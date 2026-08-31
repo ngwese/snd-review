@@ -13,8 +13,12 @@ use gpui::{
     TitlebarOptions, Window, WindowBounds, WindowOptions,
 };
 use gpui_component::{
-    h_flex, menu::AppMenuBar, v_flex, ActiveTheme as _, GlobalState, Root, Theme, ThemeMode,
-    WindowExt as _, TITLE_BAR_HEIGHT,
+    button::{Button, ButtonVariants as _},
+    dock::{panel_handle, DockArea, DockEvent, DockLayout, DockPlacement, PanelStyle},
+    h_flex,
+    menu::AppMenuBar,
+    v_flex, ActiveTheme as _, GlobalState, IconName, Root, Selectable as _, Sizable as _, Theme,
+    ThemeMode, WindowExt as _, TITLE_BAR_HEIGHT,
 };
 
 use crate::assets::AppAssets;
@@ -24,9 +28,12 @@ use crate::commands::{
     TransportHome, TransportLoop, TransportNext, TransportPlayPause, TransportPrevious,
     TransportStart, TransportStop, ViewFitAll, ViewFrame, ViewZoomIn, ViewZoomOut,
 };
+use crate::components::dock_skin::CompactDockSkin;
+use crate::components::edits::EditsPanel;
+use crate::components::empty_pane::EmptyPane;
 use crate::components::status_bar::{FileStatus, FileStatusBar};
-use crate::components::transport::Transport;
 use crate::components::waveform::{ToggleZeroCrossing, WaveformDisplay};
+use crate::components::workspace::WorkspacePanel;
 use crate::model::composition::Composition;
 use crate::model::selection::Selection;
 use crate::model::{Buffer, BufferDocument};
@@ -43,6 +50,8 @@ pub struct AppView {
     device: Device,
     document: Entity<BufferDocument>,
     waveform: Entity<WaveformDisplay>,
+    workspace: Entity<WorkspacePanel>,
+    dock_area: Entity<DockArea>,
     playback: PlaybackSession,
     app_menu_bar: Option<Entity<AppMenuBar>>,
     pending_opens: Arc<Mutex<Vec<PathBuf>>>,
@@ -88,6 +97,13 @@ impl AppView {
                         dirty = true;
                         this.waveform.update(cx, |_, cx| cx.notify());
                     }
+                    this.workspace.update(cx, |workspace, cx| {
+                        workspace.sync_transport(
+                            this.playback.transport_state(),
+                            this.playback.looping(),
+                            cx,
+                        );
+                    });
                     if dirty {
                         cx.notify();
                     }
@@ -102,12 +118,50 @@ impl AppView {
 
         let waveform = cx.new(|cx| WaveformDisplay::new(document.clone(), cx));
         cx.observe(&waveform, |_, _, cx| cx.notify()).detach();
+        let workspace = cx.new(|cx| WorkspacePanel::new(document.clone(), waveform.clone(), cx));
+        let edits = cx.new(|cx| EditsPanel::new(document.clone(), cx));
+        let transients = cx.new(|cx| EmptyPane::new("TransientsPanel", "Transients", cx));
+        let markers = cx.new(|cx| EmptyPane::new("MarkersPanel", "Markers", cx));
+        let labels = cx.new(|cx| EmptyPane::new("LabelsPanel", "Labels", cx));
+        let (dock_area, skin) = CompactDockSkin::dock_area("main-dock", Some(1), window, cx);
+        let workspace_handle = panel_handle(workspace.clone());
+        let edits_handle = panel_handle(edits);
+        let transients_handle = panel_handle(transients);
+        let markers_handle = panel_handle(markers);
+        let labels_handle = panel_handle(labels);
+        dock_area.update(cx, |area, cx| {
+            area.set_center(
+                DockLayout::tabs().panel_view(workspace_handle, cx),
+                window,
+                cx,
+            );
+            area.set_dock(
+                DockPlacement::Right,
+                DockLayout::tabs()
+                    .panel_view(edits_handle, cx)
+                    .panel_view(transients_handle, cx)
+                    .panel_view(markers_handle, cx)
+                    .panel_view(labels_handle, cx),
+                window,
+                cx,
+            );
+            area.set_dock_size(DockPlacement::Right, px(260.), window, cx);
+            area.set_dock_collapsible(DockPlacement::Right, true, window, cx);
+            area.toggle_dock(DockPlacement::Right, window, cx);
+        });
+        skin.set_panel_style(PanelStyle::TabBar, cx);
+        skin.set_toggle_button_visible(false, cx);
+        cx.subscribe_in(&dock_area, window, |_, _, _: &DockEvent, _, cx| cx.notify())
+            .detach();
+
         let this = Self {
             composition,
             buffer,
             device,
             document,
             waveform,
+            workspace,
+            dock_area,
             playback,
             app_menu_bar: (!cfg!(target_os = "macos")).then(|| AppMenuBar::new(cx)),
             pending_opens,
@@ -119,13 +173,7 @@ impl AppView {
     }
 
     fn composition_title(composition: &Composition) -> SharedString {
-        composition
-            .pool()
-            .first()
-            .and_then(|m| m.path.file_name())
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "snd-review".into())
-            .into()
+        composition.display_name().into()
     }
 
     fn load_composition(
@@ -153,9 +201,22 @@ impl AppView {
         self.playback.sync_from_document(self.document.read(cx));
         self.spawn_peak_build(cx);
         self.waveform.update(cx, |view, cx| view.reset_view(cx));
+        self.workspace.update(cx, |_, cx| cx.notify());
+        self.dock_area.update(cx, |_, cx| cx.notify());
 
         window.set_window_title(&title);
         cx.notify();
+    }
+
+    fn toggle_edits_dock(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.dock_area.update(cx, |area, cx| {
+            area.toggle_dock(DockPlacement::Right, window, cx);
+        });
+        cx.notify();
+    }
+
+    fn edits_dock_open(&self, cx: &App) -> bool {
+        self.dock_area.read(cx).is_dock_open(DockPlacement::Right)
     }
 
     fn spawn_peak_build(&self, cx: &mut Context<Self>) {
@@ -306,17 +367,25 @@ fn format_header_meta(doc: &BufferDocument, transport: TransportState) -> String
 impl Render for AppView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
-        let waveform = self.waveform.clone();
         let doc = self.document.read(cx);
         let transport_state = self.playback.transport_state();
-        let looping = self.playback.looping();
-
         let hover_sample = self.waveform.read(cx).hover_sample();
         let meta = format_header_meta(doc, transport_state);
         let hover_meta = hover_sample.map(|sample| format_hover_meta(doc, sample));
         let file_status = FileStatus::from_composition(&doc.composition.read().unwrap());
         let progress_message = doc.progress.snapshot().map(|state| state.message());
         let drop_highlight = theme.secondary;
+        let edits_open = self.edits_dock_open(cx);
+        let edits_icon = if edits_open {
+            IconName::PanelRight
+        } else {
+            IconName::PanelRightOpen
+        };
+        let edits_tooltip = if edits_open {
+            "Hide Edits"
+        } else {
+            "Show Edits"
+        };
 
         div()
             .id("app-view")
@@ -385,10 +454,26 @@ impl Render for AppView {
                                         .whitespace_nowrap()
                                         .child(hover_meta),
                                 )
-                            }),
+                            })
+                            .child(
+                                Button::new("toggle-edits-dock")
+                                    .ghost()
+                                    .small()
+                                    .icon(edits_icon)
+                                    .tooltip(edits_tooltip)
+                                    .selected(edits_open)
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.toggle_edits_dock(window, cx);
+                                    })),
+                            ),
                     )
-                    .child(div().flex_1().min_h_0().w_full().child(waveform))
-                    .child(Transport::new(transport_state, looping))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_h_0()
+                            .w_full()
+                            .child(self.dock_area.clone()),
+                    )
                     .child(FileStatusBar::new(file_status).with_progress_message(progress_message)),
             )
             .children(Root::render_dialog_layer(window, cx))

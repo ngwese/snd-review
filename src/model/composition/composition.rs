@@ -127,6 +127,15 @@ impl Composition {
         Ok(self)
     }
 
+    pub fn display_name(&self) -> String {
+        self.pool()
+            .first()
+            .and_then(|media| media.path.file_name())
+            .map(|name| name.to_string_lossy().into_owned())
+            .filter(|name| !name.is_empty())
+            .unwrap_or_else(|| "snd-review".into())
+    }
+
     pub fn sample_rate(&self) -> u32 {
         self.sample_rate
     }
