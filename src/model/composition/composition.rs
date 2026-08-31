@@ -12,6 +12,7 @@ use super::media::{MediaId, MediaPool, MediaRef};
 use super::pager::BlockPager;
 use super::tree::ClipTree;
 use crate::audio::{ProbedFile, PEAK_BLOCK};
+use crate::progress::ProgressHandle;
 
 #[derive(Debug, Clone, Default)]
 pub struct Clipboard {
@@ -95,8 +96,14 @@ impl Composition {
                 media_id: media_id.0,
             },
         };
-        composed.ensure_clip_peaks().ok();
-        composed.edl = Edl::new(composed.tree.clone());
+        let peaked = composed
+            .pool
+            .first()
+            .is_some_and(|media| media.samples.is_some());
+        if peaked {
+            composed.ensure_clip_peaks().ok();
+            composed.edl = Edl::new(composed.tree.clone());
+        }
         Ok(composed)
     }
 
@@ -670,10 +677,44 @@ impl Composition {
         Ok(())
     }
 
+    pub fn needs_peak_build(&self) -> bool {
+        self.spans()
+            .iter()
+            .any(|span| span.clip.source.is_some() && span.clip.cache.peaks.is_empty())
+    }
+
     pub fn ensure_clip_peaks(&mut self) -> Result<()> {
+        let updates = self.build_missing_peak_caches(None, 0)?;
+        self.apply_peak_caches(updates);
+        Ok(())
+    }
+
+    pub fn apply_peak_caches(&mut self, updates: Vec<(u64, Clip)>) {
+        for (start, clip) in updates {
+            self.tree = self.tree.map_clip_at(start, |_| clip);
+        }
+    }
+
+    pub fn build_missing_peak_caches(
+        &self,
+        progress: Option<&ProgressHandle>,
+        epoch: u64,
+    ) -> Result<Vec<(u64, Clip)>> {
         let spans = self.tree.spans();
+        let total: u64 = spans
+            .iter()
+            .filter(|span| span.clip.source.is_some() && span.clip.cache.peaks.is_empty())
+            .map(|span| span.clip.len.saturating_mul(self.channel_count as u64))
+            .sum();
+        let mut done = 0u64;
         let mut updated = Vec::new();
+        if let Some(progress) = progress {
+            progress.set_ratio(epoch, 0, total.max(1));
+        }
         for span in &spans {
+            if progress.is_some_and(|p| !p.is_epoch(epoch)) {
+                break;
+            }
             if !span.clip.cache.peaks.is_empty() || span.clip.source.is_none() {
                 continue;
             }
@@ -683,6 +724,9 @@ impl Composition {
             let mut pos = 0u64;
             let mut chunk = vec![0.0; PEAK_BLOCK];
             while pos < span.clip.len {
+                if progress.is_some_and(|p| !p.is_epoch(epoch)) {
+                    return Ok(updated);
+                }
                 let take = ((span.clip.len - pos) as usize).min(PEAK_BLOCK);
                 for ch in 0..self.channel_count {
                     let dest = &mut chunk[..take];
@@ -700,6 +744,10 @@ impl Composition {
                     } else {
                         (0.0, 0.0)
                     });
+                    done += take as u64;
+                    if let Some(progress) = progress {
+                        progress.set_ratio(epoch, done, total.max(1));
+                    }
                 }
                 pos += take as u64;
             }
@@ -711,10 +759,10 @@ impl Composition {
             };
             updated.push((span.start, clip));
         }
-        for (start, clip) in updated {
-            self.tree = self.tree.map_clip_at(start, |_| clip);
+        if let Some(progress) = progress {
+            progress.set_fraction(epoch, 1.0);
         }
-        Ok(())
+        Ok(updated)
     }
 
     pub fn to_project_file(&self) -> ProjectFile {
@@ -1041,12 +1089,26 @@ mod tests {
         let dir = std::env::temp_dir();
         let path = dir.join("snd-composition-page-test.wav");
         write_sine_wav(&path, 1, 512, 44100);
-        let comp = Composition::load_from_path(&path).unwrap();
+        let mut comp = Composition::load_from_path(&path).unwrap();
         assert_eq!(comp.frames(), 512);
         assert!(comp.pool().first().unwrap().samples.is_none());
         let mut dest = vec![0.0; 8];
         comp.read_interleaved(10, 8, &mut dest).unwrap();
         assert!(dest.iter().any(|&s| s.abs() > 0.01));
+        assert!(comp.needs_peak_build());
+        let progress = crate::progress::ProgressHandle::new();
+        let epoch = progress.begin("building peaks");
+        let updates = comp
+            .build_missing_peak_caches(Some(&progress), epoch)
+            .unwrap();
+        assert!(!updates.is_empty());
+        assert_eq!(
+            progress.snapshot().unwrap().message(),
+            "building peaks 100%"
+        );
+        comp.apply_peak_caches(updates);
+        assert!(!comp.needs_peak_build());
+        progress.finish(epoch);
         let _ = std::fs::remove_file(path);
     }
 

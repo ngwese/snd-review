@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Greg Wuller
 // SPDX-License-Identifier: MIT
 
-use gpui::{px, App, IntoElement, RenderOnce, Styled as _, Window};
+use gpui::{px, App, IntoElement, ParentElement as _, RenderOnce, Styled as _, Window};
 use gpui_component::status_bar::StatusBar;
 
 use crate::model::composition::Composition;
@@ -52,11 +52,20 @@ impl FileStatus {
 #[derive(IntoElement)]
 pub struct FileStatusBar {
     file: Option<FileStatus>,
+    progress_message: Option<String>,
 }
 
 impl FileStatusBar {
     pub fn new(file: Option<FileStatus>) -> Self {
-        Self { file }
+        Self {
+            file,
+            progress_message: None,
+        }
+    }
+
+    pub fn with_progress_message(mut self, message: Option<String>) -> Self {
+        self.progress_message = message;
+        self
     }
 }
 
@@ -69,6 +78,7 @@ impl RenderOnce for FileStatusBar {
             .min_h(HEIGHT)
             .max_h(HEIGHT)
             .text_xs();
+        let has_file = self.file.is_some();
         if let Some(file) = self.file {
             bar = bar
                 .left(format!("{} Hz", file.sample_rate))
@@ -80,6 +90,12 @@ impl RenderOnce for FileStatusBar {
                         .map(format_bytes)
                         .unwrap_or_else(|| "—".into()),
                 );
+        }
+        if let Some(message) = self.progress_message {
+            if !has_file {
+                bar = bar.left("");
+            }
+            bar = bar.child(message).right("");
         }
         bar
     }

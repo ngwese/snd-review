@@ -31,6 +31,7 @@ use crate::model::composition::Composition;
 use crate::model::selection::Selection;
 use crate::model::{Buffer, BufferDocument};
 use crate::playback::{PlaybackSession, TransportState};
+use crate::progress::ProgressState;
 
 struct OpenTarget(Entity<AppView>);
 
@@ -46,6 +47,7 @@ pub struct AppView {
     app_menu_bar: Option<Entity<AppMenuBar>>,
     pending_opens: Arc<Mutex<Vec<PathBuf>>>,
     focus_handle: FocusHandle,
+    last_progress: Option<ProgressState>,
 }
 
 impl AppView {
@@ -80,6 +82,12 @@ impl AppView {
                             cx.notify();
                         }
                     });
+                    let progress = this.document.read(cx).progress.snapshot();
+                    if progress != this.last_progress {
+                        this.last_progress = progress;
+                        dirty = true;
+                        this.waveform.update(cx, |_, cx| cx.notify());
+                    }
                     if dirty {
                         cx.notify();
                     }
@@ -94,7 +102,7 @@ impl AppView {
 
         let waveform = cx.new(|cx| WaveformDisplay::new(document.clone(), cx));
         cx.observe(&waveform, |_, _, cx| cx.notify()).detach();
-        Self {
+        let this = Self {
             composition,
             buffer,
             device,
@@ -104,7 +112,10 @@ impl AppView {
             app_menu_bar: (!cfg!(target_os = "macos")).then(|| AppMenuBar::new(cx)),
             pending_opens,
             focus_handle: cx.focus_handle(),
-        }
+            last_progress: None,
+        };
+        this.spawn_peak_build(cx);
+        this
     }
 
     fn composition_title(composition: &Composition) -> SharedString {
@@ -124,6 +135,7 @@ impl AppView {
         cx: &mut Context<Self>,
     ) {
         let title = Self::composition_title(&composition);
+        self.document.read(cx).progress.cancel();
         {
             *self.composition.write().unwrap() = composition;
         }
@@ -139,10 +151,41 @@ impl AppView {
         self.document
             .update(cx, |doc, _| doc.reset_for_new_buffer());
         self.playback.sync_from_document(self.document.read(cx));
+        self.spawn_peak_build(cx);
         self.waveform.update(cx, |view, cx| view.reset_view(cx));
 
         window.set_window_title(&title);
         cx.notify();
+    }
+
+    fn spawn_peak_build(&self, cx: &mut Context<Self>) {
+        let composition = self.composition.clone();
+        if !composition.read().unwrap().needs_peak_build() {
+            return;
+        }
+        let progress = self.document.read(cx).progress.clone();
+        let epoch = progress.begin("building peaks");
+        self.waveform.update(cx, |_, cx| cx.notify());
+        std::thread::spawn(move || {
+            let result = {
+                let composition = composition.read().unwrap();
+                composition.build_missing_peak_caches(Some(&progress), epoch)
+            };
+            match result {
+                Ok(updates) => {
+                    if !updates.is_empty() {
+                        let mut composition = composition.write().unwrap();
+                        if progress.is_epoch(epoch) {
+                            composition.apply_peak_caches(updates);
+                        }
+                    }
+                }
+                Err(err) => {
+                    eprintln!("failed to build peaks: {err:#}");
+                }
+            }
+            progress.finish(epoch);
+        });
     }
 
     fn show_load_error(&self, message: &str, window: &mut Window, cx: &mut Context<Self>) {
@@ -272,6 +315,7 @@ impl Render for AppView {
         let meta = format_header_meta(doc, transport_state);
         let hover_meta = hover_sample.map(|sample| format_hover_meta(doc, sample));
         let file_status = FileStatus::from_composition(&doc.composition.read().unwrap());
+        let progress_message = doc.progress.snapshot().map(|state| state.message());
         let drop_highlight = theme.secondary;
 
         div()
@@ -345,7 +389,7 @@ impl Render for AppView {
                     )
                     .child(div().flex_1().min_h_0().w_full().child(waveform))
                     .child(Transport::new(transport_state, looping))
-                    .child(FileStatusBar::new(file_status)),
+                    .child(FileStatusBar::new(file_status).with_progress_message(progress_message)),
             )
             .children(Root::render_dialog_layer(window, cx))
     }

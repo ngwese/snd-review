@@ -8,6 +8,7 @@ use super::composition::{Composition, EditId};
 use super::selection::{SamplePosition, Selection};
 use super::snap::nearest_zero_crossing;
 use crate::components::waveform::WaveformDataProvider;
+use crate::progress::ProgressHandle;
 
 const DRAG_THRESHOLD_SAMPLES: usize = 0;
 
@@ -17,6 +18,7 @@ pub struct BufferDocument {
     pub selection: Selection,
     pub current_position: Option<SamplePosition>,
     pub snap_zero_crossings: bool,
+    pub progress: ProgressHandle,
     region_drag_anchor: Option<usize>,
     next_region_id: u64,
     next_marker_id: u64,
@@ -37,6 +39,7 @@ impl BufferDocument {
             selection: Selection::None,
             current_position: None,
             snap_zero_crossings: false,
+            progress: ProgressHandle::new(),
             region_drag_anchor: None,
             next_region_id: 1,
             next_marker_id: 1,
@@ -487,6 +490,10 @@ impl WaveformDataProvider for BufferDocument {
             .read()
             .unwrap()
             .min_max_in_range(channel, start, end)
+    }
+
+    fn peaks_ready(&self) -> bool {
+        !self.composition.read().unwrap().needs_peak_build()
     }
 
     fn fill_minmax_columns(

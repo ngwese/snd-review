@@ -3,10 +3,10 @@
 
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
-    actions, canvas, div, fill, hsla, point, px, size, App, Bounds, Context, DispatchPhase, Entity,
-    InteractiveElement as _, IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, ParentElement as _, PathBuilder, Pixels, Render, ScrollWheelEvent, SharedString,
-    StatefulInteractiveElement as _, Styled as _, Window,
+    actions, canvas, div, fill, hsla, point, px, relative, size, App, Bounds, Context,
+    DispatchPhase, Entity, InteractiveElement as _, IntoElement, MouseButton, MouseDownEvent,
+    MouseMoveEvent, MouseUpEvent, ParentElement as _, PathBuilder, Pixels, Render,
+    ScrollWheelEvent, SharedString, StatefulInteractiveElement as _, Styled as _, Window,
 };
 use gpui_component::{
     h_flex,
@@ -30,6 +30,10 @@ pub trait WaveformDataProvider: Send + Sync {
     fn channel_label(&self, channel: usize) -> String;
     fn read_channel(&self, channel: usize, start: usize, dest: &mut [f32]);
     fn min_max_in_range(&self, channel: usize, start: f64, end: f64) -> (f32, f32);
+    /// Overview paint needs peak bins; sample-accurate zoom still reads PCM.
+    fn peaks_ready(&self) -> bool {
+        true
+    }
     fn fill_minmax_columns(
         &self,
         channel: usize,
@@ -619,77 +623,82 @@ fn paint_lane(
     let frames = WaveformDataProvider::frames(provider);
     let cols = width.ceil() as usize;
 
-    if samples_per_pixel < 1.0 {
-        let mut builder = PathBuilder::stroke(px(1.2));
-        let mut started = false;
-        let first = start_sample.max(0.0).floor() as usize;
-        let last = ((start_sample + width as f64 * samples_per_pixel).ceil() as usize)
-            .min(frames.saturating_sub(1));
-        if first <= last && frames > 0 {
-            let mut samples = vec![0.0; last - first + 1];
-            WaveformDataProvider::read_channel(provider, channel, first, &mut samples);
-            for (offset, sample) in samples.iter().enumerate() {
-                let i = first + offset;
-                let x = origin_x + ((i as f64 - start_sample) / samples_per_pixel) as f32;
-                let y = y_scale
-                    .tick(&(*sample as f64))
-                    .unwrap_or(origin_y + height * 0.5);
-                if !started {
-                    builder.move_to(point(px(x), px(y)));
-                    started = true;
-                } else {
-                    builder.line_to(point(px(x), px(y)));
+    // Overview paint uses peak bins. Folding PCM while caches are still
+    // building would decode on the UI thread and delay the progress UI.
+    if WaveformDataProvider::peaks_ready(provider) {
+        if samples_per_pixel < 1.0 {
+            let mut builder = PathBuilder::stroke(px(1.2));
+            let mut started = false;
+            let first = start_sample.max(0.0).floor() as usize;
+            let last = ((start_sample + width as f64 * samples_per_pixel).ceil() as usize)
+                .min(frames.saturating_sub(1));
+            if first <= last && frames > 0 {
+                let mut samples = vec![0.0; last - first + 1];
+                WaveformDataProvider::read_channel(provider, channel, first, &mut samples);
+                for (offset, sample) in samples.iter().enumerate() {
+                    let i = first + offset;
+                    let x = origin_x + ((i as f64 - start_sample) / samples_per_pixel) as f32;
+                    let y = y_scale
+                        .tick(&(*sample as f64))
+                        .unwrap_or(origin_y + height * 0.5);
+                    if !started {
+                        builder.move_to(point(px(x), px(y)));
+                        started = true;
+                    } else {
+                        builder.line_to(point(px(x), px(y)));
+                    }
                 }
             }
-        }
-        if let Ok(path) = builder.build() {
-            window.paint_path(path, color);
-        }
-    } else {
-        let first = start_sample.max(0.0).floor() as usize;
-        let last = ((start_sample + cols as f64 * samples_per_pixel).ceil() as usize).min(frames);
-        let visible = last.saturating_sub(first);
-        let fold_from_samples = samples_per_pixel < PEAK_BLOCK as f64
-            && visible > 0
-            && visible <= cols.saturating_mul(64);
-
-        if fold_from_samples {
-            let mut samples = vec![0.0; visible];
-            WaveformDataProvider::read_channel(provider, channel, first, &mut samples);
-            for col in 0..cols {
-                let bin_start = start_sample + col as f64 * samples_per_pixel;
-                let bin_end = bin_start + samples_per_pixel;
-                if bin_start >= frames as f64 {
-                    break;
-                }
-                let a = (bin_start.floor() as usize)
-                    .saturating_sub(first)
-                    .min(samples.len());
-                let b = (bin_end.ceil() as usize)
-                    .saturating_sub(first)
-                    .clamp(a, samples.len());
-                let (min, max) = min_max_of(&samples[a..b]);
-                paint_column(
-                    origin_x, col, min, max, &y_scale, origin_y, height, color, window,
-                );
+            if let Ok(path) = builder.build() {
+                window.paint_path(path, color);
             }
         } else {
-            let mut columns = vec![(0.0f32, 0.0f32); cols];
-            WaveformDataProvider::fill_minmax_columns(
-                provider,
-                channel,
-                start_sample,
-                samples_per_pixel,
-                &mut columns,
-            );
-            for (col, &(min, max)) in columns.iter().enumerate() {
-                let bin_start = start_sample + col as f64 * samples_per_pixel;
-                if bin_start >= frames as f64 {
-                    break;
+            let first = start_sample.max(0.0).floor() as usize;
+            let last =
+                ((start_sample + cols as f64 * samples_per_pixel).ceil() as usize).min(frames);
+            let visible = last.saturating_sub(first);
+            let fold_from_samples = samples_per_pixel < PEAK_BLOCK as f64
+                && visible > 0
+                && visible <= cols.saturating_mul(64);
+
+            if fold_from_samples {
+                let mut samples = vec![0.0; visible];
+                WaveformDataProvider::read_channel(provider, channel, first, &mut samples);
+                for col in 0..cols {
+                    let bin_start = start_sample + col as f64 * samples_per_pixel;
+                    let bin_end = bin_start + samples_per_pixel;
+                    if bin_start >= frames as f64 {
+                        break;
+                    }
+                    let a = (bin_start.floor() as usize)
+                        .saturating_sub(first)
+                        .min(samples.len());
+                    let b = (bin_end.ceil() as usize)
+                        .saturating_sub(first)
+                        .clamp(a, samples.len());
+                    let (min, max) = min_max_of(&samples[a..b]);
+                    paint_column(
+                        origin_x, col, min, max, &y_scale, origin_y, height, color, window,
+                    );
                 }
-                paint_column(
-                    origin_x, col, min, max, &y_scale, origin_y, height, color, window,
+            } else {
+                let mut columns = vec![(0.0f32, 0.0f32); cols];
+                WaveformDataProvider::fill_minmax_columns(
+                    provider,
+                    channel,
+                    start_sample,
+                    samples_per_pixel,
+                    &mut columns,
                 );
+                for (col, &(min, max)) in columns.iter().enumerate() {
+                    let bin_start = start_sample + col as f64 * samples_per_pixel;
+                    if bin_start >= frames as f64 {
+                        break;
+                    }
+                    paint_column(
+                        origin_x, col, min, max, &y_scale, origin_y, height, color, window,
+                    );
+                }
             }
         }
     }
@@ -795,8 +804,10 @@ impl Render for WaveformDisplay {
         let entity = cx.entity();
         let channel_count = WaveformDataProvider::channel_count(self.document.read(cx));
         let is_empty = WaveformDataProvider::frames(self.document.read(cx)) == 0;
+        let job_progress = self.document.read(cx).progress.snapshot();
 
         v_flex()
+            .relative()
             .size_full()
             .child(
                 div()
@@ -1037,6 +1048,21 @@ impl Render for WaveformDisplay {
                                 ),
                         )
                 })
+            })
+            .when_some(job_progress, |this, state| {
+                let fill = theme.primary;
+                let track = theme.border;
+                this.child(
+                    div()
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .w_full()
+                        .h(px(2.))
+                        .flex_none()
+                        .bg(track)
+                        .child(div().h_full().w(relative(state.fraction)).bg(fill)),
+                )
             })
     }
 }
