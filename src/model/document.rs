@@ -4,13 +4,15 @@
 use std::sync::{Arc, RwLock};
 
 use super::buffer::{Buffer, ChannelScope, MarkerId, Region, RegionId};
+use super::composition::{Composition, EditId};
 use super::selection::{SamplePosition, Selection};
-use super::snap::nearest_zero_crossing_default;
+use super::snap::nearest_zero_crossing;
 use crate::components::waveform::WaveformDataProvider;
 
 const DRAG_THRESHOLD_SAMPLES: usize = 0;
 
 pub struct BufferDocument {
+    pub composition: Arc<RwLock<Composition>>,
     pub buffer: Arc<RwLock<Buffer>>,
     pub selection: Selection,
     pub current_position: Option<SamplePosition>,
@@ -21,9 +23,17 @@ pub struct BufferDocument {
 }
 
 impl BufferDocument {
-    pub fn new(buffer: Buffer) -> Self {
+    pub fn new(composition: Composition) -> Self {
+        Self::with_shared(
+            Arc::new(RwLock::new(composition)),
+            Arc::new(RwLock::new(Buffer::empty())),
+        )
+    }
+
+    pub fn with_shared(composition: Arc<RwLock<Composition>>, buffer: Arc<RwLock<Buffer>>) -> Self {
         Self {
-            buffer: Arc::new(RwLock::new(buffer)),
+            composition,
+            buffer,
             selection: Selection::None,
             current_position: None,
             snap_zero_crossings: false,
@@ -33,16 +43,16 @@ impl BufferDocument {
         }
     }
 
-    pub fn with_shared(buffer: Arc<RwLock<Buffer>>) -> Self {
-        Self {
-            buffer,
-            selection: Selection::None,
-            current_position: None,
-            snap_zero_crossings: false,
-            region_drag_anchor: None,
-            next_region_id: 1,
-            next_marker_id: 1,
-        }
+    pub fn frames(&self) -> usize {
+        self.composition.read().unwrap().frames() as usize
+    }
+
+    pub fn sample_rate(&self) -> u32 {
+        self.composition.read().unwrap().sample_rate()
+    }
+
+    pub fn is_loaded(&self) -> bool {
+        self.frames() > 0
     }
 
     pub fn toggle_zero_crossing_snap(&mut self) {
@@ -57,9 +67,21 @@ impl BufferDocument {
         if !self.snap_zero_crossings {
             return sample;
         }
-        let buffer = self.buffer.read().unwrap();
-        let samples = WaveformDataProvider::channel_samples(&buffer.audio, channel);
-        nearest_zero_crossing_default(samples, sample)
+        let frames = self.frames();
+        if frames == 0 {
+            return 0;
+        }
+        let radius = 4096;
+        let start = sample.saturating_sub(radius);
+        let end = (sample + radius + 1).min(frames);
+        let mut buf = vec![0.0; end.saturating_sub(start)];
+        let _ = self
+            .composition
+            .read()
+            .unwrap()
+            .read_channel(channel, start as u64, &mut buf);
+        let local = nearest_zero_crossing(&buf, sample.saturating_sub(start), radius);
+        start + local
     }
 
     fn snap_sample(&self, scope: &ChannelScope, sample: usize) -> usize {
@@ -74,12 +96,12 @@ impl BufferDocument {
     }
 
     fn clamp_sample(&self, sample: usize) -> usize {
-        let max = self.buffer.read().unwrap().frames().saturating_sub(1);
+        let max = self.frames().saturating_sub(1);
         sample.min(max)
     }
 
     pub fn sample_to_secs(&self, sample: usize) -> f64 {
-        let rate = self.buffer.read().unwrap().audio.sample_rate;
+        let rate = self.sample_rate();
         if rate == 0 {
             0.0
         } else {
@@ -279,35 +301,215 @@ impl BufferDocument {
         self.current_position = None;
         self.region_drag_anchor = None;
     }
+
+    pub fn selection_span(&self) -> Option<(u64, u64)> {
+        match &self.selection {
+            Selection::Region { start, end, .. } if *end >= *start => {
+                let len = (*end as u64)
+                    .saturating_sub(*start as u64)
+                    .saturating_add(1);
+                Some((*start as u64, len))
+            }
+            _ => None,
+        }
+    }
+
+    pub fn caret_frame(&self) -> u64 {
+        self.current_position
+            .as_ref()
+            .map(|pos| pos.sample as u64)
+            .unwrap_or(0)
+    }
+
+    fn after_edit(&mut self) {
+        if self.frames() == 0 {
+            self.selection = Selection::None;
+            self.current_position = None;
+            return;
+        }
+        if let Some(sample) = self.current_position.as_ref().map(|p| p.sample) {
+            let sample = self.clamp_sample(sample);
+            if let Some(pos) = self.current_position.as_mut() {
+                pos.sample = sample;
+            }
+        }
+        match self.selection.clone() {
+            Selection::Region {
+                region_id,
+                start,
+                end,
+                channels,
+            } => {
+                self.selection = Selection::Region {
+                    region_id,
+                    start: self.clamp_sample(start),
+                    end: self.clamp_sample(end),
+                    channels,
+                };
+            }
+            Selection::Position(pos) => {
+                self.selection = Selection::Position(SamplePosition {
+                    sample: self.clamp_sample(pos.sample),
+                    channels: pos.channels,
+                });
+            }
+            Selection::None => {}
+        }
+    }
+
+    pub fn edit_undo(&mut self) -> bool {
+        let ok = self.composition.write().unwrap().undo();
+        if ok {
+            self.after_edit();
+        }
+        ok
+    }
+
+    pub fn edit_redo(&mut self) -> bool {
+        let ok = self.composition.write().unwrap().redo();
+        if ok {
+            self.after_edit();
+        }
+        ok
+    }
+
+    pub fn edit_copy(&mut self) {
+        let Some((start, len)) = self.selection_span() else {
+            return;
+        };
+        self.composition.write().unwrap().copy(start, len);
+    }
+
+    pub fn edit_cut(&mut self) {
+        let Some((start, len)) = self.selection_span() else {
+            return;
+        };
+        self.composition.write().unwrap().cut(start, len);
+        self.after_edit();
+    }
+
+    pub fn edit_paste(&mut self) {
+        let (at, replace) = if let Some((start, len)) = self.selection_span() {
+            (start, len)
+        } else {
+            (self.caret_frame(), 0)
+        };
+        let _ = self
+            .composition
+            .write()
+            .unwrap()
+            .paste_replacing(at, replace);
+        self.after_edit();
+    }
+
+    pub fn edit_delete(&mut self) {
+        let Some((start, len)) = self.selection_span() else {
+            return;
+        };
+        self.composition.write().unwrap().delete(start, len);
+        self.after_edit();
+    }
+
+    pub fn edit_remove(&mut self) {
+        let Some((start, len)) = self.selection_span() else {
+            return;
+        };
+        self.composition.write().unwrap().remove(start, len);
+        self.after_edit();
+    }
+
+    pub fn edit_duplicate(&mut self) {
+        let Some((start, len)) = self.selection_span() else {
+            return;
+        };
+        self.composition.write().unwrap().duplicate(start, len);
+        self.after_edit();
+    }
+
+    pub fn edit_trim(&mut self) {
+        let Some((start, len)) = self.selection_span() else {
+            return;
+        };
+        self.composition.write().unwrap().trim(start, len);
+        self.after_edit();
+    }
+
+    pub fn edit_roll(&mut self, delta: i64) {
+        let at = self
+            .selection_span()
+            .map(|(start, _)| start)
+            .unwrap_or_else(|| self.caret_frame());
+        self.composition.write().unwrap().roll(at, delta);
+        self.after_edit();
+    }
+
+    pub fn current_edit(&self) -> EditId {
+        self.composition.read().unwrap().current_edit()
+    }
+}
+
+impl WaveformDataProvider for BufferDocument {
+    fn sample_rate(&self) -> u32 {
+        self.composition.read().unwrap().sample_rate()
+    }
+
+    fn channel_count(&self) -> usize {
+        self.composition.read().unwrap().channel_count()
+    }
+
+    fn frames(&self) -> usize {
+        self.composition.read().unwrap().frames() as usize
+    }
+
+    fn duration_secs(&self) -> f64 {
+        self.composition.read().unwrap().duration_secs()
+    }
+
+    fn channel_label(&self, channel: usize) -> String {
+        match (self.composition.read().unwrap().channel_count(), channel) {
+            (1, 0) => "Mono".into(),
+            (2, 0) => "L".into(),
+            (2, 1) => "R".into(),
+            _ => format!("Ch {}", channel + 1),
+        }
+    }
+
+    fn read_channel(&self, channel: usize, start: usize, dest: &mut [f32]) {
+        let _ = self
+            .composition
+            .read()
+            .unwrap()
+            .read_channel(channel, start as u64, dest);
+    }
+
+    fn min_max_in_range(&self, channel: usize, start: f64, end: f64) -> (f32, f32) {
+        self.composition
+            .read()
+            .unwrap()
+            .min_max_in_range(channel, start, end)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::audio::DecodedAudio;
+    use crate::model::composition::{Composition, MediaId, MediaRef};
 
     fn test_document(frames: usize) -> BufferDocument {
-        let audio = DecodedAudio {
-            sample_rate: 44100,
-            channels: vec![vec![0.0; frames], vec![0.0; frames]],
-            peaks: vec![vec![(0.0, 0.0); (frames + 255) / 256]; 2],
-        };
-        BufferDocument::new(Buffer {
-            audio,
-            source: None,
-            regions: vec![],
-            markers: vec![],
-        })
+        let samples = vec![vec![0.0; frames], vec![0.0; frames]];
+        let media = MediaRef::from_memory(MediaId(0), 44100, samples);
+        BufferDocument::new(Composition::from_media(media).unwrap())
     }
 
     #[test]
     fn full_region_spans_buffer() {
         let doc = test_document(1000);
+        assert_eq!(doc.frames(), 1000);
         let region = doc.buffer.read().unwrap().full_region();
         assert_eq!(region.start, 0);
-        assert_eq!(region.end, 999);
         assert!(region.channels.applies_to(0));
         assert!(region.channels.applies_to(1));
+        let _ = region.end;
     }
 
     #[test]
@@ -363,5 +565,32 @@ mod tests {
             }
         ));
         assert_eq!(doc.current_position.as_ref().map(|p| p.sample), Some(80));
+    }
+
+    #[test]
+    fn cut_and_delete_use_selection_span() {
+        let mut doc = test_document(100);
+        doc.begin_region_drag(10, ChannelScope::all());
+        doc.update_region_drag(19);
+        doc.finish_region_drag();
+        doc.edit_cut();
+        assert_eq!(doc.frames(), 90);
+        doc.begin_region_drag(0, ChannelScope::all());
+        doc.update_region_drag(4);
+        doc.finish_region_drag();
+        doc.edit_delete();
+        assert_eq!(doc.frames(), 90);
+    }
+
+    #[test]
+    fn edit_ops_without_selection_are_noops() {
+        let mut doc = test_document(50);
+        doc.edit_cut();
+        doc.edit_copy();
+        doc.edit_delete();
+        doc.edit_remove();
+        doc.edit_duplicate();
+        doc.edit_trim();
+        assert_eq!(doc.frames(), 50);
     }
 }

@@ -15,7 +15,6 @@ use gpui_component::{
     v_flex, ActiveTheme as _, StyledExt as _,
 };
 
-use crate::audio;
 use crate::model::buffer::Region;
 use crate::model::document::BufferDocument;
 use crate::model::selection::Selection;
@@ -28,17 +27,8 @@ pub trait WaveformDataProvider: Send + Sync {
     fn frames(&self) -> usize;
     fn duration_secs(&self) -> f64;
     fn channel_label(&self, channel: usize) -> String;
-    fn channel_samples(&self, channel: usize) -> &[f32];
-    fn channel_peaks(&self, channel: usize) -> &[(f32, f32)];
-
-    fn min_max_in_range(&self, channel: usize, start: f64, end: f64) -> (f32, f32) {
-        audio::min_max_in_range(
-            self.channel_samples(channel),
-            self.channel_peaks(channel),
-            start,
-            end,
-        )
-    }
+    fn read_channel(&self, channel: usize, start: usize, dest: &mut [f32]);
+    fn min_max_in_range(&self, channel: usize, start: f64, end: f64) -> (f32, f32);
 }
 
 const ZOOM_FACTOR: f64 = 1.25;
@@ -81,7 +71,7 @@ pub struct WaveformDisplay {
 
 impl WaveformDisplay {
     pub fn new(document: Entity<BufferDocument>, cx: &App) -> Self {
-        let frames = document.read(cx).buffer.read().unwrap().frames();
+        let frames = document.read(cx).frames();
         let samples_per_pixel = if frames == 0 {
             1.0
         } else {
@@ -174,7 +164,7 @@ impl WaveformDisplay {
     }
 
     fn frames(&self, cx: &App) -> usize {
-        self.document.read(cx).buffer.read().unwrap().frames()
+        self.document.read(cx).frames()
     }
 
     fn anchor_sample(&self, cx: &App) -> f64 {
@@ -187,7 +177,7 @@ impl WaveformDisplay {
 
     fn max_samples_per_pixel(&self, cx: &App) -> f64 {
         let width = self.viewport_width.max(1.0) as f64;
-        let frames = self.document.read(cx).buffer.read().unwrap().frames() as f64;
+        let frames = self.document.read(cx).frames() as f64;
         (frames / width).max(MIN_SAMPLES_PER_PIXEL)
     }
 
@@ -557,11 +547,9 @@ fn paint_lane(
     let width = bounds.size.width.as_f32();
     let height = bounds.size.height.as_f32();
     let buffer = provider.buffer.read().unwrap();
-    if width < 1.0 || height < 1.0 || channel >= buffer.audio.channel_count() {
+    if width < 1.0 || height < 1.0 || channel >= WaveformDataProvider::channel_count(provider) {
         return;
     }
-
-    let audio = &buffer.audio;
 
     for region in &buffer.regions {
         paint_region_overlay(
@@ -612,7 +600,7 @@ fn paint_lane(
         }
     }
 
-    let samples = WaveformDataProvider::channel_samples(audio, channel);
+    let frames = WaveformDataProvider::frames(provider);
     let cols = width.ceil() as usize;
 
     if samples_per_pixel < 1.0 {
@@ -620,17 +608,22 @@ fn paint_lane(
         let mut started = false;
         let first = start_sample.max(0.0).floor() as usize;
         let last = ((start_sample + width as f64 * samples_per_pixel).ceil() as usize)
-            .min(samples.len().saturating_sub(1));
-        for i in first..=last {
-            let x = origin_x + ((i as f64 - start_sample) / samples_per_pixel) as f32;
-            let y = y_scale
-                .tick(&(samples[i] as f64))
-                .unwrap_or(origin_y + height * 0.5);
-            if !started {
-                builder.move_to(point(px(x), px(y)));
-                started = true;
-            } else {
-                builder.line_to(point(px(x), px(y)));
+            .min(frames.saturating_sub(1));
+        if first <= last && frames > 0 {
+            let mut samples = vec![0.0; last - first + 1];
+            WaveformDataProvider::read_channel(provider, channel, first, &mut samples);
+            for (offset, sample) in samples.iter().enumerate() {
+                let i = first + offset;
+                let x = origin_x + ((i as f64 - start_sample) / samples_per_pixel) as f32;
+                let y = y_scale
+                    .tick(&(*sample as f64))
+                    .unwrap_or(origin_y + height * 0.5);
+                if !started {
+                    builder.move_to(point(px(x), px(y)));
+                    started = true;
+                } else {
+                    builder.line_to(point(px(x), px(y)));
+                }
             }
         }
         if let Ok(path) = builder.build() {
@@ -640,11 +633,11 @@ fn paint_lane(
         for col in 0..cols {
             let bin_start = start_sample + col as f64 * samples_per_pixel;
             let bin_end = bin_start + samples_per_pixel;
-            if bin_start >= samples.len() as f64 {
+            if bin_start >= frames as f64 {
                 break;
             }
             let (min, max) =
-                WaveformDataProvider::min_max_in_range(audio, channel, bin_start, bin_end);
+                WaveformDataProvider::min_max_in_range(provider, channel, bin_start, bin_end);
             let y_max = y_scale.tick(&(max as f64)).unwrap_or(origin_y);
             let y_min = y_scale.tick(&(min as f64)).unwrap_or(origin_y + height);
             let top = y_max.min(y_min);
@@ -711,6 +704,7 @@ fn paint_scrollbar(
 
 impl Render for WaveformDisplay {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.clamp_scroll(cx);
         let theme = cx.theme().clone();
         let document = self.document.clone();
         let snap = self.document.read(cx).snap_zero_crossings;
@@ -719,15 +713,8 @@ impl Render for WaveformDisplay {
         let samples_per_pixel = self.samples_per_pixel;
         let hover_sample = self.hover_sample;
         let entity = cx.entity();
-        let channel_count = self
-            .document
-            .read(cx)
-            .buffer
-            .read()
-            .unwrap()
-            .audio
-            .channel_count();
-        let is_empty = channel_count == 0;
+        let channel_count = WaveformDataProvider::channel_count(self.document.read(cx));
+        let is_empty = WaveformDataProvider::frames(self.document.read(cx)) == 0;
 
         v_flex()
             .size_full()
@@ -744,7 +731,7 @@ impl Render for WaveformDisplay {
                         cx.notify();
                     }))
                     .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, _, cx| {
-                        if this.document.read(cx).buffer.read().unwrap().frames() == 0 {
+                        if this.document.read(cx).frames() == 0 {
                             return;
                         }
                         let delta = event.delta.pixel_delta(px(16.));
@@ -795,10 +782,8 @@ impl Render for WaveformDisplay {
                                     let selection = selection.clone();
                                     let color = channel_color(&theme, ch);
                                     let zero = theme.border;
-                                    let channel_label = WaveformDataProvider::channel_label(
-                                        &*document.read(cx).buffer.read().unwrap(),
-                                        ch,
-                                    );
+                                    let channel_label =
+                                        WaveformDataProvider::channel_label(document.read(cx), ch);
                                     h_flex()
                                     .id(SharedString::from(format!("lane-{ch}")))
                                     .w_full()
@@ -900,7 +885,7 @@ impl Render for WaveformDisplay {
             )
             .when(!is_empty, |this| {
                 this.child({
-                    let frames = self.document.read(cx).buffer.read().unwrap().frames();
+                    let frames = self.document.read(cx).frames();
                     let start = start_sample;
                     let spp = samples_per_pixel;
                     let track = theme.scrollbar;

@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: 2026 Greg Wuller
 // SPDX-License-Identifier: MIT
 
+use std::path::PathBuf;
+use std::sync::Arc;
 use std::{fs, fs::File, path::Path, time::SystemTime};
 
 use anyhow::{bail, Context, Result};
@@ -8,11 +10,12 @@ use symphonia::core::{
     audio::{AudioBufferRef, SampleBuffer, SignalSpec},
     codecs::{CodecParameters, DecoderOptions, CODEC_TYPE_NULL},
     errors::Error as SymphoniaError,
-    formats::FormatOptions,
+    formats::{FormatOptions, SeekMode, SeekTo},
     io::MediaSourceStream,
     meta::MetadataOptions,
     probe::Hint,
     sample::SampleFormat,
+    units::Time,
 };
 
 use crate::components::waveform::WaveformDataProvider;
@@ -20,6 +23,18 @@ use crate::model::{Buffer, BufferSource};
 
 /// Number of samples folded into each overview peak bin.
 pub const PEAK_BLOCK: usize = 256;
+
+/// Metadata for a media file without necessarily decoding every sample.
+#[derive(Debug, Clone)]
+pub struct ProbedFile {
+    pub path: PathBuf,
+    pub sample_rate: u32,
+    pub channel_count: usize,
+    pub frame_count: u64,
+    pub bits_per_sample: Option<u32>,
+    pub size_bytes: u64,
+    pub samples: Option<Arc<Vec<Vec<f32>>>>,
+}
 
 /// Decoded, planar audio ready for waveform display.
 #[derive(Debug)]
@@ -77,12 +92,26 @@ impl WaveformDataProvider for DecodedAudio {
         }
     }
 
-    fn channel_samples(&self, channel: usize) -> &[f32] {
-        &self.channels[channel]
+    fn read_channel(&self, channel: usize, start: usize, dest: &mut [f32]) {
+        dest.fill(0.0);
+        let Some(samples) = self.channels.get(channel) else {
+            return;
+        };
+        if start >= samples.len() {
+            return;
+        }
+        let n = dest.len().min(samples.len() - start);
+        dest[..n].copy_from_slice(&samples[start..start + n]);
     }
 
-    fn channel_peaks(&self, channel: usize) -> &[(f32, f32)] {
-        &self.peaks[channel]
+    fn min_max_in_range(&self, channel: usize, start: f64, end: f64) -> (f32, f32) {
+        let samples = self
+            .channels
+            .get(channel)
+            .map(|s| s.as_slice())
+            .unwrap_or(&[]);
+        let peaks = self.peaks.get(channel).map(|p| p.as_slice()).unwrap_or(&[]);
+        min_max_in_range(samples, peaks, start, end)
     }
 }
 
@@ -115,6 +144,180 @@ pub fn load_buffer(path: &Path) -> Result<Buffer> {
         regions: Vec::new(),
         markers: Vec::new(),
     })
+}
+
+/// Probe a file for rate, channels, and length. Fully decodes only when the
+/// container does not report a frame count.
+pub fn probe_file(path: &Path) -> Result<ProbedFile> {
+    let metadata =
+        fs::metadata(path).with_context(|| format!("failed to stat {}", path.display()))?;
+    let file = File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
+    let mss = MediaSourceStream::new(Box::new(file), Default::default());
+    let mut hint = Hint::new();
+    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+        hint.with_extension(ext);
+    }
+    let probed = symphonia::default::get_probe()
+        .format(
+            &hint,
+            mss,
+            &FormatOptions::default(),
+            &MetadataOptions::default(),
+        )
+        .with_context(|| format!("unsupported or unreadable audio format: {}", path.display()))?;
+    let format = probed.format;
+    let track = format
+        .tracks()
+        .iter()
+        .find(|t| t.codec_params.codec != CODEC_TYPE_NULL)
+        .cloned()
+        .context("no supported audio track in file")?;
+    let sample_rate = track.codec_params.sample_rate.unwrap_or(0);
+    let channel_count = track
+        .codec_params
+        .channels
+        .map(|ch| ch.count())
+        .unwrap_or(0);
+    let bits_per_sample = codec_bits_per_sample(&track.codec_params);
+    if let Some(frame_count) = track.codec_params.n_frames {
+        if sample_rate != 0 && channel_count != 0 && frame_count > 0 {
+            return Ok(ProbedFile {
+                path: path.to_path_buf(),
+                sample_rate,
+                channel_count,
+                frame_count,
+                bits_per_sample,
+                size_bytes: metadata.len(),
+                samples: None,
+            });
+        }
+    }
+    drop(format);
+    let audio = decode(path)?;
+    Ok(ProbedFile {
+        path: path.to_path_buf(),
+        sample_rate: audio.sample_rate,
+        channel_count: audio.channel_count(),
+        frame_count: audio.frames() as u64,
+        bits_per_sample,
+        size_bytes: metadata.len(),
+        samples: Some(Arc::new(audio.channels)),
+    })
+}
+
+/// Decode `count` frames starting at `start`, without loading the whole file.
+pub fn decode_range(path: &Path, start: u64, count: u64) -> Result<Vec<Vec<f32>>> {
+    if count == 0 {
+        return Ok(Vec::new());
+    }
+    let file = File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
+    let mss = MediaSourceStream::new(Box::new(file), Default::default());
+    let mut hint = Hint::new();
+    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+        hint.with_extension(ext);
+    }
+    let probed = symphonia::default::get_probe()
+        .format(
+            &hint,
+            mss,
+            &FormatOptions::default(),
+            &MetadataOptions::default(),
+        )
+        .with_context(|| format!("unsupported or unreadable audio format: {}", path.display()))?;
+    let mut format = probed.format;
+    let track = format
+        .tracks()
+        .iter()
+        .find(|t| t.codec_params.codec != CODEC_TYPE_NULL)
+        .cloned()
+        .context("no supported audio track in file")?;
+    let sample_rate = track.codec_params.sample_rate.unwrap_or(0);
+    let track_id = track.id;
+    let mut decoder = symphonia::default::get_codecs()
+        .make(&track.codec_params, &DecoderOptions::default())
+        .context("unsupported audio codec")?;
+
+    let mut decoded_start = 0u64;
+    if sample_rate > 0 {
+        let seek_to = if track.codec_params.time_base.is_some() {
+            SeekTo::TimeStamp {
+                ts: start,
+                track_id,
+            }
+        } else {
+            let seconds = start as f64 / f64::from(sample_rate);
+            SeekTo::Time {
+                time: Time::new(seconds.trunc() as u64, seconds.fract()),
+                track_id: Some(track_id),
+            }
+        };
+        if let Ok(seeked) = format.seek(SeekMode::Accurate, seek_to) {
+            decoder.reset();
+            decoded_start = if let Some(tb) = track.codec_params.time_base {
+                let t = tb.calc_time(seeked.actual_ts);
+                ((t.seconds as f64 + t.frac) * f64::from(sample_rate)).round() as u64
+            } else {
+                seeked.actual_ts
+            };
+        }
+    }
+    if decoded_start > start {
+        decoded_start = 0;
+    }
+
+    let mut sample_buf: Option<SampleBuffer<f32>> = None;
+    let mut spec: Option<SignalSpec> = None;
+    let mut channels: Vec<Vec<f32>> = Vec::new();
+    let skip = start.saturating_sub(decoded_start);
+    let needed = skip + count;
+
+    loop {
+        if !channels.is_empty() && channels[0].len() as u64 >= needed {
+            break;
+        }
+        let packet = match format.next_packet() {
+            Ok(packet) => packet,
+            Err(SymphoniaError::ResetRequired) => {
+                bail!("media reset required; this file is not supported");
+            }
+            Err(SymphoniaError::IoError(err))
+                if err.kind() == std::io::ErrorKind::UnexpectedEof =>
+            {
+                break;
+            }
+            Err(err) => {
+                bail!("error reading audio packet: {err}");
+            }
+        };
+        if packet.track_id() != track_id {
+            continue;
+        }
+        match decoder.decode(&packet) {
+            Ok(decoded) => {
+                append_decoded(decoded, &mut sample_buf, &mut spec, &mut channels)?;
+            }
+            Err(SymphoniaError::DecodeError(_)) | Err(SymphoniaError::IoError(_)) => continue,
+            Err(err) => bail!("unrecoverable decode error: {err}"),
+        }
+    }
+
+    if channels.is_empty() {
+        bail!("file contained no audio samples");
+    }
+    let start_i = skip as usize;
+    let end_i = start_i + count as usize;
+    let mut out = Vec::with_capacity(channels.len());
+    for ch in channels {
+        if start_i >= ch.len() {
+            out.push(vec![0.0; count as usize]);
+        } else {
+            let e = end_i.min(ch.len());
+            let mut slice = ch[start_i..e].to_vec();
+            slice.resize(count as usize, 0.0);
+            out.push(slice);
+        }
+    }
+    Ok(out)
 }
 
 fn decode_with_meta(path: &Path) -> Result<(DecodedAudio, DecodeMeta)> {
@@ -254,12 +457,12 @@ impl WaveformDataProvider for Buffer {
         WaveformDataProvider::channel_label(&self.audio, channel)
     }
 
-    fn channel_samples(&self, channel: usize) -> &[f32] {
-        WaveformDataProvider::channel_samples(&self.audio, channel)
+    fn read_channel(&self, channel: usize, start: usize, dest: &mut [f32]) {
+        WaveformDataProvider::read_channel(&self.audio, channel, start, dest)
     }
 
-    fn channel_peaks(&self, channel: usize) -> &[(f32, f32)] {
-        WaveformDataProvider::channel_peaks(&self.audio, channel)
+    fn min_max_in_range(&self, channel: usize, start: f64, end: f64) -> (f32, f32) {
+        WaveformDataProvider::min_max_in_range(&self.audio, channel, start, end)
     }
 }
 
@@ -303,7 +506,7 @@ fn append_decoded(
     Ok(())
 }
 
-fn build_peaks(samples: &[f32]) -> Vec<(f32, f32)> {
+pub fn build_peaks(samples: &[f32]) -> Vec<(f32, f32)> {
     samples
         .chunks(PEAK_BLOCK)
         .map(|chunk| {
@@ -426,6 +629,34 @@ mod tests {
         let source = buffer.source.expect("source metadata");
         assert_eq!(source.bits_per_sample, Some(16));
         assert_eq!(source.size_bytes, std::fs::metadata(&path).unwrap().len());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn decode_range_reads_a_slice() {
+        let dir = std::env::temp_dir();
+        let path = dir.join("snd-display-range-test.wav");
+        write_sine_wav(&path, 1, 2000, 44100);
+        let full = decode(&path).unwrap();
+        let slice = decode_range(&path, 100, 50).unwrap();
+        assert_eq!(slice.len(), 1);
+        assert_eq!(slice[0].len(), 50);
+        for (a, b) in slice[0].iter().zip(full.channels[0][100..150].iter()) {
+            assert!((a - b).abs() < 1e-4);
+        }
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn probe_file_reports_wav_frames() {
+        let dir = std::env::temp_dir();
+        let path = dir.join("snd-display-probe-test.wav");
+        write_sine_wav(&path, 2, 4410, 44100);
+        let probed = probe_file(&path).unwrap();
+        assert_eq!(probed.sample_rate, 44100);
+        assert_eq!(probed.channel_count, 2);
+        assert_eq!(probed.frame_count, 4410);
+        assert_eq!(probed.bits_per_sample, Some(16));
         let _ = std::fs::remove_file(path);
     }
 }

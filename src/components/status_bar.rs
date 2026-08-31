@@ -4,6 +4,7 @@
 use gpui::{px, App, IntoElement, RenderOnce, Styled as _, Window};
 use gpui_component::status_bar::StatusBar;
 
+use crate::model::composition::Composition;
 use crate::model::Buffer;
 
 const HEIGHT: gpui::Pixels = px(24.);
@@ -17,6 +18,20 @@ pub struct FileStatus {
 }
 
 impl FileStatus {
+    pub fn from_composition(composition: &Composition) -> Option<Self> {
+        if composition.frames() == 0 {
+            return None;
+        }
+        let media = composition.pool().first();
+        Some(Self {
+            sample_rate: composition.sample_rate(),
+            bits_per_sample: media.and_then(|m| m.bits_per_sample),
+            channel_count: composition.channel_count(),
+            duration_secs: composition.duration_secs(),
+            size_bytes: media.map(|m| m.size_bytes),
+        })
+    }
+
     pub fn from_buffer(buffer: &Buffer) -> Option<Self> {
         if !buffer.is_loaded() {
             return None;

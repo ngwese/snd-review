@@ -18,15 +18,16 @@ use gpui_component::{
 };
 
 use crate::assets::AppAssets;
-use crate::audio;
 use crate::commands::{
-    install_keybindings, About, Open, Quit, TransportEnd, TransportHome, TransportLoop,
-    TransportNext, TransportPlayPause, TransportPrevious, TransportStart, TransportStop,
-    ViewFitAll, ViewFrame, ViewZoomIn, ViewZoomOut,
+    install_keybindings, About, EditCopy, EditCut, EditDelete, EditDuplicate, EditPaste, EditRedo,
+    EditRemove, EditRollLeft, EditRollRight, EditTrim, EditUndo, Open, Quit, TransportEnd,
+    TransportHome, TransportLoop, TransportNext, TransportPlayPause, TransportPrevious,
+    TransportStart, TransportStop, ViewFitAll, ViewFrame, ViewZoomIn, ViewZoomOut,
 };
 use crate::components::status_bar::{FileStatus, FileStatusBar};
 use crate::components::transport::Transport;
 use crate::components::waveform::{ToggleZeroCrossing, WaveformDisplay};
+use crate::model::composition::Composition;
 use crate::model::selection::Selection;
 use crate::model::{Buffer, BufferDocument};
 use crate::playback::{PlaybackSession, TransportState};
@@ -36,6 +37,7 @@ struct OpenTarget(Entity<AppView>);
 impl Global for OpenTarget {}
 
 pub struct AppView {
+    composition: Arc<RwLock<Composition>>,
     buffer: Arc<RwLock<Buffer>>,
     device: Device,
     document: Entity<BufferDocument>,
@@ -48,6 +50,7 @@ pub struct AppView {
 
 impl AppView {
     fn new(
+        composition: Arc<RwLock<Composition>>,
         buffer: Arc<RwLock<Buffer>>,
         device: Device,
         document: Entity<BufferDocument>,
@@ -87,6 +90,7 @@ impl AppView {
         let waveform = cx.new(|cx| WaveformDisplay::new(document.clone(), cx));
         cx.observe(&waveform, |_, _, cx| cx.notify()).detach();
         Self {
+            composition,
             buffer,
             device,
             document,
@@ -98,19 +102,28 @@ impl AppView {
         }
     }
 
-    fn buffer_title(buffer: &Buffer) -> SharedString {
-        buffer
-            .source
-            .as_ref()
-            .and_then(|s| s.path.file_name())
+    fn composition_title(composition: &Composition) -> SharedString {
+        composition
+            .pool()
+            .first()
+            .and_then(|m| m.path.file_name())
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| "snd-review".into())
             .into()
     }
 
-    fn load_buffer(&mut self, buffer: Buffer, window: &mut Window, cx: &mut Context<Self>) {
+    fn load_composition(
+        &mut self,
+        composition: Composition,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let title = Self::composition_title(&composition);
         {
-            *self.buffer.write().unwrap() = buffer;
+            *self.composition.write().unwrap() = composition;
+        }
+        {
+            *self.buffer.write().unwrap() = Buffer::empty();
         }
         let snapshot = self.buffer.read().unwrap();
         if let Err(err) = self.playback.reload(&self.device, &snapshot) {
@@ -123,7 +136,7 @@ impl AppView {
         self.playback.sync_from_document(self.document.read(cx));
         self.waveform.update(cx, |view, cx| view.reset_view(cx));
 
-        window.set_window_title(&Self::buffer_title(&self.buffer.read().unwrap()));
+        window.set_window_title(&title);
         cx.notify();
     }
 
@@ -146,10 +159,10 @@ impl AppView {
     fn open_path(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
         let view = cx.entity();
         cx.spawn_in(window, async move |_, window| {
-            let result = std::thread::spawn(move || audio::load_buffer(&path)).join();
+            let result = std::thread::spawn(move || Composition::load_from_path(&path)).join();
             let _ = window.update(|window, cx| {
                 view.update(cx, |this, cx| match result {
-                    Ok(Ok(buffer)) => this.load_buffer(buffer, window, cx),
+                    Ok(Ok(composition)) => this.load_composition(composition, window, cx),
                     Ok(Err(err)) => this.show_load_error(&format!("{err:#}"), window, cx),
                     Err(_) => this.show_load_error("failed to load file", window, cx),
                 });
@@ -174,10 +187,10 @@ impl AppView {
             let Some(path) = paths.into_iter().next() else {
                 return;
             };
-            let result = std::thread::spawn(move || audio::load_buffer(&path)).join();
+            let result = std::thread::spawn(move || Composition::load_from_path(&path)).join();
             let _ = window.update(|window, cx| {
                 view.update(cx, |this, cx| match result {
-                    Ok(Ok(buffer)) => this.load_buffer(buffer, window, cx),
+                    Ok(Ok(composition)) => this.load_composition(composition, window, cx),
                     Ok(Err(err)) => this.show_load_error(&format!("{err:#}"), window, cx),
                     Err(_) => this.show_load_error("failed to load file", window, cx),
                 });
@@ -210,8 +223,7 @@ fn format_hover_meta(doc: &BufferDocument, sample: usize) -> String {
 }
 
 fn format_header_meta(doc: &BufferDocument, transport: TransportState) -> String {
-    let buffer = doc.buffer.read().unwrap();
-    if !buffer.is_loaded() {
+    if !doc.is_loaded() {
         return format!("No file open  ·  {}", transport_state_label(transport));
     }
 
@@ -229,7 +241,7 @@ fn format_header_meta(doc: &BufferDocument, transport: TransportState) -> String
             let start_secs = doc.sample_to_secs(*start);
             let end_secs = doc.sample_to_secs(*end);
             let len_samples = end - start + 1;
-            let len_secs = len_samples as f64 / f64::from(buffer.audio.sample_rate.max(1));
+            let len_secs = len_samples as f64 / f64::from(doc.sample_rate().max(1));
             parts.push(format!(
                 "region {}–{}",
                 format_secs(start_secs),
@@ -254,7 +266,7 @@ impl Render for AppView {
         let hover_sample = self.waveform.read(cx).hover_sample();
         let meta = format_header_meta(doc, transport_state);
         let hover_meta = hover_sample.map(|sample| format_hover_meta(doc, sample));
-        let file_status = FileStatus::from_buffer(&doc.buffer.read().unwrap());
+        let file_status = FileStatus::from_composition(&doc.composition.read().unwrap());
         let drop_highlight = theme.secondary;
 
         div()
@@ -476,12 +488,87 @@ fn view_zoom_out(_: &ViewZoomOut, cx: &mut App) {
     });
 }
 
+fn with_edit(cx: &mut App, f: impl FnOnce(&mut BufferDocument)) {
+    with_app_view(cx, |this, cx| {
+        this.document.update(cx, |doc, cx| {
+            f(doc);
+            cx.notify();
+        });
+        this.playback.sync_from_document(this.document.read(cx));
+        cx.notify();
+    });
+}
+
+fn edit_undo(_: &EditUndo, cx: &mut App) {
+    with_edit(cx, |doc| {
+        doc.edit_undo();
+    });
+}
+
+fn edit_redo(_: &EditRedo, cx: &mut App) {
+    with_edit(cx, |doc| {
+        doc.edit_redo();
+    });
+}
+
+fn edit_cut(_: &EditCut, cx: &mut App) {
+    with_edit(cx, |doc| doc.edit_cut());
+}
+
+fn edit_copy(_: &EditCopy, cx: &mut App) {
+    with_edit(cx, |doc| doc.edit_copy());
+}
+
+fn edit_paste(_: &EditPaste, cx: &mut App) {
+    with_edit(cx, |doc| doc.edit_paste());
+}
+
+fn edit_delete(_: &EditDelete, cx: &mut App) {
+    with_edit(cx, |doc| doc.edit_delete());
+}
+
+fn edit_remove(_: &EditRemove, cx: &mut App) {
+    with_edit(cx, |doc| doc.edit_remove());
+}
+
+fn edit_duplicate(_: &EditDuplicate, cx: &mut App) {
+    with_edit(cx, |doc| doc.edit_duplicate());
+}
+
+fn edit_trim(_: &EditTrim, cx: &mut App) {
+    with_edit(cx, |doc| doc.edit_trim());
+}
+
+fn edit_roll_left(_: &EditRollLeft, cx: &mut App) {
+    with_edit(cx, |doc| doc.edit_roll(-1));
+}
+
+fn edit_roll_right(_: &EditRollRight, cx: &mut App) {
+    with_edit(cx, |doc| doc.edit_roll(1));
+}
+
 fn app_menus() -> Vec<Menu> {
     vec![
         Menu::new("File").items([
             MenuItem::action("Open...", Open),
             MenuItem::separator(),
             MenuItem::action("Quit", Quit),
+        ]),
+        Menu::new("Edit").items([
+            MenuItem::action("Undo", EditUndo),
+            MenuItem::action("Redo", EditRedo),
+            MenuItem::separator(),
+            MenuItem::action("Cut", EditCut),
+            MenuItem::action("Copy", EditCopy),
+            MenuItem::action("Paste", EditPaste),
+            MenuItem::separator(),
+            MenuItem::action("Delete", EditDelete),
+            MenuItem::action("Remove", EditRemove),
+            MenuItem::action("Duplicate", EditDuplicate),
+            MenuItem::action("Trim to Selection", EditTrim),
+            MenuItem::separator(),
+            MenuItem::action("Roll Source Left", EditRollLeft),
+            MenuItem::action("Roll Source Right", EditRollRight),
         ]),
         Menu::new("View").items([
             MenuItem::action("Zoom In", ViewZoomIn),
@@ -508,6 +595,17 @@ fn install_app_menu(cx: &mut App) {
     cx.on_action(view_frame);
     cx.on_action(view_zoom_in);
     cx.on_action(view_zoom_out);
+    cx.on_action(edit_undo);
+    cx.on_action(edit_redo);
+    cx.on_action(edit_cut);
+    cx.on_action(edit_copy);
+    cx.on_action(edit_paste);
+    cx.on_action(edit_delete);
+    cx.on_action(edit_remove);
+    cx.on_action(edit_duplicate);
+    cx.on_action(edit_trim);
+    cx.on_action(edit_roll_left);
+    cx.on_action(edit_roll_right);
     install_keybindings(cx);
     cx.set_menus(app_menus());
     let owned = app_menus().into_iter().map(|menu| menu.owned()).collect();
@@ -552,12 +650,13 @@ fn percent_decode(input: &str) -> Option<String> {
     String::from_utf8(out).ok()
 }
 
-pub fn run(initial_buffer: Option<Buffer>, device: Device) {
-    let buffer = initial_buffer.unwrap_or_else(Buffer::empty);
-    let title = AppView::buffer_title(&buffer);
+pub fn run(initial: Option<Composition>, device: Device) {
+    let composition = initial.unwrap_or_else(|| Composition::new(44100, 2));
+    let title = AppView::composition_title(&composition);
 
-    let shared = Arc::new(RwLock::new(buffer));
-    let playback = PlaybackSession::open(&device, shared.clone())
+    let shared_composition = Arc::new(RwLock::new(composition));
+    let shared_buffer = Arc::new(RwLock::new(Buffer::empty()));
+    let playback = PlaybackSession::open(&device, shared_composition.clone())
         .expect("failed to open audio playback device");
     let pending_opens = Arc::new(Mutex::new(Vec::<PathBuf>::new()));
 
@@ -594,10 +693,13 @@ pub fn run(initial_buffer: Option<Buffer>, device: Device) {
             };
 
             cx.open_window(options, move |window, cx| {
-                let document = cx.new(|_| BufferDocument::with_shared(shared.clone()));
+                let document = cx.new(|_| {
+                    BufferDocument::with_shared(shared_composition.clone(), shared_buffer.clone())
+                });
                 let view = cx.new(|cx| {
                     AppView::new(
-                        shared.clone(),
+                        shared_composition.clone(),
+                        shared_buffer.clone(),
                         device,
                         document,
                         playback,

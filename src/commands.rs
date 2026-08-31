@@ -25,6 +25,17 @@ actions!(
         ViewFrame,
         ViewZoomIn,
         ViewZoomOut,
+        EditUndo,
+        EditRedo,
+        EditCut,
+        EditCopy,
+        EditPaste,
+        EditDelete,
+        EditRemove,
+        EditDuplicate,
+        EditTrim,
+        EditRollLeft,
+        EditRollRight,
     ]
 );
 
@@ -46,6 +57,17 @@ const KNOWN_COMMANDS: &[&str] = &[
     "transport.next",
     "transport.end",
     "transport.loop",
+    "edit.undo",
+    "edit.redo",
+    "edit.cut",
+    "edit.copy",
+    "edit.paste",
+    "edit.delete",
+    "edit.remove",
+    "edit.duplicate",
+    "edit.trim",
+    "edit.roll_left",
+    "edit.roll_right",
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -212,6 +234,17 @@ fn binding_for(command_id: &str, keystrokes: &str) -> Option<KeyBinding> {
         "transport.next" => KeyBinding::new(keystrokes, TransportNext, None),
         "transport.end" => KeyBinding::new(keystrokes, TransportEnd, None),
         "transport.loop" => KeyBinding::new(keystrokes, TransportLoop, None),
+        "edit.undo" => KeyBinding::new(keystrokes, EditUndo, None),
+        "edit.redo" => KeyBinding::new(keystrokes, EditRedo, None),
+        "edit.cut" => KeyBinding::new(keystrokes, EditCut, None),
+        "edit.copy" => KeyBinding::new(keystrokes, EditCopy, None),
+        "edit.paste" => KeyBinding::new(keystrokes, EditPaste, None),
+        "edit.delete" => KeyBinding::new(keystrokes, EditDelete, None),
+        "edit.remove" => KeyBinding::new(keystrokes, EditRemove, None),
+        "edit.duplicate" => KeyBinding::new(keystrokes, EditDuplicate, None),
+        "edit.trim" => KeyBinding::new(keystrokes, EditTrim, None),
+        "edit.roll_left" => KeyBinding::new(keystrokes, EditRollLeft, None),
+        "edit.roll_right" => KeyBinding::new(keystrokes, EditRollRight, None),
         _ => return None,
     })
 }
@@ -268,6 +301,15 @@ mod tests {
             Some("transport.play_pause")
         );
         assert_eq!(map.get("cmd-o").map(String::as_str), Some("file.open"));
+        assert_eq!(map.get("cmd-z").map(String::as_str), Some("edit.undo"));
+        assert_eq!(map.get("cmd-x").map(String::as_str), Some("edit.cut"));
+        assert_eq!(map.get("cmd-c").map(String::as_str), Some("edit.copy"));
+        assert_eq!(map.get("cmd-v").map(String::as_str), Some("edit.paste"));
+        assert_eq!(
+            map.get("backspace").map(String::as_str),
+            Some("edit.delete")
+        );
+        assert_eq!(map.get("delete").map(String::as_str), Some("edit.remove"));
         assert!(map.get("ctrl-o").is_none());
     }
 

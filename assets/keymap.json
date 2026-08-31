@@ -9,18 +9,47 @@
     "secondary-0": "view.fit_all",
     "space": "transport.play_pause",
     "home": "transport.home",
-    "end": "transport.end"
+    "end": "transport.end",
+    "backspace": "edit.delete",
+    "delete": "edit.remove"
   },
   "macos": {
     "cmd-o": "file.open",
-    "cmd-q": "file.quit"
+    "cmd-q": "file.quit",
+    "cmd-z": "edit.undo",
+    "cmd-shift-z": "edit.redo",
+    "cmd-x": "edit.cut",
+    "cmd-c": "edit.copy",
+    "cmd-v": "edit.paste",
+    "cmd-d": "edit.duplicate",
+    "cmd-t": "edit.trim",
+    "cmd-alt-left": "edit.roll_left",
+    "cmd-alt-right": "edit.roll_right"
   },
   "linux": {
     "ctrl-o": "file.open",
-    "alt-f4": "file.quit"
+    "alt-f4": "file.quit",
+    "ctrl-z": "edit.undo",
+    "ctrl-shift-z": "edit.redo",
+    "ctrl-x": "edit.cut",
+    "ctrl-c": "edit.copy",
+    "ctrl-v": "edit.paste",
+    "ctrl-d": "edit.duplicate",
+    "ctrl-t": "edit.trim",
+    "ctrl-alt-left": "edit.roll_left",
+    "ctrl-alt-right": "edit.roll_right"
   },
   "windows": {
     "ctrl-o": "file.open",
-    "alt-f4": "file.quit"
+    "alt-f4": "file.quit",
+    "ctrl-z": "edit.undo",
+    "ctrl-shift-z": "edit.redo",
+    "ctrl-x": "edit.cut",
+    "ctrl-c": "edit.copy",
+    "ctrl-v": "edit.paste",
+    "ctrl-d": "edit.duplicate",
+    "ctrl-t": "edit.trim",
+    "ctrl-alt-left": "edit.roll_left",
+    "ctrl-alt-right": "edit.roll_right"
   }
 }

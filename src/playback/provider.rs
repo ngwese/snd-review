@@ -4,6 +4,7 @@
 use std::sync::{Arc, RwLock};
 
 use crate::audio::DecodedAudio;
+use crate::model::composition::Composition;
 use crate::model::Buffer;
 
 pub trait PlaybackDataProvider: Send + Sync {
@@ -13,24 +14,27 @@ pub trait PlaybackDataProvider: Send + Sync {
     fn read_interleaved(&self, start: usize, count: usize, dest: &mut [f32]);
 }
 
-pub struct SharedBufferProvider(pub Arc<RwLock<Buffer>>);
+pub struct SharedCompositionProvider(pub Arc<RwLock<Composition>>);
 
-impl PlaybackDataProvider for SharedBufferProvider {
+impl PlaybackDataProvider for SharedCompositionProvider {
     fn sample_rate(&self) -> u32 {
-        self.0.read().unwrap().audio.sample_rate
+        self.0.read().unwrap().sample_rate()
     }
 
     fn channel_count(&self) -> usize {
-        self.0.read().unwrap().audio.channel_count()
+        self.0.read().unwrap().channel_count()
     }
 
     fn frames(&self) -> usize {
-        self.0.read().unwrap().frames()
+        self.0.read().unwrap().frames() as usize
     }
 
     fn read_interleaved(&self, start: usize, count: usize, dest: &mut [f32]) {
-        let buffer = self.0.read().unwrap();
-        buffer.read_interleaved(start, count, dest);
+        let _ = self
+            .0
+            .read()
+            .unwrap()
+            .read_interleaved(start as u64, count as u64, dest);
     }
 }
 

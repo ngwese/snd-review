@@ -7,6 +7,7 @@ use anyhow::Result;
 use cpal::Device;
 
 use crate::model::buffer::ChannelScope;
+use crate::model::composition::Composition;
 use crate::model::document::BufferDocument;
 use crate::model::selection::Selection;
 use crate::model::Buffer;
@@ -14,7 +15,7 @@ use crate::model::Buffer;
 use super::anchors::{collect_anchors, next_anchor, previous_anchor};
 use super::engine::PlaybackEngine;
 use super::playhead::Playhead;
-use super::provider::{PlaybackDataProvider, SharedBufferProvider};
+use super::provider::{PlaybackDataProvider, SharedCompositionProvider};
 use super::transport::{Transport, TransportState};
 
 pub struct PlaybackSession {
@@ -26,16 +27,16 @@ pub struct PlaybackSession {
 }
 
 impl PlaybackSession {
-    pub fn open(device: &Device, buffer: Arc<RwLock<Buffer>>) -> Result<Self> {
-        let anchors = collect_anchors(&buffer.read().unwrap());
-        let provider: Arc<dyn PlaybackDataProvider> = Arc::new(SharedBufferProvider(buffer));
+    pub fn open(device: &Device, composition: Arc<RwLock<Composition>>) -> Result<Self> {
+        let provider: Arc<dyn PlaybackDataProvider> =
+            Arc::new(SharedCompositionProvider(composition));
         let playhead = Playhead::new(provider.clone());
         let engine = PlaybackEngine::open(device, provider)?;
         Ok(Self {
             playhead,
             transport: Transport::new(),
             engine,
-            anchors,
+            anchors: Vec::new(),
             active_region: None,
         })
     }
