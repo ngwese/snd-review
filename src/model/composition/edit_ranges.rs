@@ -118,6 +118,108 @@ pub fn map_range_through_op(start: u64, end: u64, op: &EditOp) -> Vec<FrameRange
     }
 }
 
+fn invert_op(op: &EditOp) -> Option<EditOp> {
+    match op {
+        EditOp::Paste { at, len } if *len > 0 => Some(EditOp::Remove {
+            start: *at,
+            len: *len,
+        }),
+        EditOp::Duplicate { start, len } if *len > 0 => Some(EditOp::Remove {
+            start: start.saturating_add(*len),
+            len: *len,
+        }),
+        EditOp::Cut { start, len } | EditOp::Remove { start, len } if *len > 0 => {
+            Some(EditOp::Paste {
+                at: *start,
+                len: *len,
+            })
+        }
+        EditOp::Move { from, len, dest } if *len > 0 => {
+            let insert_at = if *dest > *from {
+                dest.saturating_sub(*len)
+            } else {
+                *dest
+            };
+            Some(EditOp::Move {
+                from: insert_at,
+                len: *len,
+                dest: *from,
+            })
+        }
+        _ => None,
+    }
+}
+
+fn hole_for_op(op: &EditOp) -> Option<u64> {
+    match op {
+        EditOp::Cut { start, .. } | EditOp::Remove { start, .. } => Some(*start),
+        EditOp::Trim { .. } => Some(0),
+        EditOp::Move { dest, from, len } => {
+            let insert_at = if *dest > *from {
+                dest.saturating_sub(*len)
+            } else {
+                *dest
+            };
+            Some(insert_at)
+        }
+        _ => None,
+    }
+}
+
+fn first_mapped_frame(ranges: &[FrameRange], op: &EditOp, fallback: u64) -> u64 {
+    ranges
+        .first()
+        .map(|(start, _)| *start)
+        .or_else(|| hole_for_op(op))
+        .unwrap_or(fallback)
+}
+
+fn span_mapped_inclusive(ranges: &[FrameRange]) -> Option<(u64, u64)> {
+    let start = ranges.iter().map(|(s, _)| *s).min()?;
+    let end_excl = ranges.iter().map(|(_, e)| *e).max()?;
+    if end_excl == 0 {
+        None
+    } else {
+        Some((start, end_excl - 1))
+    }
+}
+
+/// Map a timeline point through an op. Deleted points snap to the hole.
+pub fn map_point_through_op(frame: u64, op: &EditOp) -> u64 {
+    let ranges = map_range_through_op(frame, frame.saturating_add(1), op);
+    first_mapped_frame(&ranges, op, frame)
+}
+
+/// Map an inclusive `[start, end]` selection through an op.
+pub fn map_inclusive_through_op(start: u64, end: u64, op: &EditOp) -> Option<(u64, u64)> {
+    let end_excl = end.saturating_add(1);
+    let ranges = map_range_through_op(start, end_excl, op);
+    span_mapped_inclusive(&ranges)
+}
+
+/// Inverse of [`map_point_through_op`] for undo / jumping backward.
+pub fn map_point_through_inverse(frame: u64, op: &EditOp) -> u64 {
+    match op {
+        EditOp::Trim { start, .. } => start.saturating_add(frame),
+        other => invert_op(other)
+            .map(|inv| map_point_through_op(frame, &inv))
+            .unwrap_or(frame),
+    }
+}
+
+/// Inverse of [`map_inclusive_through_op`] for undo / jumping backward.
+pub fn map_inclusive_through_inverse(start: u64, end: u64, op: &EditOp) -> Option<(u64, u64)> {
+    match op {
+        EditOp::Trim { start: keep, .. } => {
+            Some((keep.saturating_add(start), keep.saturating_add(end)))
+        }
+        other => match invert_op(other) {
+            Some(inv) => map_inclusive_through_op(start, end, &inv),
+            None => Some((start, end)),
+        },
+    }
+}
+
 fn map_through_move(start: u64, end: u64, from: u64, len: u64, dest: u64) -> Vec<FrameRange> {
     if len == 0 || start >= end {
         return if start < end {
@@ -260,6 +362,34 @@ mod tests {
                 }
             ),
             vec![(40, 50)]
+        );
+    }
+
+    #[test]
+    fn paste_shifts_a_later_point() {
+        assert_eq!(
+            map_point_through_op(50, &EditOp::Paste { at: 0, len: 10 }),
+            60
+        );
+        assert_eq!(
+            map_point_through_inverse(60, &EditOp::Paste { at: 0, len: 10 }),
+            50
+        );
+    }
+
+    #[test]
+    fn remove_collapses_a_point_inside_the_hole() {
+        assert_eq!(
+            map_point_through_op(12, &EditOp::Remove { start: 10, len: 5 }),
+            10
+        );
+    }
+
+    #[test]
+    fn insert_expands_an_inclusive_selection() {
+        assert_eq!(
+            map_inclusive_through_op(40, 59, &EditOp::Paste { at: 50, len: 10 }),
+            Some((40, 69))
         );
     }
 }

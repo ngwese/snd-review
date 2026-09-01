@@ -4,7 +4,10 @@
 use std::sync::{Arc, RwLock};
 
 use super::buffer::{Buffer, ChannelScope, MarkerId, Region, RegionId};
-use super::composition::{Composition, EditId};
+use super::composition::{
+    map_inclusive_through_inverse, map_inclusive_through_op, map_point_through_inverse,
+    map_point_through_op, Composition, EditId, EditOp,
+};
 use super::selection::{SamplePosition, Selection};
 use super::snap::nearest_zero_crossing;
 use crate::components::waveform::WaveformDataProvider;
@@ -324,7 +327,93 @@ impl BufferDocument {
             .unwrap_or(0)
     }
 
-    fn after_edit(&mut self) {
+    fn after_tree_changed(&mut self, from_cursor: usize) {
+        let to_cursor = self.composition.read().unwrap().edit_cursor();
+        self.remap_between_cursors(from_cursor, to_cursor);
+        self.clamp_playhead_and_selection();
+    }
+
+    fn remap_between_cursors(&mut self, from: usize, to: usize) {
+        let ops: Vec<EditOp> = self
+            .composition
+            .read()
+            .unwrap()
+            .edits()
+            .iter()
+            .map(|edit| edit.op.clone())
+            .collect();
+        if to > from {
+            for op in &ops[from + 1..=to] {
+                self.remap_through_op(op);
+            }
+        } else if to < from {
+            for op in ops[to + 1..=from].iter().rev() {
+                self.remap_through_inverse(op);
+            }
+        }
+    }
+
+    fn remap_through_op(&mut self, op: &EditOp) {
+        if let Some(pos) = self.current_position.as_mut() {
+            pos.sample = map_point_through_op(pos.sample as u64, op) as usize;
+        }
+        self.selection = match self.selection.clone() {
+            Selection::Region {
+                start,
+                end,
+                channels,
+                ..
+            } => match map_inclusive_through_op(start as u64, end as u64, op) {
+                Some((start, end)) => Selection::Region {
+                    region_id: None,
+                    start: start as usize,
+                    end: end as usize,
+                    channels,
+                },
+                None => Selection::Position(SamplePosition {
+                    sample: map_point_through_op(start as u64, op) as usize,
+                    channels,
+                }),
+            },
+            Selection::Position(pos) => Selection::Position(SamplePosition {
+                sample: map_point_through_op(pos.sample as u64, op) as usize,
+                channels: pos.channels,
+            }),
+            Selection::None => Selection::None,
+        };
+    }
+
+    fn remap_through_inverse(&mut self, op: &EditOp) {
+        if let Some(pos) = self.current_position.as_mut() {
+            pos.sample = map_point_through_inverse(pos.sample as u64, op) as usize;
+        }
+        self.selection = match self.selection.clone() {
+            Selection::Region {
+                start,
+                end,
+                channels,
+                ..
+            } => match map_inclusive_through_inverse(start as u64, end as u64, op) {
+                Some((start, end)) => Selection::Region {
+                    region_id: None,
+                    start: start as usize,
+                    end: end as usize,
+                    channels,
+                },
+                None => Selection::Position(SamplePosition {
+                    sample: map_point_through_inverse(start as u64, op) as usize,
+                    channels,
+                }),
+            },
+            Selection::Position(pos) => Selection::Position(SamplePosition {
+                sample: map_point_through_inverse(pos.sample as u64, op) as usize,
+                channels: pos.channels,
+            }),
+            Selection::None => Selection::None,
+        };
+    }
+
+    fn clamp_playhead_and_selection(&mut self) {
         if self.frames() == 0 {
             self.selection = Selection::None;
             self.current_position = None;
@@ -343,10 +432,13 @@ impl BufferDocument {
                 end,
                 channels,
             } => {
+                let start = self.clamp_sample(start);
+                let end = self.clamp_sample(end);
+                let (start, end) = Self::normalized_region_bounds(start, end);
                 self.selection = Selection::Region {
                     region_id,
-                    start: self.clamp_sample(start),
-                    end: self.clamp_sample(end),
+                    start,
+                    end,
                     channels,
                 };
             }
@@ -361,25 +453,28 @@ impl BufferDocument {
     }
 
     pub fn edit_undo(&mut self) -> bool {
+        let from = self.composition.read().unwrap().edit_cursor();
         let ok = self.composition.write().unwrap().undo();
         if ok {
-            self.after_edit();
+            self.after_tree_changed(from);
         }
         ok
     }
 
     pub fn edit_redo(&mut self) -> bool {
+        let from = self.composition.read().unwrap().edit_cursor();
         let ok = self.composition.write().unwrap().redo();
         if ok {
-            self.after_edit();
+            self.after_tree_changed(from);
         }
         ok
     }
 
     pub fn jump_to_edit(&mut self, id: EditId) -> bool {
+        let from = self.composition.read().unwrap().edit_cursor();
         let ok = self.composition.write().unwrap().jump_to_edit(id);
         if ok {
-            self.after_edit();
+            self.after_tree_changed(from);
         }
         ok
     }
@@ -395,8 +490,9 @@ impl BufferDocument {
         let Some((start, len)) = self.selection_span() else {
             return;
         };
+        let from = self.composition.read().unwrap().edit_cursor();
         self.composition.write().unwrap().cut(start, len);
-        self.after_edit();
+        self.after_tree_changed(from);
     }
 
     pub fn edit_paste(&mut self) {
@@ -405,44 +501,49 @@ impl BufferDocument {
         } else {
             (self.caret_frame(), 0)
         };
+        let from = self.composition.read().unwrap().edit_cursor();
         let _ = self
             .composition
             .write()
             .unwrap()
             .paste_replacing(at, replace);
-        self.after_edit();
+        self.after_tree_changed(from);
     }
 
     pub fn edit_delete(&mut self) {
         let Some((start, len)) = self.selection_span() else {
             return;
         };
+        let from = self.composition.read().unwrap().edit_cursor();
         self.composition.write().unwrap().delete(start, len);
-        self.after_edit();
+        self.after_tree_changed(from);
     }
 
     pub fn edit_remove(&mut self) {
         let Some((start, len)) = self.selection_span() else {
             return;
         };
+        let from = self.composition.read().unwrap().edit_cursor();
         self.composition.write().unwrap().remove(start, len);
-        self.after_edit();
+        self.after_tree_changed(from);
     }
 
     pub fn edit_duplicate(&mut self) {
         let Some((start, len)) = self.selection_span() else {
             return;
         };
+        let from = self.composition.read().unwrap().edit_cursor();
         self.composition.write().unwrap().duplicate(start, len);
-        self.after_edit();
+        self.after_tree_changed(from);
     }
 
     pub fn edit_trim(&mut self) {
         let Some((start, len)) = self.selection_span() else {
             return;
         };
+        let from = self.composition.read().unwrap().edit_cursor();
         self.composition.write().unwrap().trim(start, len);
-        self.after_edit();
+        self.after_tree_changed(from);
     }
 
     pub fn edit_roll(&mut self, delta: i64) {
@@ -450,8 +551,9 @@ impl BufferDocument {
             .selection_span()
             .map(|(start, _)| start)
             .unwrap_or_else(|| self.caret_frame());
+        let from = self.composition.read().unwrap().edit_cursor();
         self.composition.write().unwrap().roll(at, delta);
-        self.after_edit();
+        self.after_tree_changed(from);
     }
 
     pub fn current_edit(&self) -> EditId {
@@ -618,5 +720,33 @@ mod tests {
         doc.edit_duplicate();
         doc.edit_trim();
         assert_eq!(doc.frames(), 50);
+    }
+
+    #[test]
+    fn paste_before_playhead_shifts_position() {
+        let mut doc = test_document(100);
+        doc.set_position(50, ChannelScope::all());
+        doc.composition.write().unwrap().copy(0, 10);
+        let from = doc.composition.read().unwrap().edit_cursor();
+        doc.composition.write().unwrap().paste(0).unwrap();
+        doc.after_tree_changed(from);
+        assert_eq!(doc.frames(), 110);
+        assert_eq!(doc.current_position.as_ref().map(|p| p.sample), Some(60));
+        assert!(doc.edit_undo());
+        assert_eq!(doc.frames(), 100);
+        assert_eq!(doc.current_position.as_ref().map(|p| p.sample), Some(50));
+    }
+
+    #[test]
+    fn paste_at_caret_follows_the_shifted_sample() {
+        let mut doc = test_document(100);
+        doc.begin_region_drag(0, ChannelScope::all());
+        doc.update_region_drag(9);
+        doc.finish_region_drag();
+        doc.edit_copy();
+        doc.set_position(50, ChannelScope::all());
+        doc.edit_paste();
+        assert_eq!(doc.frames(), 110);
+        assert_eq!(doc.current_position.as_ref().map(|p| p.sample), Some(60));
     }
 }

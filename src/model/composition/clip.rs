@@ -40,23 +40,34 @@ impl ClipCache {
     }
 
     pub fn split(&self, at: u64) -> (Self, Self) {
-        let bin = (at as usize) / crate::audio::PEAK_BLOCK;
+        let at = at as usize;
+        let block = crate::audio::PEAK_BLOCK;
+        let aligned = at % block == 0;
+        let bin = at / block;
         let mut left_peaks = Vec::with_capacity(self.peaks.len());
         let mut right_peaks = Vec::with_capacity(self.peaks.len());
         for channel in &self.peaks {
             let split = bin.min(channel.len());
             left_peaks.push(channel[..split].to_vec());
-            right_peaks.push(channel[split..].to_vec());
+            // Peak bins are aligned to the original clip origin. Reusing the
+            // suffix when `at` is not a block boundary would phase-shift the
+            // overview by up to PEAK_BLOCK samples. Leave it empty so
+            // `ensure_clip_peaks` rebuilds from source.
+            if aligned {
+                right_peaks.push(channel[split..].to_vec());
+            } else {
+                right_peaks.push(Vec::new());
+            }
         }
         (
             Self {
-                min: extrema_of(&left_peaks).map(|(mn, _)| mn).or(self.min),
-                max: extrema_of(&left_peaks).map(|(_, mx)| mx).or(self.max),
+                min: extrema_of(&left_peaks).map(|(mn, _)| mn),
+                max: extrema_of(&left_peaks).map(|(_, mx)| mx),
                 peaks: left_peaks,
             },
             Self {
-                min: extrema_of(&right_peaks).map(|(mn, _)| mn).or(self.min),
-                max: extrema_of(&right_peaks).map(|(_, mx)| mx).or(self.max),
+                min: extrema_of(&right_peaks).map(|(mn, _)| mn),
+                max: extrema_of(&right_peaks).map(|(_, mx)| mx),
                 peaks: right_peaks,
             },
         )
@@ -266,7 +277,33 @@ mod tests {
         assert_eq!(left.fade_out, 0);
         assert_eq!(right.fade_out, 2);
         assert_eq!(left.cache.peaks[0].len(), 0);
-        assert_eq!(right.cache.peaks[0], [(-0.4, 0.1), (-0.2, 0.5)]);
+        assert!(right.cache.peaks[0].is_empty());
+        assert!(right.cache.min.is_none());
+        assert!(right.cache.max.is_none());
+    }
+
+    #[test]
+    fn split_drops_unaligned_right_peaks() {
+        let block = crate::audio::PEAK_BLOCK as u64;
+        let clip = Clip {
+            id: ClipId(1),
+            len: block * 2,
+            source: Some(ClipSource {
+                media_id: MediaId(1),
+                offset: 0,
+            }),
+            fade_in: 0,
+            fade_out: 0,
+            cache: ClipCache {
+                min: Some(-1.0),
+                max: Some(1.0),
+                peaks: vec![vec![(-1.0, 0.2), (-0.3, 1.0)]],
+            },
+            markers: Vec::new(),
+        };
+        let (left, right) = clip.split(block + 4, ClipId(2));
+        assert_eq!(left.cache.peaks[0], [(-1.0, 0.2)]);
+        assert!(right.cache.peaks[0].is_empty());
     }
 
     #[test]

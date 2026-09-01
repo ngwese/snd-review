@@ -172,6 +172,10 @@ impl Composition {
         self.edl.current_id()
     }
 
+    pub fn edit_cursor(&self) -> usize {
+        self.edl.cursor()
+    }
+
     pub fn can_undo(&self) -> bool {
         self.edl.can_undo()
     }
