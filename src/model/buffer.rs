@@ -50,6 +50,7 @@ pub struct Region {
     pub start: usize,
     pub end: usize,
     pub channels: ChannelScope,
+    pub label: Option<String>,
 }
 
 impl Region {
@@ -64,7 +65,13 @@ impl Region {
             start,
             end,
             channels,
+            label: None,
         }
+    }
+
+    pub fn with_label(mut self, label: impl Into<String>) -> Self {
+        self.label = Some(label.into());
+        self
     }
 
     pub fn contains(&self, sample: usize, channel: usize) -> bool {
@@ -119,6 +126,7 @@ impl Buffer {
             start: 0,
             end,
             channels: ChannelScope::all(),
+            label: None,
         }
     }
 
@@ -128,5 +136,11 @@ impl Buffer {
 
     pub fn region_mut(&mut self, id: RegionId) -> Option<&mut Region> {
         self.regions.iter_mut().find(|r| r.id == id)
+    }
+
+    pub fn remove_region(&mut self, id: RegionId) -> bool {
+        let before = self.regions.len();
+        self.regions.retain(|region| region.id != id);
+        self.regions.len() != before
     }
 }

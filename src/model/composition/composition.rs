@@ -633,28 +633,33 @@ impl Composition {
     }
 
     fn clip_min_max(&self, clip: &Clip, channel: usize, local: u64, len: u64) -> (f32, f32) {
-        if clip.source.is_none() {
+        if clip.source.is_none() || len == 0 {
             return (0.0, 0.0);
         }
-        if let Some(peaks) = clip.cache.peaks.get(channel) {
-            if !peaks.is_empty() {
-                let peak_start = local as usize / PEAK_BLOCK;
-                let peak_end =
-                    (((local + len) as usize + PEAK_BLOCK - 1) / PEAK_BLOCK).min(peaks.len());
-                if peak_start < peak_end {
-                    let mut min = f32::MAX;
-                    let mut max = f32::MIN;
-                    for &(pmin, pmax) in &peaks[peak_start..peak_end] {
-                        min = min.min(pmin);
-                        max = max.max(pmax);
-                    }
-                    if min <= max {
-                        return (min, max);
-                    }
-                }
+        let Some(peaks) = clip.cache.peaks.get(channel) else {
+            return (0.0, 0.0);
+        };
+        if peaks.is_empty() {
+            // Missing overview bins: do not decode PCM on the UI thread.
+            // `ensure_clip_peaks` / `build_missing_peak_caches` refill these.
+            return (0.0, 0.0);
+        }
+        let peak_start = local as usize / PEAK_BLOCK;
+        let peak_end = (((local + len) as usize + PEAK_BLOCK - 1) / PEAK_BLOCK).min(peaks.len());
+        if peak_start < peak_end {
+            let mut min = f32::MAX;
+            let mut max = f32::MIN;
+            for &(pmin, pmax) in &peaks[peak_start..peak_end] {
+                min = min.min(pmin);
+                max = max.max(pmax);
+            }
+            if min <= max {
+                return (min, max);
             }
         }
-        let mut buf = vec![0.0; len as usize];
+        // Uncovered tail after an unaligned split (at most one peak block).
+        let take = (len as usize).min(PEAK_BLOCK);
+        let mut buf = vec![0.0; take];
         let _ = self.read_clip_channel(clip, channel, local, &mut buf);
         let mut min = f32::MAX;
         let mut max = f32::MIN;
@@ -741,9 +746,17 @@ impl Composition {
     }
 
     pub fn needs_peak_build(&self) -> bool {
-        self.spans()
-            .iter()
-            .any(|span| span.clip.source.is_some() && span.clip.cache.peaks.is_empty())
+        self.spans().iter().any(|span| span.clip.needs_peak_cache())
+    }
+
+    /// Overview paint can proceed if some clips already have bins, even while
+    /// others are still rebuilding after a split.
+    pub fn can_paint_overview(&self) -> bool {
+        !self.needs_peak_build()
+            || self
+                .spans()
+                .iter()
+                .any(|span| !span.clip.cache.is_missing_peaks())
     }
 
     pub fn ensure_clip_peaks(&mut self) -> Result<()> {
@@ -768,7 +781,7 @@ impl Composition {
         let spans = self.tree.spans();
         let total: u64 = spans
             .iter()
-            .filter(|span| span.clip.source.is_some() && span.clip.cache.peaks.is_empty())
+            .filter(|span| span.clip.needs_peak_cache())
             .map(|span| span.clip.len.saturating_mul(self.channel_count as u64))
             .sum();
         let mut done = 0u64;
@@ -780,7 +793,7 @@ impl Composition {
             if progress.is_some_and(|p| !p.is_epoch(epoch)) {
                 break;
             }
-            if !span.clip.cache.peaks.is_empty() || span.clip.source.is_none() {
+            if !span.clip.needs_peak_cache() {
                 continue;
             }
             let mut peaks = vec![Vec::new(); self.channel_count];
@@ -1034,6 +1047,28 @@ mod tests {
         assert_eq!(got, *expected);
         let clip = comp.clip_at(0).unwrap().clip;
         assert!(!clip.cache.peaks.is_empty());
+    }
+
+    #[test]
+    fn unaligned_delete_rebuilds_right_peak_cache() {
+        let block = crate::audio::PEAK_BLOCK as u64;
+        let mut comp = Composition::from_media(sine_media((block * 4) as usize, 1, 44100)).unwrap();
+        assert!(!comp.needs_peak_build());
+        comp.delete(block + 7, 5);
+        assert!(!comp.needs_peak_build());
+        let right = comp
+            .spans()
+            .into_iter()
+            .rev()
+            .find(|span| span.clip.source.is_some())
+            .unwrap();
+        assert!(
+            !right.clip.cache.is_missing_peaks(),
+            "unaligned split must rebuild the right fragment, not leave empty bins"
+        );
+        let (min, max) =
+            comp.min_max_in_range(0, right.start as f64, (right.start + right.clip.len) as f64);
+        assert!(max > min);
     }
 
     #[test]

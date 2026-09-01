@@ -78,7 +78,7 @@ impl BasePanel for EditsPanel {
 
 impl Panel for EditsPanel {
     fn title(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-        "Edits"
+        "History"
     }
 
     fn inner_padding(&self, _: &App) -> bool {

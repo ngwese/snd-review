@@ -25,6 +25,9 @@ actions!(
         ViewFrame,
         ViewZoomIn,
         ViewZoomOut,
+        ViewExplorer,
+        ViewHistory,
+        ViewScript,
         EditUndo,
         EditRedo,
         EditCut,
@@ -41,6 +44,16 @@ actions!(
 
 const DEFAULT_KEYMAP: &str = include_str!("../assets/keymap.json");
 
+/// Keymap actions apply while the waveform App view is focused, not while
+/// typing in the Script panel or other text fields.
+const APP_KEY_CONTEXT: &str = "App";
+
+/// Fit/frame letter keys apply while the waveform is focused.
+const WAVEFORM_KEY_CONTEXT: &str = "Waveform";
+
+/// Fit/frame letter keys also apply while the pointer is over the waveform.
+const WAVEFORM_HOVER_KEY_CONTEXT: &str = "WaveformHover";
+
 const KNOWN_COMMANDS: &[&str] = &[
     "file.open",
     "file.quit",
@@ -49,6 +62,9 @@ const KNOWN_COMMANDS: &[&str] = &[
     "view.frame",
     "view.zoom_in",
     "view.zoom_out",
+    "view.explorer",
+    "view.history",
+    "view.script",
     "transport.home",
     "transport.previous",
     "transport.start",
@@ -69,6 +85,31 @@ const KNOWN_COMMANDS: &[&str] = &[
     "edit.roll_left",
     "edit.roll_right",
 ];
+
+/// Command IDs that keymap, menus, and Lua `app:command` share.
+pub fn known_commands() -> &'static [&'static str] {
+    KNOWN_COMMANDS
+}
+
+pub fn is_known_command(command_id: &str) -> bool {
+    KNOWN_COMMANDS.contains(&command_id)
+}
+
+/// Run a command by keymap ID. Lua and the menu/key path share this table.
+pub fn dispatch(command_id: &str, cx: &mut App) -> Result<(), String> {
+    validate_command_id(command_id)?;
+    if let Some(result) = crate::script::try_invoke_command(command_id) {
+        return result;
+    }
+    crate::app::dispatch_command(command_id, cx)
+}
+
+pub fn validate_command_id(command_id: &str) -> Result<(), String> {
+    if !is_known_command(command_id) {
+        return Err(format!("unknown command `{command_id}`"));
+    }
+    Ok(())
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Platform {
@@ -97,7 +138,7 @@ pub fn install_keybindings(cx: &mut App) {
 fn load_keybindings() -> Vec<KeyBinding> {
     resolved_bindings()
         .into_iter()
-        .filter_map(|(keystrokes, command_id)| binding_for(&command_id, &keystrokes))
+        .flat_map(|(keystrokes, command_id)| bindings_for(&command_id, &keystrokes))
         .collect()
 }
 
@@ -164,6 +205,10 @@ fn read_user_keymap() -> Option<Result<String, String>> {
     Some(std::fs::read_to_string(&path).map_err(|err| format!("{}: {err}", path.display())))
 }
 
+pub fn user_config_dir() -> Option<PathBuf> {
+    user_keymap_path()?.parent().map(PathBuf::from)
+}
+
 fn user_keymap_path() -> Option<PathBuf> {
     #[cfg(target_os = "macos")]
     {
@@ -197,10 +242,6 @@ fn user_keymap_path() -> Option<PathBuf> {
     }
 }
 
-fn is_known_command(command_id: &str) -> bool {
-    KNOWN_COMMANDS.contains(&command_id)
-}
-
 fn valid_keystrokes(spec: &str) -> bool {
     let mut parts = spec.split_whitespace().peekable();
     if parts.peek().is_none() {
@@ -209,7 +250,22 @@ fn valid_keystrokes(spec: &str) -> bool {
     parts.all(|part| Keystroke::parse(part).is_ok())
 }
 
+fn bindings_for(command_id: &str, keystrokes: &str) -> Vec<KeyBinding> {
+    let contexts: &[&str] = match command_id {
+        "view.fit_all" | "view.frame" => &[WAVEFORM_KEY_CONTEXT, WAVEFORM_HOVER_KEY_CONTEXT],
+        _ => &[APP_KEY_CONTEXT],
+    };
+    contexts
+        .iter()
+        .filter_map(|context| binding_in(command_id, keystrokes, context))
+        .collect()
+}
+
 fn binding_for(command_id: &str, keystrokes: &str) -> Option<KeyBinding> {
+    bindings_for(command_id, keystrokes).into_iter().next()
+}
+
+fn binding_in(command_id: &str, keystrokes: &str, context: &str) -> Option<KeyBinding> {
     if !is_known_command(command_id) {
         eprintln!("snd-review: unknown command {command_id:?} bound to {keystrokes:?}");
         return None;
@@ -219,32 +275,35 @@ fn binding_for(command_id: &str, keystrokes: &str) -> Option<KeyBinding> {
         return None;
     }
     Some(match command_id {
-        "file.open" => KeyBinding::new(keystrokes, Open, None),
-        "file.quit" => KeyBinding::new(keystrokes, Quit, None),
-        "help.about" => KeyBinding::new(keystrokes, About, None),
-        "view.fit_all" => KeyBinding::new(keystrokes, ViewFitAll, None),
-        "view.frame" => KeyBinding::new(keystrokes, ViewFrame, None),
-        "view.zoom_in" => KeyBinding::new(keystrokes, ViewZoomIn, None),
-        "view.zoom_out" => KeyBinding::new(keystrokes, ViewZoomOut, None),
-        "transport.home" => KeyBinding::new(keystrokes, TransportHome, None),
-        "transport.previous" => KeyBinding::new(keystrokes, TransportPrevious, None),
-        "transport.start" => KeyBinding::new(keystrokes, TransportStart, None),
-        "transport.play_pause" => KeyBinding::new(keystrokes, TransportPlayPause, None),
-        "transport.stop" => KeyBinding::new(keystrokes, TransportStop, None),
-        "transport.next" => KeyBinding::new(keystrokes, TransportNext, None),
-        "transport.end" => KeyBinding::new(keystrokes, TransportEnd, None),
-        "transport.loop" => KeyBinding::new(keystrokes, TransportLoop, None),
-        "edit.undo" => KeyBinding::new(keystrokes, EditUndo, None),
-        "edit.redo" => KeyBinding::new(keystrokes, EditRedo, None),
-        "edit.cut" => KeyBinding::new(keystrokes, EditCut, None),
-        "edit.copy" => KeyBinding::new(keystrokes, EditCopy, None),
-        "edit.paste" => KeyBinding::new(keystrokes, EditPaste, None),
-        "edit.delete" => KeyBinding::new(keystrokes, EditDelete, None),
-        "edit.remove" => KeyBinding::new(keystrokes, EditRemove, None),
-        "edit.duplicate" => KeyBinding::new(keystrokes, EditDuplicate, None),
-        "edit.trim" => KeyBinding::new(keystrokes, EditTrim, None),
-        "edit.roll_left" => KeyBinding::new(keystrokes, EditRollLeft, None),
-        "edit.roll_right" => KeyBinding::new(keystrokes, EditRollRight, None),
+        "file.open" => KeyBinding::new(keystrokes, Open, Some(context)),
+        "file.quit" => KeyBinding::new(keystrokes, Quit, Some(context)),
+        "help.about" => KeyBinding::new(keystrokes, About, Some(context)),
+        "view.fit_all" => KeyBinding::new(keystrokes, ViewFitAll, Some(context)),
+        "view.frame" => KeyBinding::new(keystrokes, ViewFrame, Some(context)),
+        "view.zoom_in" => KeyBinding::new(keystrokes, ViewZoomIn, Some(context)),
+        "view.zoom_out" => KeyBinding::new(keystrokes, ViewZoomOut, Some(context)),
+        "view.explorer" => KeyBinding::new(keystrokes, ViewExplorer, Some(context)),
+        "view.history" => KeyBinding::new(keystrokes, ViewHistory, Some(context)),
+        "view.script" => KeyBinding::new(keystrokes, ViewScript, Some(context)),
+        "transport.home" => KeyBinding::new(keystrokes, TransportHome, Some(context)),
+        "transport.previous" => KeyBinding::new(keystrokes, TransportPrevious, Some(context)),
+        "transport.start" => KeyBinding::new(keystrokes, TransportStart, Some(context)),
+        "transport.play_pause" => KeyBinding::new(keystrokes, TransportPlayPause, Some(context)),
+        "transport.stop" => KeyBinding::new(keystrokes, TransportStop, Some(context)),
+        "transport.next" => KeyBinding::new(keystrokes, TransportNext, Some(context)),
+        "transport.end" => KeyBinding::new(keystrokes, TransportEnd, Some(context)),
+        "transport.loop" => KeyBinding::new(keystrokes, TransportLoop, Some(context)),
+        "edit.undo" => KeyBinding::new(keystrokes, EditUndo, Some(context)),
+        "edit.redo" => KeyBinding::new(keystrokes, EditRedo, Some(context)),
+        "edit.cut" => KeyBinding::new(keystrokes, EditCut, Some(context)),
+        "edit.copy" => KeyBinding::new(keystrokes, EditCopy, Some(context)),
+        "edit.paste" => KeyBinding::new(keystrokes, EditPaste, Some(context)),
+        "edit.delete" => KeyBinding::new(keystrokes, EditDelete, Some(context)),
+        "edit.remove" => KeyBinding::new(keystrokes, EditRemove, Some(context)),
+        "edit.duplicate" => KeyBinding::new(keystrokes, EditDuplicate, Some(context)),
+        "edit.trim" => KeyBinding::new(keystrokes, EditTrim, Some(context)),
+        "edit.roll_left" => KeyBinding::new(keystrokes, EditRollLeft, Some(context)),
+        "edit.roll_right" => KeyBinding::new(keystrokes, EditRollRight, Some(context)),
         _ => return None,
     })
 }
@@ -346,6 +405,35 @@ mod tests {
     fn unknown_command_ids_are_skipped() {
         assert!(!is_known_command("not.a.command"));
         assert!(binding_for("not.a.command", "a").is_none());
+    }
+
+    #[test]
+    fn keymap_bindings_are_scoped_to_the_app_view() {
+        let binding = binding_for("edit.delete", "backspace").expect("backspace");
+        assert!(binding.predicate().is_some());
+        let binding = binding_for("transport.play_pause", "space").expect("space");
+        assert!(binding.predicate().is_some());
+    }
+
+    #[test]
+    fn fit_and_frame_keys_are_scoped_to_the_waveform() {
+        let fit = bindings_for("view.fit_all", "a");
+        assert_eq!(fit.len(), 2);
+        assert!(fit.iter().all(|binding| binding.predicate().is_some()));
+        let frame = bindings_for("view.frame", "f");
+        assert_eq!(frame.len(), 2);
+        assert!(frame.iter().all(|binding| binding.predicate().is_some()));
+    }
+
+    #[test]
+    fn dispatch_rejects_unknown_command_ids() {
+        assert_eq!(KNOWN_COMMANDS.len(), known_commands().len());
+        for id in known_commands() {
+            assert!(is_known_command(id));
+            assert!(validate_command_id(id).is_ok());
+        }
+        let err = validate_command_id("not.a.command").unwrap_err();
+        assert!(err.contains("unknown command"));
     }
 
     #[test]

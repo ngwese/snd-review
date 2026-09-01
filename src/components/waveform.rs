@@ -4,9 +4,10 @@
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
     actions, canvas, div, fill, hsla, point, px, relative, size, App, Bounds, Context,
-    DispatchPhase, Entity, InteractiveElement as _, IntoElement, MouseButton, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, ParentElement as _, PathBuilder, Pixels, Render,
-    ScrollWheelEvent, SharedString, StatefulInteractiveElement as _, Styled as _, Window,
+    DispatchPhase, Entity, FocusHandle, Focusable, InteractiveElement as _, IntoElement,
+    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement as _, PathBuilder,
+    Pixels, Render, ScrollWheelEvent, SharedString, StatefulInteractiveElement as _, Styled as _,
+    Window,
 };
 use gpui_component::{
     h_flex,
@@ -90,6 +91,8 @@ pub struct WaveformDisplay {
     drag: Option<Drag>,
     hover_sample: Option<usize>,
     hovered_edit: Option<EditId>,
+    pointer_over: bool,
+    focus_handle: FocusHandle,
 }
 
 impl WaveformDisplay {
@@ -112,11 +115,17 @@ impl WaveformDisplay {
             drag: None,
             hover_sample: None,
             hovered_edit: None,
+            pointer_over: false,
+            focus_handle: cx.focus_handle(),
         }
     }
 
     pub fn hover_sample(&self) -> Option<usize> {
         self.hover_sample
+    }
+
+    pub fn pointer_over(&self) -> bool {
+        self.pointer_over
     }
 
     pub fn set_hovered_edit(&mut self, id: Option<EditId>, cx: &mut Context<Self>) {
@@ -299,6 +308,17 @@ impl WaveformDisplay {
         }
     }
 
+    fn set_pointer_over(&mut self, hovered: bool, cx: &mut Context<Self>) {
+        if self.pointer_over == hovered {
+            return;
+        }
+        self.pointer_over = hovered;
+        if !hovered {
+            self.hover_sample = None;
+        }
+        cx.notify();
+    }
+
     fn pan_pixels(&mut self, dx: f32, cx: &App) {
         self.start_sample -= dx as f64 * self.samples_per_pixel;
         self.clamp_scroll(cx);
@@ -321,7 +341,7 @@ impl WaveformDisplay {
             return;
         }
         let first = self.viewport_width <= 1.0;
-        let changed = (self.viewport_width - width).abs() > 0.5;
+        let changed = (self.viewport_width - width).abs() > 2.0;
         self.viewport_width = width;
         self.content_origin_x = bounds.origin.x.as_f32();
         if first {
@@ -728,6 +748,7 @@ fn paint_lane(
             start: *start,
             end: *end,
             channels: channels.clone(),
+            label: None,
         };
         paint_region_overlay(
             bounds,
@@ -940,6 +961,12 @@ fn paint_scrollbar(
     ));
 }
 
+impl Focusable for WaveformDisplay {
+    fn focus_handle(&self, _: &App) -> FocusHandle {
+        self.focus_handle.clone()
+    }
+}
+
 impl Render for WaveformDisplay {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.clamp_scroll(cx);
@@ -966,8 +993,20 @@ impl Render for WaveformDisplay {
         let job_progress = self.document.read(cx).progress.snapshot();
 
         v_flex()
+            .id("waveform-root")
+            .key_context("Waveform")
+            .track_focus(&self.focus_handle)
             .relative()
             .size_full()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, window, cx| {
+                    this.focus_handle.focus(window, cx);
+                }),
+            )
+            .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
+                this.set_pointer_over(*hovered, cx);
+            }))
             .child(
                 div()
                     .id("waveform")

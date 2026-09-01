@@ -16,6 +16,7 @@ mod components;
 mod model;
 mod playback;
 mod progress;
+mod script;
 mod session;
 
 #[derive(Parser, Debug)]

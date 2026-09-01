@@ -27,7 +27,6 @@ pub struct WorkspacePanel {
     transport_state: TransportState,
     looping: bool,
     on_activated: Option<ActivatedFn>,
-    focus_handle: FocusHandle,
 }
 
 impl WorkspacePanel {
@@ -46,7 +45,6 @@ impl WorkspacePanel {
             transport_state: TransportState::Stopped,
             looping: false,
             on_activated: None,
-            focus_handle: cx.focus_handle(),
         }
     }
 
@@ -67,8 +65,8 @@ impl WorkspacePanel {
 impl EventEmitter<PanelEvent> for WorkspacePanel {}
 
 impl Focusable for WorkspacePanel {
-    fn focus_handle(&self, _: &App) -> FocusHandle {
-        self.focus_handle.clone()
+    fn focus_handle(&self, cx: &App) -> FocusHandle {
+        self.waveform.focus_handle(cx)
     }
 }
 

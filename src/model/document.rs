@@ -258,11 +258,56 @@ impl BufferDocument {
     }
 
     pub fn add_region(&mut self, start: usize, end: usize, channels: ChannelScope) -> RegionId {
+        self.add_labeled_region(start, end, channels, None)
+    }
+
+    pub fn add_labeled_region(
+        &mut self,
+        start: usize,
+        end: usize,
+        channels: ChannelScope,
+        label: Option<String>,
+    ) -> RegionId {
         let id = RegionId(self.next_region_id);
         self.next_region_id += 1;
-        let region = Region::new(id, start, end, channels);
+        let mut region = Region::new(id, start, end, channels);
+        if let Some(label) = label {
+            region = region.with_label(label);
+        }
         self.buffer.write().unwrap().regions.push(region);
         id
+    }
+
+    pub fn remove_region(&mut self, id: RegionId) -> bool {
+        self.buffer.write().unwrap().remove_region(id)
+    }
+
+    pub fn select_range(&mut self, start: usize, stop: usize, channels: ChannelScope) {
+        let start = self.clamp_sample(start);
+        let stop = self.clamp_sample(stop);
+        let (start, end) = Self::normalized_region_bounds(start, stop);
+        self.region_drag_anchor = None;
+        self.set_current_position_sample(end, channels.clone());
+        self.selection = Selection::Region {
+            region_id: None,
+            start,
+            end,
+            channels,
+        };
+    }
+
+    pub fn select_all(&mut self) {
+        let frames = self.frames();
+        if frames == 0 {
+            self.clear_selection();
+            return;
+        }
+        self.select_range(0, frames.saturating_sub(1), ChannelScope::all());
+    }
+
+    pub fn clear_selection(&mut self) {
+        self.region_drag_anchor = None;
+        self.selection = Selection::None;
     }
 
     pub fn add_marker(&mut self, sample: usize, channels: ChannelScope) -> MarkerId {
@@ -603,7 +648,7 @@ impl WaveformDataProvider for BufferDocument {
     }
 
     fn peaks_ready(&self) -> bool {
-        !self.composition.read().unwrap().needs_peak_build()
+        self.composition.read().unwrap().can_paint_overview()
     }
 
     fn fill_minmax_columns(

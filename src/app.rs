@@ -11,8 +11,8 @@ use cpal::Device;
 use gpui::{
     div, point, prelude::FluentBuilder as _, px, size, App, AppContext as _, Bounds, Context,
     Entity, ExternalPaths, FocusHandle, Focusable, Global, InteractiveElement as _, IntoElement,
-    Menu, MenuItem, ParentElement as _, PathPromptOptions, Render, SharedString, Styled as _,
-    TitlebarOptions, WeakEntity, Window, WindowBounds, WindowOptions,
+    KeyContext, Menu, MenuItem, ParentElement as _, PathPromptOptions, Pixels, Render,
+    SharedString, Styled as _, TitlebarOptions, WeakEntity, Window, WindowBounds, WindowOptions,
 };
 use gpui_component::{
     button::{Button, ButtonVariants as _},
@@ -31,12 +31,14 @@ use crate::commands::{
     install_keybindings, About, EditCopy, EditCut, EditDelete, EditDuplicate, EditPaste, EditRedo,
     EditRemove, EditRollLeft, EditRollRight, EditTrim, EditUndo, Open, Quit, TransportEnd,
     TransportHome, TransportLoop, TransportNext, TransportPlayPause, TransportPrevious,
-    TransportStart, TransportStop, ViewFitAll, ViewFrame, ViewZoomIn, ViewZoomOut,
+    TransportStart, TransportStop, ViewExplorer, ViewFitAll, ViewFrame, ViewHistory, ViewScript,
+    ViewZoomIn, ViewZoomOut,
 };
 use crate::components::dock_skin::{CenterTabCloseHandler, CompactDockSkin};
 use crate::components::edits::EditsPanel;
 use crate::components::empty_pane::EmptyPane;
 use crate::components::explorer::{ExplorerEvent, ExplorerPanel};
+use crate::components::repl::ReplPanel;
 use crate::components::status_bar::{FileStatus, FileStatusBar};
 use crate::components::waveform::{ToggleZeroCrossing, WaveformDisplay};
 use crate::components::workspace::WorkspacePanel;
@@ -45,6 +47,7 @@ use crate::model::selection::Selection;
 use crate::model::{Buffer, BufferDocument};
 use crate::playback::{PlaybackSession, TransportState};
 use crate::progress::ProgressState;
+use crate::script::{EvalOutput, ScriptHost};
 use crate::session::{DocumentId, DocumentSession};
 
 struct OpenTarget(Entity<AppView>);
@@ -67,6 +70,8 @@ pub struct AppView {
     explorer: Entity<ExplorerPanel>,
     edits: Entity<EditsPanel>,
     empty_editors: Entity<EmptyPane>,
+    repl: Entity<ReplPanel>,
+    script: ScriptHost,
     idle_composition: Arc<RwLock<Composition>>,
     playback: PlaybackSession,
     app_menu_bar: Option<Entity<AppMenuBar>>,
@@ -74,6 +79,9 @@ pub struct AppView {
     pending_load: Arc<Mutex<Vec<(DocumentId, u64, Result<Composition, String>)>>>,
     focus_handle: FocusHandle,
     last_progress: Option<ProgressState>,
+    script_dock_size: Pixels,
+    last_waveform_hover: Option<usize>,
+    last_waveform_over: bool,
 }
 
 impl AppView {
@@ -167,6 +175,14 @@ impl AppView {
         let transients = cx.new(|cx| EmptyPane::new("TransientsPanel", "Transients", cx));
         let markers = cx.new(|cx| EmptyPane::new("MarkersPanel", "Markers", cx));
         let labels = cx.new(|cx| EmptyPane::new("LabelsPanel", "Labels", cx));
+        let script = ScriptHost::new().expect("lua runtime");
+        let repl = cx.new(|cx| ReplPanel::new(window, cx));
+        repl.update(cx, |repl, _| {
+            let app = app.clone();
+            repl.set_handler(Rc::new(move |code, window, cx| {
+                let _ = app.update(cx, |this, cx| this.eval_lua(&code, window, cx));
+            }));
+        });
         let (dock_area, skin) = CompactDockSkin::dock_area("main-dock", Some(1), window, cx);
         let explorer_handle = panel_handle(explorer.clone());
         let center_handle = match first_workspace {
@@ -211,18 +227,19 @@ impl AppView {
                 if matches!(event, DockEvent::LayoutChanged) {
                     this.sync_tabs_from_layout(window, cx);
                 }
-                cx.notify();
             },
         )
         .detach();
 
-        let this = Self {
+        let mut this = Self {
             session,
             views,
             dock_area,
             explorer,
             edits,
             empty_editors,
+            repl,
+            script,
             idle_composition,
             playback,
             app_menu_bar: (!cfg!(target_os = "macos")).then(|| AppMenuBar::new(cx)),
@@ -230,7 +247,11 @@ impl AppView {
             pending_load: Arc::new(Mutex::new(Vec::new())),
             focus_handle: cx.focus_handle(),
             last_progress: None,
+            script_dock_size: px(160.),
+            last_waveform_hover: None,
+            last_waveform_over: false,
         };
+        this.load_init_lua(window, cx);
         this.refresh_explorer(cx);
         if let Some(id) = this.session.active() {
             this.spawn_peak_build(id, cx);
@@ -254,7 +275,17 @@ impl AppView {
         })
         .detach();
         let waveform = cx.new(|cx| WaveformDisplay::new(document.clone(), cx));
-        cx.observe(&waveform, |_, _, cx| cx.notify()).detach();
+        cx.observe(&waveform, |this, waveform, cx| {
+            let hover = waveform.read(cx).hover_sample();
+            let over = waveform.read(cx).pointer_over();
+            if this.last_waveform_hover == hover && this.last_waveform_over == over {
+                return;
+            }
+            this.last_waveform_hover = hover;
+            this.last_waveform_over = over;
+            cx.notify();
+        })
+        .detach();
         let workspace =
             cx.new(|cx| WorkspacePanel::new(id, document.clone(), waveform.clone(), cx));
         workspace.update(cx, |workspace, _| {
@@ -607,6 +638,7 @@ impl AppView {
         self.spawn_peak_build(id, cx);
         self.refresh_explorer(cx);
         self.dock_area.update(cx, |_, cx| cx.notify());
+        self.fire_loaded_script(id, window, cx);
         cx.notify();
     }
 
@@ -614,6 +646,7 @@ impl AppView {
         self.dock_area.update(cx, |area, cx| {
             area.toggle_dock(DockPlacement::Right, window, cx);
         });
+        self.sync_view_menus(cx);
         cx.notify();
     }
 
@@ -621,6 +654,7 @@ impl AppView {
         self.dock_area.update(cx, |area, cx| {
             area.toggle_dock(DockPlacement::Left, window, cx);
         });
+        self.sync_view_menus(cx);
         cx.notify();
     }
 
@@ -632,12 +666,291 @@ impl AppView {
         self.dock_area.read(cx).is_dock_open(DockPlacement::Left)
     }
 
+    fn toggle_script_dock(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.script_dock_open(cx) {
+            self.hide_script_dock(window, cx);
+        } else {
+            self.show_script_dock(window, cx);
+        }
+    }
+
+    fn script_dock_open(&self, cx: &App) -> bool {
+        self.dock_area.read(cx).is_dock_open(DockPlacement::Bottom)
+    }
+
+    fn sync_view_menus(&self, cx: &mut Context<Self>) {
+        apply_app_menus(
+            self.explorer_dock_open(cx),
+            self.edits_dock_open(cx),
+            self.script_dock_open(cx),
+            cx,
+        );
+        if let Some(bar) = self.app_menu_bar.clone() {
+            bar.update(cx, |bar, cx| bar.reload(cx));
+        }
+    }
+
+    fn show_script_dock(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let opened = !self.script_dock_open(cx);
+        if opened {
+            let handle = panel_handle(self.repl.clone());
+            let size = self.script_dock_size;
+            self.dock_area.update(cx, |area, cx| {
+                area.set_dock(
+                    DockPlacement::Bottom,
+                    DockLayout::tabs().panel_view(handle, cx),
+                    window,
+                    cx,
+                );
+                area.set_dock_size(DockPlacement::Bottom, size, window, cx);
+                area.set_dock_collapsible(DockPlacement::Bottom, false, window, cx);
+            });
+        }
+        self.repl.focus_handle(cx).focus(window, cx);
+        if opened {
+            self.sync_view_menus(cx);
+            cx.notify();
+        }
+    }
+
+    fn hide_script_dock(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.script_dock_open(cx) {
+            return;
+        }
+        if let Some(size) = self.dock_area.read(cx).dock_size(DockPlacement::Bottom) {
+            self.script_dock_size = size;
+        }
+        self.dock_area.update(cx, |area, cx| {
+            area.remove_dock(DockPlacement::Bottom, window, cx);
+        });
+        self.sync_view_menus(cx);
+        cx.notify();
+    }
+
+    fn load_init_lua(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let _guard = crate::script::enter(self, window, cx);
+        if let Err(err) = self.script.load_init() {
+            self.repl.update(cx, |repl, cx| {
+                repl.append_error(&err, cx);
+            });
+        }
+        let prints = self.script.take_prints();
+        if !prints.is_empty() {
+            let output = EvalOutput {
+                prints,
+                result: None,
+                error: None,
+            };
+            self.repl.update(cx, |repl, cx| {
+                repl.append_output(&output, cx);
+            });
+        }
+    }
+
+    fn eval_lua(&mut self, code: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let _guard = crate::script::enter(self, window, cx);
+        let output = self.script.eval(code);
+        self.repl.update(cx, |repl, cx| {
+            repl.append_eval(code, &output, cx);
+        });
+    }
+
+    fn fire_loaded_script(&mut self, id: DocumentId, window: &mut Window, cx: &mut Context<Self>) {
+        let _guard = crate::script::enter(self, window, cx);
+        self.script.fire_loaded(id);
+        let prints = self.script.take_prints();
+        if !prints.is_empty() {
+            let output = EvalOutput {
+                prints,
+                result: None,
+                error: None,
+            };
+            self.repl.update(cx, |repl, cx| {
+                repl.append_output(&output, cx);
+            });
+        }
+    }
+
+    pub(crate) fn session_active(&self) -> Option<DocumentId> {
+        self.session.active()
+    }
+
+    pub(crate) fn session_document_ids(&self) -> Vec<DocumentId> {
+        self.session.documents().iter().map(|doc| doc.id).collect()
+    }
+
+    pub(crate) fn script_display_name(&self, id: DocumentId, cx: &App) -> Option<String> {
+        Some(self.display_title(id, cx).to_string())
+    }
+
+    pub(crate) fn script_path(&self, id: DocumentId) -> Option<PathBuf> {
+        self.session.get(id).and_then(|doc| doc.source_path.clone())
+    }
+
+    pub(crate) fn script_open(
+        &mut self,
+        path: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<DocumentId, String> {
+        self.open_path(path.clone(), window, cx);
+        self.session
+            .find_by_path(&path)
+            .or_else(|| self.session.active())
+            .ok_or_else(|| format!("failed to open {}", path.display()))
+    }
+
+    pub(crate) fn script_with_document<R>(
+        &mut self,
+        id: DocumentId,
+        cx: &mut Context<Self>,
+        f: impl FnOnce(&mut BufferDocument) -> mlua::Result<R>,
+    ) -> mlua::Result<R> {
+        let views = self
+            .views
+            .get(&id)
+            .ok_or_else(|| mlua::Error::runtime("composition is not open"))?;
+        views.document.update(cx, |doc, _| f(doc))
+    }
+
+    pub(crate) fn after_script_edit(
+        &mut self,
+        id: DocumentId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.session.active() == Some(id) {
+            if let Some(views) = self.views.get(&id).cloned() {
+                self.playback.sync_from_document(views.document.read(cx));
+                views.document.update(cx, |_, cx| cx.notify());
+                views.waveform.update(cx, |_, cx| cx.notify());
+            }
+        }
+        self.refresh_explorer(cx);
+        self.spawn_peak_build(id, cx);
+        self.update_window_title(window, cx);
+        cx.notify();
+    }
+
+    pub(crate) fn invoke_command(
+        &mut self,
+        command_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        match command_id {
+            "file.open" => self.prompt_open_file(window, cx),
+            "file.quit" => cx.quit(),
+            "help.about" => {
+                window.open_alert_dialog(cx, |alert, _, _| {
+                    alert.title("About snd-review").description(format!(
+                        "{}\n\nVersion {}",
+                        env!("CARGO_PKG_DESCRIPTION"),
+                        env!("CARGO_PKG_VERSION"),
+                    ))
+                });
+            }
+            "transport.home" => {
+                self.playback.home();
+                self.sync_playback_to_document(cx);
+            }
+            "transport.previous" => {
+                self.playback.previous();
+                self.sync_playback_to_document(cx);
+            }
+            "transport.start" => {
+                self.playback.start();
+                self.sync_playback_to_document(cx);
+            }
+            "transport.play_pause" => {
+                self.playback.toggle_play_pause();
+                self.sync_playback_to_document(cx);
+            }
+            "transport.stop" => {
+                self.playback.stop();
+                self.sync_playback_to_document(cx);
+            }
+            "transport.next" => {
+                self.playback.next();
+                self.sync_playback_to_document(cx);
+            }
+            "transport.end" => {
+                self.playback.end();
+                self.sync_playback_to_document(cx);
+            }
+            "transport.loop" => {
+                self.playback.toggle_loop();
+                cx.notify();
+            }
+            "view.fit_all" => {
+                if let Some(views) = self.active_views() {
+                    views.waveform.update(cx, |view, cx| view.fit(cx));
+                }
+            }
+            "view.frame" => {
+                if let Some(views) = self.active_views() {
+                    views.waveform.update(cx, |view, cx| view.frame(cx));
+                }
+            }
+            "view.zoom_in" => {
+                if let Some(views) = self.active_views() {
+                    views.waveform.update(cx, |view, cx| view.zoom_in(cx));
+                }
+            }
+            "view.zoom_out" => {
+                if let Some(views) = self.active_views() {
+                    views.waveform.update(cx, |view, cx| view.zoom_out(cx));
+                }
+            }
+            "view.explorer" => self.toggle_explorer_dock(window, cx),
+            "view.history" => self.toggle_edits_dock(window, cx),
+            "view.script" => self.toggle_script_dock(window, cx),
+            "edit.undo" => self.run_edit(cx, |doc| {
+                doc.edit_undo();
+            }),
+            "edit.redo" => self.run_edit(cx, |doc| {
+                doc.edit_redo();
+            }),
+            "edit.cut" => self.run_edit(cx, |doc| doc.edit_cut()),
+            "edit.copy" => self.run_edit(cx, |doc| doc.edit_copy()),
+            "edit.paste" => self.run_edit(cx, |doc| doc.edit_paste()),
+            "edit.delete" => self.run_edit(cx, |doc| doc.edit_delete()),
+            "edit.remove" => self.run_edit(cx, |doc| doc.edit_remove()),
+            "edit.duplicate" => self.run_edit(cx, |doc| doc.edit_duplicate()),
+            "edit.trim" => self.run_edit(cx, |doc| doc.edit_trim()),
+            "edit.roll_left" => self.run_edit(cx, |doc| doc.edit_roll(-1)),
+            "edit.roll_right" => self.run_edit(cx, |doc| doc.edit_roll(1)),
+            other => return Err(format!("unknown command `{other}`")),
+        }
+        Ok(())
+    }
+
+    fn run_edit(&mut self, cx: &mut Context<Self>, f: impl FnOnce(&mut BufferDocument)) {
+        let Some(id) = self.session.active() else {
+            return;
+        };
+        let Some(views) = self.views.get(&id).cloned() else {
+            return;
+        };
+        views.document.update(cx, |doc, cx| {
+            f(doc);
+            cx.notify();
+        });
+        self.playback.sync_from_document(views.document.read(cx));
+        self.refresh_explorer(cx);
+        self.spawn_peak_build(id, cx);
+        cx.notify();
+    }
+
     fn spawn_peak_build(&self, id: DocumentId, cx: &mut Context<Self>) {
         let Some(views) = self.views.get(&id) else {
             return;
         };
         let composition = views.composition.clone();
         if !composition.read().unwrap().needs_peak_build() {
+            return;
+        }
+        if views.document.read(cx).progress.snapshot().is_some() {
             return;
         }
         let progress = views.document.read(cx).progress.clone();
@@ -808,6 +1121,20 @@ fn format_header_meta(doc: &BufferDocument, transport: TransportState) -> String
     parts.join("  ·  ")
 }
 
+impl AppView {
+    fn app_key_context(&self, window: &mut Window, cx: &mut App) -> KeyContext {
+        let mut context = KeyContext::parse("App").expect("App key context");
+        let typing = window.focused_input(cx).is_some();
+        let over_waveform = self
+            .active_views()
+            .is_some_and(|views| views.waveform.read(cx).pointer_over());
+        if over_waveform && !typing {
+            context.add("WaveformHover");
+        }
+        context
+    }
+}
+
 impl Render for AppView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
@@ -849,6 +1176,17 @@ impl Render for AppView {
         } else {
             "Show Explorer"
         };
+        let console_open = self.script_dock_open(cx);
+        let console_icon = if console_open {
+            IconName::PanelBottom
+        } else {
+            IconName::PanelBottomOpen
+        };
+        let console_tooltip = if console_open {
+            "Hide Script"
+        } else {
+            "Show Script"
+        };
         let edits_open = self.edits_dock_open(cx);
         let edits_icon = if edits_open {
             IconName::PanelRight
@@ -856,14 +1194,14 @@ impl Render for AppView {
             IconName::PanelRightOpen
         };
         let edits_tooltip = if edits_open {
-            "Hide Edits"
+            "Hide History"
         } else {
-            "Show Edits"
+            "Show History"
         };
 
         div()
             .id("app-view")
-            .key_context("App")
+            .key_context(self.app_key_context(window, cx))
             .track_focus(&self.focus_handle)
             .relative()
             .size_full()
@@ -949,6 +1287,17 @@ impl Render for AppView {
                                 )
                             })
                             .child(
+                                Button::new("toggle-script-dock")
+                                    .ghost()
+                                    .small()
+                                    .icon(console_icon)
+                                    .tooltip(console_tooltip)
+                                    .selected(console_open)
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.toggle_script_dock(window, cx);
+                                    })),
+                            )
+                            .child(
                                 Button::new("toggle-edits-dock")
                                     .ghost()
                                     .small()
@@ -991,204 +1340,145 @@ impl AppView {
     }
 }
 
+pub(crate) fn dispatch_command(command_id: &str, cx: &mut App) -> Result<(), String> {
+    if command_id == "file.quit" {
+        cx.quit();
+        return Ok(());
+    }
+    let Some(view) = cx.try_global::<OpenTarget>().map(|target| target.0.clone()) else {
+        return Err("application is not ready".into());
+    };
+    let Some(window) = cx.active_window() else {
+        return Err("no active window".into());
+    };
+    let command_id = command_id.to_string();
+    // Menu and key handlers run inside an update. Defer so path prompts and
+    // nested view updates are not attempted on the same tick.
+    cx.defer(move |cx| {
+        let _ = window.update(cx, |_, window, cx| {
+            view.update(cx, |this, cx| this.invoke_command(&command_id, window, cx))
+        });
+    });
+    Ok(())
+}
+
 fn quit(_: &Quit, cx: &mut App) {
-    cx.quit();
+    let _ = crate::commands::dispatch("file.quit", cx);
 }
 
 fn open(_: &Open, cx: &mut App) {
-    let Some(view) = cx.try_global::<OpenTarget>().map(|target| target.0.clone()) else {
-        return;
-    };
-    let Some(window) = cx.active_window() else {
-        return;
-    };
-    cx.defer(move |cx| {
-        let _ = window.update(cx, |_, window, cx| {
-            view.update(cx, |this, cx| {
-                this.prompt_open_file(window, cx);
-            });
-        });
-    });
+    let _ = crate::commands::dispatch("file.open", cx);
 }
 
 fn about(_: &About, cx: &mut App) {
-    let Some(window) = cx.active_window().and_then(|w| w.downcast::<Root>()) else {
-        return;
-    };
-    cx.defer(move |cx| {
-        let _ = window.update(cx, |_, window, cx| {
-            window.defer(cx, |window, cx| {
-                window.open_alert_dialog(cx, |alert, _, _| {
-                    alert.title("About snd-review").description(format!(
-                        "{}\n\nVersion {}",
-                        env!("CARGO_PKG_DESCRIPTION"),
-                        env!("CARGO_PKG_VERSION"),
-                    ))
-                });
-            });
-        });
-    });
-}
-
-fn with_app_view(cx: &mut App, f: impl FnOnce(&mut AppView, &mut Context<AppView>)) {
-    let Some(view) = cx.try_global::<OpenTarget>().map(|target| target.0.clone()) else {
-        return;
-    };
-    view.update(cx, f);
+    let _ = crate::commands::dispatch("help.about", cx);
 }
 
 fn transport_home(_: &TransportHome, cx: &mut App) {
-    with_app_view(cx, |this, cx| {
-        this.playback.home();
-        this.sync_playback_to_document(cx);
-    });
+    let _ = crate::commands::dispatch("transport.home", cx);
 }
 
 fn transport_previous(_: &TransportPrevious, cx: &mut App) {
-    with_app_view(cx, |this, cx| {
-        this.playback.previous();
-        this.sync_playback_to_document(cx);
-    });
+    let _ = crate::commands::dispatch("transport.previous", cx);
 }
 
 fn transport_start(_: &TransportStart, cx: &mut App) {
-    with_app_view(cx, |this, cx| {
-        this.playback.start();
-        this.sync_playback_to_document(cx);
-    });
+    let _ = crate::commands::dispatch("transport.start", cx);
 }
 
 fn transport_play_pause(_: &TransportPlayPause, cx: &mut App) {
-    with_app_view(cx, |this, cx| {
-        this.playback.toggle_play_pause();
-        this.sync_playback_to_document(cx);
-    });
+    let _ = crate::commands::dispatch("transport.play_pause", cx);
 }
 
 fn transport_stop(_: &TransportStop, cx: &mut App) {
-    with_app_view(cx, |this, cx| {
-        this.playback.stop();
-        this.sync_playback_to_document(cx);
-    });
+    let _ = crate::commands::dispatch("transport.stop", cx);
 }
 
 fn transport_next(_: &TransportNext, cx: &mut App) {
-    with_app_view(cx, |this, cx| {
-        this.playback.next();
-        this.sync_playback_to_document(cx);
-    });
+    let _ = crate::commands::dispatch("transport.next", cx);
 }
 
 fn transport_end(_: &TransportEnd, cx: &mut App) {
-    with_app_view(cx, |this, cx| {
-        this.playback.end();
-        this.sync_playback_to_document(cx);
-    });
+    let _ = crate::commands::dispatch("transport.end", cx);
 }
 
 fn transport_loop(_: &TransportLoop, cx: &mut App) {
-    with_app_view(cx, |this, cx| {
-        this.playback.toggle_loop();
-        cx.notify();
-    });
+    let _ = crate::commands::dispatch("transport.loop", cx);
 }
 
 fn view_fit_all(_: &ViewFitAll, cx: &mut App) {
-    with_app_view(cx, |this, cx| {
-        if let Some(views) = this.active_views() {
-            views.waveform.update(cx, |view, cx| view.fit(cx));
-        }
-    });
+    let _ = crate::commands::dispatch("view.fit_all", cx);
 }
 
 fn view_frame(_: &ViewFrame, cx: &mut App) {
-    with_app_view(cx, |this, cx| {
-        if let Some(views) = this.active_views() {
-            views.waveform.update(cx, |view, cx| view.frame(cx));
-        }
-    });
+    let _ = crate::commands::dispatch("view.frame", cx);
 }
 
 fn view_zoom_in(_: &ViewZoomIn, cx: &mut App) {
-    with_app_view(cx, |this, cx| {
-        if let Some(views) = this.active_views() {
-            views.waveform.update(cx, |view, cx| view.zoom_in(cx));
-        }
-    });
+    let _ = crate::commands::dispatch("view.zoom_in", cx);
 }
 
 fn view_zoom_out(_: &ViewZoomOut, cx: &mut App) {
-    with_app_view(cx, |this, cx| {
-        if let Some(views) = this.active_views() {
-            views.waveform.update(cx, |view, cx| view.zoom_out(cx));
-        }
-    });
+    let _ = crate::commands::dispatch("view.zoom_out", cx);
 }
 
-fn with_edit(cx: &mut App, f: impl FnOnce(&mut BufferDocument)) {
-    with_app_view(cx, |this, cx| {
-        let Some(views) = this.active_views() else {
-            return;
-        };
-        views.document.update(cx, |doc, cx| {
-            f(doc);
-            cx.notify();
-        });
-        this.playback.sync_from_document(views.document.read(cx));
-        this.refresh_explorer(cx);
-        cx.notify();
-    });
+fn view_explorer(_: &ViewExplorer, cx: &mut App) {
+    let _ = crate::commands::dispatch("view.explorer", cx);
+}
+
+fn view_history(_: &ViewHistory, cx: &mut App) {
+    let _ = crate::commands::dispatch("view.history", cx);
+}
+
+fn view_script(_: &ViewScript, cx: &mut App) {
+    let _ = crate::commands::dispatch("view.script", cx);
 }
 
 fn edit_undo(_: &EditUndo, cx: &mut App) {
-    with_edit(cx, |doc| {
-        doc.edit_undo();
-    });
+    let _ = crate::commands::dispatch("edit.undo", cx);
 }
 
 fn edit_redo(_: &EditRedo, cx: &mut App) {
-    with_edit(cx, |doc| {
-        doc.edit_redo();
-    });
+    let _ = crate::commands::dispatch("edit.redo", cx);
 }
 
 fn edit_cut(_: &EditCut, cx: &mut App) {
-    with_edit(cx, |doc| doc.edit_cut());
+    let _ = crate::commands::dispatch("edit.cut", cx);
 }
 
 fn edit_copy(_: &EditCopy, cx: &mut App) {
-    with_edit(cx, |doc| doc.edit_copy());
+    let _ = crate::commands::dispatch("edit.copy", cx);
 }
 
 fn edit_paste(_: &EditPaste, cx: &mut App) {
-    with_edit(cx, |doc| doc.edit_paste());
+    let _ = crate::commands::dispatch("edit.paste", cx);
 }
 
 fn edit_delete(_: &EditDelete, cx: &mut App) {
-    with_edit(cx, |doc| doc.edit_delete());
+    let _ = crate::commands::dispatch("edit.delete", cx);
 }
 
 fn edit_remove(_: &EditRemove, cx: &mut App) {
-    with_edit(cx, |doc| doc.edit_remove());
+    let _ = crate::commands::dispatch("edit.remove", cx);
 }
 
 fn edit_duplicate(_: &EditDuplicate, cx: &mut App) {
-    with_edit(cx, |doc| doc.edit_duplicate());
+    let _ = crate::commands::dispatch("edit.duplicate", cx);
 }
 
 fn edit_trim(_: &EditTrim, cx: &mut App) {
-    with_edit(cx, |doc| doc.edit_trim());
+    let _ = crate::commands::dispatch("edit.trim", cx);
 }
 
 fn edit_roll_left(_: &EditRollLeft, cx: &mut App) {
-    with_edit(cx, |doc| doc.edit_roll(-1));
+    let _ = crate::commands::dispatch("edit.roll_left", cx);
 }
 
 fn edit_roll_right(_: &EditRollRight, cx: &mut App) {
-    with_edit(cx, |doc| doc.edit_roll(1));
+    let _ = crate::commands::dispatch("edit.roll_right", cx);
 }
 
-fn app_menus() -> Vec<Menu> {
+fn app_menus(explorer: bool, history: bool, script: bool) -> Vec<Menu> {
     vec![
         Menu::new("File").items([
             MenuItem::action("Open...", Open),
@@ -1212,12 +1502,25 @@ fn app_menus() -> Vec<Menu> {
             MenuItem::action("Roll Source Right", EditRollRight),
         ]),
         Menu::new("View").items([
+            MenuItem::action("Explorer", ViewExplorer).checked(explorer),
+            MenuItem::action("History", ViewHistory).checked(history),
+            MenuItem::action("Script", ViewScript).checked(script),
+            MenuItem::separator(),
             MenuItem::action("Zoom In", ViewZoomIn),
             MenuItem::action("Zoom Out", ViewZoomOut),
             MenuItem::action("Reset View", ViewFitAll),
         ]),
         Menu::new("Help").items([MenuItem::action("About...", About)]),
     ]
+}
+
+fn apply_app_menus(explorer: bool, history: bool, script: bool, cx: &mut App) {
+    cx.set_menus(app_menus(explorer, history, script));
+    let owned = app_menus(explorer, history, script)
+        .into_iter()
+        .map(|menu| menu.owned())
+        .collect();
+    GlobalState::global_mut(cx).set_app_menus(owned);
 }
 
 fn install_app_menu(cx: &mut App) {
@@ -1236,6 +1539,9 @@ fn install_app_menu(cx: &mut App) {
     cx.on_action(view_frame);
     cx.on_action(view_zoom_in);
     cx.on_action(view_zoom_out);
+    cx.on_action(view_explorer);
+    cx.on_action(view_history);
+    cx.on_action(view_script);
     cx.on_action(edit_undo);
     cx.on_action(edit_redo);
     cx.on_action(edit_cut);
@@ -1248,9 +1554,7 @@ fn install_app_menu(cx: &mut App) {
     cx.on_action(edit_roll_left);
     cx.on_action(edit_roll_right);
     install_keybindings(cx);
-    cx.set_menus(app_menus());
-    let owned = app_menus().into_iter().map(|menu| menu.owned()).collect();
-    GlobalState::global_mut(cx).set_app_menus(owned);
+    apply_app_menus(false, false, false, cx);
     cx.activate(true);
 }
 

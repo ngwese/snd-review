@@ -7,13 +7,13 @@ use std::sync::Arc;
 use gpui::{
     div, prelude::FluentBuilder as _, rems, AnyElement, AnyView, App, AppContext as _, Axis, Div,
     Entity, Global, InteractiveElement as _, IntoElement, ParentElement as _, SharedString,
-    Stateful, StatefulInteractiveElement as _, Styled as _, WeakEntity, Window,
+    Stateful, StatefulInteractiveElement as _, Styled as _, Window,
 };
 use gpui_component::{
     button::{Button, ButtonVariants as _},
     dock::{
-        BasePanelView, DockArea, DockAreaRenderer, DockContext, DockPlacement, DockSkin, NodeId,
-        PanelHandle, TabGroupContext, TabGroupRenderer, TilesRenderer,
+        BasePanelView, DockArea, DockAreaRenderer, DockContext, DockSkin, NodeId, PanelHandle,
+        TabGroupContext, TabGroupRenderer, TilesRenderer,
     },
     h_flex,
     tab::{Tab, TabBar},
@@ -30,7 +30,6 @@ impl Global for CenterTabCloseHandler {}
 /// Dock appearance with small tabs, built on [`DockSkin`].
 pub struct CompactDockSkin {
     skin: Rc<DockSkin>,
-    area: WeakEntity<DockArea>,
 }
 
 impl CompactDockSkin {
@@ -44,11 +43,8 @@ impl CompactDockSkin {
         let area = cx.new(|cx| {
             let this = DockSkin::new(cx);
             skin = Some(this.clone());
-            DockArea::new(id, version, window, cx).with_renderer(Rc::new(Self {
-                skin: this,
-                area: cx.weak_entity(),
-            })
-                as Rc<dyn DockAreaRenderer>)
+            DockArea::new(id, version, window, cx)
+                .with_renderer(Rc::new(Self { skin: this }) as Rc<dyn DockAreaRenderer>)
         });
         (
             area,
@@ -89,7 +85,6 @@ impl DockAreaRenderer for CompactDockSkin {
     fn tab_group_renderer(&self) -> Rc<dyn TabGroupRenderer> {
         Rc::new(CompactTabGroup {
             inner: DockAreaRenderer::tab_group_renderer(self.skin.as_ref()),
-            area: self.area.clone(),
         })
     }
 
@@ -100,26 +95,21 @@ impl DockAreaRenderer for CompactDockSkin {
 
 struct CompactTabGroup {
     inner: Rc<dyn TabGroupRenderer>,
-    area: WeakEntity<DockArea>,
 }
 
 impl CompactTabGroup {
-    fn is_right_dock_group(&self, group: &TabGroupContext, cx: &App) -> bool {
-        self.area.upgrade().is_some_and(|area| {
-            area.read(cx)
-                .layout(DockPlacement::Right)
-                .and_then(|tree| tree.find_node(group.node()))
-                .is_some()
-        })
-    }
-
-    fn is_left_dock_group(&self, group: &TabGroupContext, cx: &App) -> bool {
-        self.area.upgrade().is_some_and(|area| {
-            area.read(cx)
-                .layout(DockPlacement::Left)
-                .and_then(|tree| tree.find_node(group.node()))
-                .is_some()
-        })
+    fn is_tool_dock_group(&self, group: &TabGroupContext, cx: &App) -> bool {
+        let panels = group.panels();
+        if panels.is_empty() {
+            return false;
+        }
+        if panels
+            .iter()
+            .all(|panel| panel.panel_name(cx) == "EmptyEditorsPanel")
+        {
+            return false;
+        }
+        panels.iter().all(|panel| !panel.closable(cx))
     }
 
     fn panel_title(
@@ -196,7 +186,7 @@ impl CompactTabGroup {
 impl TabGroupRenderer for CompactTabGroup {
     fn frame(&self, group: &TabGroupContext, window: &mut Window, cx: &mut App) -> Stateful<Div> {
         let frame = self.inner.frame(group, window, cx);
-        if self.is_right_dock_group(group, cx) || self.is_left_dock_group(group, cx) {
+        if self.is_tool_dock_group(group, cx) {
             frame.px(rems(0.5))
         } else {
             frame
@@ -218,7 +208,7 @@ impl TabGroupRenderer for CompactTabGroup {
         window: &mut Window,
         cx: &mut App,
     ) -> AnyElement {
-        if self.is_right_dock_group(group, cx) || self.is_left_dock_group(group, cx) {
+        if self.is_tool_dock_group(group, cx) {
             return self.render_side_tab_bar(group, window, cx);
         }
 
