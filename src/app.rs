@@ -187,6 +187,7 @@ impl AppView {
             );
             area.set_dock_size(DockPlacement::Left, px(220.), window, cx);
             area.set_dock_collapsible(DockPlacement::Left, true, window, cx);
+            area.toggle_dock(DockPlacement::Left, window, cx);
             area.set_dock(
                 DockPlacement::Right,
                 DockLayout::tabs()
