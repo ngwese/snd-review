@@ -5,6 +5,7 @@ pub mod dock_skin;
 pub mod edits;
 pub mod empty_pane;
 pub mod explorer;
+pub mod header_meta;
 pub mod repl;
 pub mod status_bar;
 pub mod transport;

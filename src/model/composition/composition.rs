@@ -215,7 +215,6 @@ impl Composition {
 
     fn commit(&mut self, op: EditOp, tree: ClipTree) {
         self.tree = tree;
-        let _ = self.ensure_clip_peaks();
         self.edl.push(op, self.tree.clone());
     }
 
@@ -249,7 +248,6 @@ impl Composition {
     fn adopt_tree(&mut self, tree: ClipTree) {
         let tree = self.tree_with_initial_media(tree);
         self.tree = tree;
-        let _ = self.ensure_clip_peaks();
     }
 
     fn rebuild_from_initial_media(&self) -> Option<ClipTree> {
@@ -1050,22 +1048,22 @@ mod tests {
     }
 
     #[test]
-    fn unaligned_delete_rebuilds_right_peak_cache() {
+    fn unaligned_delete_keeps_right_peak_cache() {
         let block = crate::audio::PEAK_BLOCK as u64;
         let mut comp = Composition::from_media(sine_media((block * 4) as usize, 1, 44100)).unwrap();
         assert!(!comp.needs_peak_build());
         comp.delete(block + 7, 5);
-        assert!(!comp.needs_peak_build());
+        assert!(
+            !comp.needs_peak_build(),
+            "delete should reuse suffix peak bins instead of rebuilding"
+        );
         let right = comp
             .spans()
             .into_iter()
             .rev()
             .find(|span| span.clip.source.is_some())
             .unwrap();
-        assert!(
-            !right.clip.cache.is_missing_peaks(),
-            "unaligned split must rebuild the right fragment, not leave empty bins"
-        );
+        assert!(!right.clip.cache.is_missing_peaks());
         let (min, max) =
             comp.min_max_in_range(0, right.start as f64, (right.start + right.clip.len) as f64);
         assert!(max > min);

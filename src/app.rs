@@ -38,12 +38,12 @@ use crate::components::dock_skin::{CenterTabCloseHandler, CompactDockSkin};
 use crate::components::edits::EditsPanel;
 use crate::components::empty_pane::EmptyPane;
 use crate::components::explorer::{ExplorerEvent, ExplorerPanel};
+use crate::components::header_meta::HeaderMeta;
 use crate::components::repl::ReplPanel;
 use crate::components::status_bar::{FileStatus, FileStatusBar};
 use crate::components::waveform::{ToggleZeroCrossing, WaveformDisplay};
 use crate::components::workspace::WorkspacePanel;
 use crate::model::composition::Composition;
-use crate::model::selection::Selection;
 use crate::model::{Buffer, BufferDocument};
 use crate::playback::{PlaybackSession, TransportState};
 use crate::progress::ProgressState;
@@ -69,6 +69,7 @@ pub struct AppView {
     dock_area: Entity<DockArea>,
     explorer: Entity<ExplorerPanel>,
     edits: Entity<EditsPanel>,
+    header_meta: Entity<HeaderMeta>,
     empty_editors: Entity<EmptyPane>,
     repl: Entity<ReplPanel>,
     script: ScriptHost,
@@ -80,7 +81,6 @@ pub struct AppView {
     focus_handle: FocusHandle,
     last_progress: Option<ProgressState>,
     script_dock_size: Pixels,
-    last_waveform_hover: Option<usize>,
     last_waveform_over: bool,
 }
 
@@ -103,30 +103,24 @@ impl AppView {
                 this.update(cx, |this, cx| {
                     this.drain_pending_opens(window, cx);
                     this.drain_pending_load(window, cx);
-                    let mut dirty = false;
                     if let Some(views) = this.active_views() {
                         views.document.update(cx, |doc, cx| {
                             if this.playback.poll(doc) {
-                                dirty = true;
                                 cx.notify();
                             }
                         });
                         let progress = views.document.read(cx).progress.snapshot();
                         if progress != this.last_progress {
                             this.last_progress = progress;
-                            dirty = true;
                             views.waveform.update(cx, |_, cx| cx.notify());
                         }
+                        let transport = this.playback.transport_state();
                         views.workspace.update(cx, |workspace, cx| {
-                            workspace.sync_transport(
-                                this.playback.transport_state(),
-                                this.playback.looping(),
-                                cx,
-                            );
+                            workspace.sync_transport(transport, this.playback.looping(), cx);
                         });
-                    }
-                    if dirty {
-                        cx.notify();
+                        this.header_meta.update(cx, |meta, cx| {
+                            meta.set_transport(transport, cx);
+                        });
                     }
                 })
             });
@@ -166,10 +160,14 @@ impl AppView {
                 .with_message("Drop an audio file here or use File → Open…")
         });
         let initial_target = session.active().and_then(|id| views.get(&id).cloned());
+        let header_meta = cx.new(|cx| HeaderMeta::new(cx));
         let edits = cx.new(|cx| EditsPanel::new(cx));
         if let Some(views) = initial_target {
             edits.update(cx, |edits, cx| {
-                edits.set_target(views.document, views.waveform, cx);
+                edits.set_target(views.document.clone(), views.waveform.clone(), cx);
+            });
+            header_meta.update(cx, |meta, cx| {
+                meta.set_target(Some(views.document), Some(views.waveform), cx);
             });
         }
         let transients = cx.new(|cx| EmptyPane::new("TransientsPanel", "Transients", cx));
@@ -237,6 +235,7 @@ impl AppView {
             dock_area,
             explorer,
             edits,
+            header_meta,
             empty_editors,
             repl,
             script,
@@ -248,7 +247,6 @@ impl AppView {
             focus_handle: cx.focus_handle(),
             last_progress: None,
             script_dock_size: px(160.),
-            last_waveform_hover: None,
             last_waveform_over: false,
         };
         this.load_init_lua(window, cx);
@@ -270,18 +268,16 @@ impl AppView {
         cx.observe(&document, move |this, entity, cx| {
             if this.session.active() == Some(id) {
                 this.playback.sync_from_document(entity.read(cx));
-                cx.notify();
+                this.spawn_peak_build(id, cx);
             }
         })
         .detach();
         let waveform = cx.new(|cx| WaveformDisplay::new(document.clone(), cx));
         cx.observe(&waveform, |this, waveform, cx| {
-            let hover = waveform.read(cx).hover_sample();
             let over = waveform.read(cx).pointer_over();
-            if this.last_waveform_hover == hover && this.last_waveform_over == over {
+            if this.last_waveform_over == over {
                 return;
             }
-            this.last_waveform_hover = hover;
             this.last_waveform_over = over;
             cx.notify();
         })
@@ -415,13 +411,19 @@ impl AppView {
             self.playback.bind_composition(views.composition);
             self.playback.sync_from_document(views.document.read(cx));
             self.edits.update(cx, |edits, cx| {
-                edits.set_target(views.document, views.waveform, cx);
+                edits.set_target(views.document.clone(), views.waveform.clone(), cx);
+            });
+            self.header_meta.update(cx, |meta, cx| {
+                meta.set_target(Some(views.document), Some(views.waveform), cx);
             });
         } else {
             self.playback
                 .bind_composition(self.idle_composition.clone());
             self.playback.reload(&Buffer::empty());
             self.edits.update(cx, |edits, cx| edits.clear_target(cx));
+            self.header_meta.update(cx, |meta, cx| {
+                meta.set_target(None, None, cx);
+            });
         }
         self.refresh_explorer(cx);
         self.update_window_title(window, cx);
@@ -939,7 +941,6 @@ impl AppView {
         self.playback.sync_from_document(views.document.read(cx));
         self.refresh_explorer(cx);
         self.spawn_peak_build(id, cx);
-        cx.notify();
     }
 
     fn spawn_peak_build(&self, id: DocumentId, cx: &mut Context<Self>) {
@@ -1066,61 +1067,6 @@ impl AppView {
     }
 }
 
-fn format_secs(secs: f64) -> String {
-    if secs.is_nan() || secs.is_infinite() {
-        return "0.000000s".into();
-    }
-    format!("{secs:.6}s")
-}
-
-fn transport_state_label(state: TransportState) -> &'static str {
-    match state {
-        TransportState::Stopped => "Stopped",
-        TransportState::Playing => "Playing",
-        TransportState::Paused => "Paused",
-    }
-}
-
-fn format_hover_meta(doc: &BufferDocument, sample: usize) -> String {
-    format!(
-        "hover {}  ·  {sample} smp",
-        format_secs(doc.sample_to_secs(sample))
-    )
-}
-
-fn format_header_meta(doc: &BufferDocument, transport: TransportState) -> String {
-    if !doc.is_loaded() {
-        return format!("No file open  ·  {}", transport_state_label(transport));
-    }
-
-    let mut parts = vec![transport_state_label(transport).to_string()];
-
-    if let Some(pos) = &doc.current_position {
-        parts.push(format!(
-            "pos {}",
-            format_secs(doc.sample_to_secs(pos.sample))
-        ));
-    }
-
-    if let Selection::Region { start, end, .. } = &doc.selection {
-        if end > start {
-            let start_secs = doc.sample_to_secs(*start);
-            let end_secs = doc.sample_to_secs(*end);
-            let len_samples = end - start + 1;
-            let len_secs = len_samples as f64 / f64::from(doc.sample_rate().max(1));
-            parts.push(format!(
-                "region {}–{}",
-                format_secs(start_secs),
-                format_secs(end_secs)
-            ));
-            parts.push(format!("len {}", format_secs(len_secs)));
-            parts.push(format!("{len_samples} smp"));
-        }
-    }
-
-    parts.join("  ·  ")
-}
-
 impl AppView {
     fn app_key_context(&self, window: &mut Window, cx: &mut App) -> KeyContext {
         let mut context = KeyContext::parse("App").expect("App key context");
@@ -1138,21 +1084,7 @@ impl AppView {
 impl Render for AppView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
-        let transport_state = self.playback.transport_state();
         let views = self.active_views();
-        let meta = views
-            .as_ref()
-            .map(|views| format_header_meta(views.document.read(cx), transport_state))
-            .unwrap_or_else(|| {
-                format!(
-                    "No file open  ·  {}",
-                    transport_state_label(transport_state)
-                )
-            });
-        let hover_meta = views.as_ref().and_then(|views| {
-            let sample = views.waveform.read(cx).hover_sample()?;
-            Some(format_hover_meta(views.document.read(cx), sample))
-        });
         let file_status = views
             .as_ref()
             .and_then(|views| FileStatus::from_composition(&views.composition.read().unwrap()));
@@ -1266,26 +1198,7 @@ impl Render for AppView {
                                         this.toggle_explorer_dock(window, cx);
                                     })),
                             )
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .text_sm()
-                                    .text_color(theme.muted_foreground)
-                                    .whitespace_nowrap()
-                                    .overflow_hidden()
-                                    .child(meta),
-                            )
-                            .when_some(hover_meta, |this, hover_meta| {
-                                this.child(
-                                    div()
-                                        .flex_none()
-                                        .text_sm()
-                                        .text_color(theme.muted_foreground)
-                                        .whitespace_nowrap()
-                                        .child(hover_meta),
-                                )
-                            })
+                            .child(self.header_meta.clone())
                             .child(
                                 Button::new("toggle-script-dock")
                                     .ghost()
@@ -1336,7 +1249,10 @@ impl AppView {
                 cx.notify();
             });
         }
-        cx.notify();
+        let transport = self.playback.transport_state();
+        self.header_meta.update(cx, |meta, cx| {
+            meta.set_transport(transport, cx);
+        });
     }
 }
 

@@ -39,10 +39,8 @@ impl ClipCache {
         self.min.is_none() && self.peaks.is_empty()
     }
 
-    /// True when overview bins are absent or a channel was left empty after a
-    /// split. An unaligned split keeps the outer `peaks` vec (so
-    /// `peaks.is_empty()` is false) but pushes empty per-channel vecs on the
-    /// right fragment.
+    /// True when overview bins are absent or a channel vec was left empty.
+    /// Initial load and roll clear the cache; splits keep suffix bins.
     pub fn is_missing_peaks(&self) -> bool {
         self.peaks.is_empty() || self.peaks.iter().any(|channel| channel.is_empty())
     }
@@ -50,22 +48,17 @@ impl ClipCache {
     pub fn split(&self, at: u64) -> (Self, Self) {
         let at = at as usize;
         let block = crate::audio::PEAK_BLOCK;
-        let aligned = at % block == 0;
         let bin = at / block;
         let mut left_peaks = Vec::with_capacity(self.peaks.len());
         let mut right_peaks = Vec::with_capacity(self.peaks.len());
         for channel in &self.peaks {
             let split = bin.min(channel.len());
             left_peaks.push(channel[..split].to_vec());
-            // Peak bins are aligned to the original clip origin. Reusing the
-            // suffix when `at` is not a block boundary would phase-shift the
-            // overview by up to PEAK_BLOCK samples. Leave the channel empty so
-            // `needs_peak_build` / `ensure_clip_peaks` rebuild from source.
-            if aligned {
-                right_peaks.push(channel[split..].to_vec());
-            } else {
-                right_peaks.push(Vec::new());
-            }
+            // Bins stay aligned to the pre-split origin. Reusing the suffix
+            // after an unaligned cut phase-shifts overview by at most one
+            // PEAK_BLOCK (sub-pixel at typical zoom). Rebuilding the rest of
+            // the file from PCM is much more expensive.
+            right_peaks.push(channel[split..].to_vec());
         }
         (
             Self {
@@ -289,13 +282,13 @@ mod tests {
         assert_eq!(left.fade_out, 0);
         assert_eq!(right.fade_out, 2);
         assert_eq!(left.cache.peaks[0].len(), 0);
-        assert!(right.cache.peaks[0].is_empty());
-        assert!(right.cache.min.is_none());
-        assert!(right.cache.max.is_none());
+        assert_eq!(right.cache.peaks[0], [(-0.4, 0.1), (-0.2, 0.5)]);
+        assert!(right.cache.min.is_some());
+        assert!(right.cache.max.is_some());
     }
 
     #[test]
-    fn split_drops_unaligned_right_peaks() {
+    fn split_reuses_unaligned_right_peaks() {
         let block = crate::audio::PEAK_BLOCK as u64;
         let clip = Clip {
             id: ClipId(1),
@@ -315,11 +308,9 @@ mod tests {
         };
         let (left, right) = clip.split(block + 4, ClipId(2));
         assert_eq!(left.cache.peaks[0], [(-1.0, 0.2)]);
-        assert!(right.cache.peaks[0].is_empty());
+        assert_eq!(right.cache.peaks[0], [(-0.3, 1.0)]);
         assert!(!left.needs_peak_cache());
-        assert!(right.needs_peak_cache());
-        assert!(right.cache.is_missing_peaks());
-        assert!(!right.cache.peaks.is_empty());
+        assert!(!right.needs_peak_cache());
     }
 
     #[test]

@@ -19,6 +19,7 @@ pub struct EditsPanel {
     document: Option<Entity<BufferDocument>>,
     waveform: Option<Entity<WaveformDisplay>>,
     focus_handle: FocusHandle,
+    last_history: Option<(u64, usize)>,
     _document_observe: Option<Subscription>,
 }
 
@@ -28,8 +29,15 @@ impl EditsPanel {
             document: None,
             waveform: None,
             focus_handle: cx.focus_handle(),
+            last_history: None,
             _document_observe: None,
         }
+    }
+
+    fn history_fingerprint(&self, cx: &App) -> Option<(u64, usize)> {
+        let document = self.document.as_ref()?;
+        let composition = document.read(cx).composition.read().unwrap();
+        Some((composition.current_edit().0, composition.edits().len()))
     }
 
     pub fn set_target(
@@ -40,8 +48,16 @@ impl EditsPanel {
     ) {
         self.document = Some(document);
         self.waveform = Some(waveform);
+        self.last_history = self.history_fingerprint(cx);
         if let Some(document) = &self.document {
-            self._document_observe = Some(cx.observe(document, |_, _, cx| cx.notify()));
+            self._document_observe = Some(cx.observe(document, |this, _, cx| {
+                let next = this.history_fingerprint(cx);
+                if this.last_history == next {
+                    return;
+                }
+                this.last_history = next;
+                cx.notify();
+            }));
         }
         cx.notify();
     }
@@ -49,6 +65,7 @@ impl EditsPanel {
     pub fn clear_target(&mut self, cx: &mut Context<Self>) {
         self.document = None;
         self.waveform = None;
+        self.last_history = None;
         self._document_observe = None;
         cx.notify();
     }
