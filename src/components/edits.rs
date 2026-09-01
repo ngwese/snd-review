@@ -2,8 +2,9 @@
 // SPDX-License-Identifier: MIT
 
 use gpui::{
-    div, px, App, Context, Entity, EventEmitter, FocusHandle, Focusable, InteractiveElement as _,
-    IntoElement, ParentElement as _, Render, StatefulInteractiveElement as _, Styled as _, Window,
+    div, px, App, ClickEvent, Context, Entity, EventEmitter, FocusHandle, Focusable,
+    InteractiveElement as _, IntoElement, ParentElement as _, Render,
+    StatefulInteractiveElement as _, Styled as _, Window,
 };
 use gpui_component::{
     dock::{BasePanel, Panel, PanelEvent},
@@ -99,7 +100,6 @@ impl Render for EditsPanel {
                 cards
                     .into_iter()
                     .map(|(id, title, detail, current, future)| {
-                        let document = self.document.clone();
                         v_flex()
                             .id(("edit-card", id.0))
                             .w_full()
@@ -127,11 +127,17 @@ impl Render for EditsPanel {
                                     );
                                 });
                             }))
-                            .on_click(cx.listener(move |_, _, _, cx| {
-                                document.update(cx, |doc, cx| {
-                                    doc.jump_to_edit(id);
-                                    cx.notify();
-                                });
+                            .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
+                                if event.click_count() >= 2 {
+                                    this.document.update(cx, |doc, cx| {
+                                        doc.jump_to_edit(id);
+                                        cx.notify();
+                                    });
+                                } else {
+                                    this.waveform.update(cx, |view, cx| {
+                                        view.scroll_edit_into_view(id, cx);
+                                    });
+                                }
                             }))
                             .child(
                                 div()

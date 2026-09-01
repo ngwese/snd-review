@@ -127,6 +127,36 @@ impl WaveformDisplay {
         cx.notify();
     }
 
+    pub fn scroll_edit_into_view(&mut self, id: EditId, cx: &mut Context<Self>) {
+        let (ranges, frames) = {
+            let composition = self.document.read(cx).composition.read().unwrap();
+            (composition.ranges_for_edit(id), composition.frames() as f64)
+        };
+        let before = self.start_sample;
+        if ranges.is_empty() {
+            if id.0 == 0 {
+                apply_scroll_to_frame(
+                    &mut self.start_sample,
+                    self.samples_per_pixel,
+                    self.viewport_width,
+                    frames,
+                    0.0,
+                );
+            }
+        } else {
+            apply_scroll_ranges_into_view(
+                &mut self.start_sample,
+                self.samples_per_pixel,
+                self.viewport_width,
+                frames,
+                &ranges,
+            );
+        }
+        if (self.start_sample - before).abs() > f64::EPSILON {
+            cx.notify();
+        }
+    }
+
     pub fn zoom_in(&mut self, cx: &mut Context<Self>) {
         let anchor = self.anchor_sample(cx);
         self.zoom_at(1.0 / ZOOM_FACTOR, anchor, cx);
@@ -1276,6 +1306,39 @@ fn apply_scroll_to_frame(
     clamp_viewport(start_sample, &mut spp, viewport_width, frames);
 }
 
+fn apply_scroll_ranges_into_view(
+    start_sample: &mut f64,
+    samples_per_pixel: f64,
+    viewport_width: f32,
+    frames: f64,
+    ranges: &[(u64, u64)],
+) {
+    if ranges.is_empty() {
+        return;
+    }
+    let mut spp = samples_per_pixel;
+    let visible = spp * viewport_width.max(1.0) as f64;
+    let view_start = *start_sample;
+    let view_end = view_start + visible;
+    let already_visible = ranges
+        .iter()
+        .any(|&(start, end)| (start as f64) < view_end && (end as f64) > view_start);
+    if already_visible {
+        return;
+    }
+    let (range_start, range_end) = ranges[0];
+    let range_start = range_start as f64;
+    let range_end = range_end as f64;
+    let span = (range_end - range_start).max(1.0);
+    let margin = visible * FRAME_PADDING;
+    if span + 2.0 * margin <= visible {
+        *start_sample = range_start - (visible - span) / 2.0;
+    } else {
+        *start_sample = range_start - margin;
+    }
+    clamp_viewport(start_sample, &mut spp, viewport_width, frames);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1308,6 +1371,25 @@ mod tests {
         let mut start = 4000.0;
         let spp = 10.0;
         apply_scroll_to_frame(&mut start, spp, 100.0, 10_000.0, 4500.0);
+        assert!((start - 4000.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn scroll_ranges_into_view_pans_when_offscreen() {
+        let mut start = 0.0;
+        let spp = 10.0;
+        apply_scroll_ranges_into_view(&mut start, spp, 100.0, 10_000.0, &[(5000, 5100)]);
+        let visible = 1000.0;
+        let span = 100.0;
+        let expected = 5000.0 - (visible - span) / 2.0;
+        assert!((start - expected).abs() < 1e-9);
+    }
+
+    #[test]
+    fn scroll_ranges_into_view_is_noop_when_any_range_visible() {
+        let mut start = 4000.0;
+        let spp = 10.0;
+        apply_scroll_ranges_into_view(&mut start, spp, 100.0, 10_000.0, &[(4500, 4600)]);
         assert!((start - 4000.0).abs() < 1e-9);
     }
 
