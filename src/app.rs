@@ -17,8 +17,8 @@ use gpui_component::{
     dock::{panel_handle, DockArea, DockEvent, DockLayout, DockPlacement, PanelStyle},
     h_flex,
     menu::AppMenuBar,
-    v_flex, ActiveTheme as _, GlobalState, IconName, Root, Selectable as _, Sizable as _, Theme,
-    ThemeMode, WindowExt as _, TITLE_BAR_HEIGHT,
+    v_flex, ActiveTheme as _, GlobalState, Icon, IconName, Root, Selectable as _, Sizable as _,
+    Theme, ThemeMode, TitleBar, WindowExt as _,
 };
 
 use crate::assets::AppAssets;
@@ -415,21 +415,24 @@ impl Render for AppView {
                     .size_full()
                     .bg(theme.background)
                     .text_color(theme.foreground)
-                    .when_some(self.app_menu_bar.clone(), |this, menu_bar| {
-                        this.child(
+                    .child(
+                        TitleBar::new().child(
                             h_flex()
-                                .id("app-menu-bar-row")
-                                .w_full()
-                                .h(TITLE_BAR_HEIGHT)
-                                .flex_none()
+                                .id("app-title-bar-leading")
+                                .h_full()
                                 .items_center()
-                                .px_2()
-                                .border_b_1()
-                                .border_color(theme.border)
-                                .bg(theme.title_bar)
-                                .child(menu_bar),
-                        )
-                    })
+                                .gap_2()
+                                .child(
+                                    Icon::empty()
+                                        .path("icons/app-mark.svg")
+                                        .with_size(px(16.))
+                                        .text_color(theme.foreground),
+                                )
+                                .when_some(self.app_menu_bar.clone(), |this, menu_bar| {
+                                    this.child(menu_bar)
+                                }),
+                        ),
+                    )
                     .child(
                         h_flex()
                             .w_full()
@@ -823,13 +826,15 @@ pub fn run(initial: Option<Composition>, device: Device) {
             let options = WindowOptions {
                 titlebar: Some(TitlebarOptions {
                     title: Some(title.clone()),
-                    ..Default::default()
+                    ..TitleBar::title_bar_options()
                 }),
                 window_bounds: Some(WindowBounds::Windowed(Bounds {
                     origin: point(px(80.), px(80.)),
                     size: size(px(1280.), px(760.)),
                 })),
-                ..Default::default()
+                #[cfg(target_os = "linux")]
+                window_decorations: Some(gpui::WindowDecorations::Client),
+                ..TitleBar::window_options()
             };
 
             cx.open_window(options, move |window, cx| {
