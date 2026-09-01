@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Greg Wuller
 // SPDX-License-Identifier: MIT
 
+use std::io::Read;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::{fs, fs::File, path::Path, time::SystemTime};
@@ -151,6 +152,9 @@ pub fn load_buffer(path: &Path) -> Result<Buffer> {
 pub fn probe_file(path: &Path) -> Result<ProbedFile> {
     let metadata =
         fs::metadata(path).with_context(|| format!("failed to stat {}", path.display()))?;
+    if let Some(probed) = probe_flac_header(path, metadata.len()) {
+        return Ok(probed);
+    }
     let file = File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
     let mss = MediaSourceStream::new(Box::new(file), Default::default());
     let mut hint = Hint::new();
@@ -179,8 +183,9 @@ pub fn probe_file(path: &Path) -> Result<ProbedFile> {
         .map(|ch| ch.count())
         .unwrap_or(0);
     let bits_per_sample = codec_bits_per_sample(&track.codec_params);
-    if let Some(frame_count) = track.codec_params.n_frames {
-        if sample_rate != 0 && channel_count != 0 && frame_count > 0 {
+    let frame_count = track.codec_params.n_frames.filter(|n| *n > 0);
+    if let Some(frame_count) = frame_count {
+        if sample_rate != 0 && channel_count != 0 {
             return Ok(ProbedFile {
                 path: path.to_path_buf(),
                 sample_rate,
@@ -421,6 +426,66 @@ fn decode_with_meta(path: &Path) -> Result<(DecodedAudio, DecodeMeta)> {
     ))
 }
 
+/// Native FLAC stores rate, channels, and length in STREAMINFO. Reading that
+/// header avoids a container probe that can hitch on large files.
+fn probe_flac_header(path: &Path, size_bytes: u64) -> Option<ProbedFile> {
+    let ext = path.extension().and_then(|e| e.to_str())?;
+    if !ext.eq_ignore_ascii_case("flac") {
+        return None;
+    }
+    let info = parse_flac_streaminfo(path)?;
+    Some(ProbedFile {
+        path: path.to_path_buf(),
+        sample_rate: info.sample_rate,
+        channel_count: info.channel_count,
+        frame_count: info.frame_count,
+        bits_per_sample: info.bits_per_sample,
+        size_bytes,
+        samples: None,
+    })
+}
+
+struct FlacStreaminfo {
+    sample_rate: u32,
+    channel_count: usize,
+    bits_per_sample: Option<u32>,
+    frame_count: u64,
+}
+
+fn parse_flac_streaminfo(path: &Path) -> Option<FlacStreaminfo> {
+    let mut file = File::open(path).ok()?;
+    let mut magic = [0u8; 4];
+    file.read_exact(&mut magic).ok()?;
+    if &magic != b"fLaC" {
+        return None;
+    }
+    let mut block_hdr = [0u8; 4];
+    file.read_exact(&mut block_hdr).ok()?;
+    if block_hdr[0] & 0x7f != 0 {
+        return None;
+    }
+    let len = u32::from_be_bytes([0, block_hdr[1], block_hdr[2], block_hdr[3]]) as usize;
+    if len < 18 {
+        return None;
+    }
+    let mut payload = vec![0u8; len];
+    file.read_exact(&mut payload).ok()?;
+    let packed = u64::from_be_bytes(payload[10..18].try_into().ok()?);
+    let sample_rate = (packed >> 44) as u32;
+    let channel_count = ((packed >> 41) & 7) as usize + 1;
+    let bits = ((packed >> 36) & 0x1f) as u32 + 1;
+    let frame_count = packed & ((1u64 << 36) - 1);
+    if sample_rate == 0 || channel_count == 0 || frame_count == 0 {
+        return None;
+    }
+    Some(FlacStreaminfo {
+        sample_rate,
+        channel_count,
+        bits_per_sample: Some(bits),
+        frame_count,
+    })
+}
+
 fn codec_bits_per_sample(params: &CodecParameters) -> Option<u32> {
     params
         .bits_per_sample
@@ -644,6 +709,30 @@ mod tests {
         for (a, b) in slice[0].iter().zip(full.channels[0][100..150].iter()) {
             assert!((a - b).abs() < 1e-4);
         }
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn flac_header_probe_skips_decode() {
+        let sample_rate: u64 = 44100;
+        let channels_m1: u64 = 1;
+        let bps_m1: u64 = 15;
+        let total: u64 = 12_345;
+        let packed = (sample_rate << 44) | (channels_m1 << 41) | (bps_m1 << 36) | total;
+        let mut payload = [0u8; 34];
+        payload[10..18].copy_from_slice(&packed.to_be_bytes());
+        let mut bytes = Vec::from(b"fLaC".as_slice());
+        bytes.push(0x80);
+        bytes.extend_from_slice(&34u32.to_be_bytes()[1..]);
+        bytes.extend_from_slice(&payload);
+        let path = std::env::temp_dir().join("snd-flac-streaminfo-header.flac");
+        std::fs::write(&path, &bytes).unwrap();
+        let probed = probe_file(&path).unwrap();
+        assert_eq!(probed.sample_rate, 44100);
+        assert_eq!(probed.channel_count, 2);
+        assert_eq!(probed.bits_per_sample, Some(16));
+        assert_eq!(probed.frame_count, total);
+        assert!(probed.samples.is_none());
         let _ = std::fs::remove_file(path);
     }
 

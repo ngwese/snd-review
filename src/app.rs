@@ -47,7 +47,6 @@ impl Global for OpenTarget {}
 pub struct AppView {
     composition: Arc<RwLock<Composition>>,
     buffer: Arc<RwLock<Buffer>>,
-    device: Device,
     document: Entity<BufferDocument>,
     waveform: Entity<WaveformDisplay>,
     workspace: Entity<WorkspacePanel>,
@@ -55,6 +54,7 @@ pub struct AppView {
     playback: PlaybackSession,
     app_menu_bar: Option<Entity<AppMenuBar>>,
     pending_opens: Arc<Mutex<Vec<PathBuf>>>,
+    pending_load: Arc<Mutex<Option<(u64, Result<Composition, String>)>>>,
     focus_handle: FocusHandle,
     last_progress: Option<ProgressState>,
 }
@@ -63,7 +63,6 @@ impl AppView {
     fn new(
         composition: Arc<RwLock<Composition>>,
         buffer: Arc<RwLock<Buffer>>,
-        device: Device,
         document: Entity<BufferDocument>,
         playback: PlaybackSession,
         pending_opens: Arc<Mutex<Vec<PathBuf>>>,
@@ -84,6 +83,7 @@ impl AppView {
             let still_alive = cx.update(|window, cx| {
                 this.update(cx, |this, cx| {
                     this.drain_pending_opens(window, cx);
+                    this.drain_pending_load(window, cx);
                     let mut dirty = false;
                     this.document.update(cx, |doc, cx| {
                         if this.playback.poll(doc) {
@@ -157,7 +157,6 @@ impl AppView {
         let this = Self {
             composition,
             buffer,
-            device,
             document,
             waveform,
             workspace,
@@ -165,6 +164,7 @@ impl AppView {
             playback,
             app_menu_bar: (!cfg!(target_os = "macos")).then(|| AppMenuBar::new(cx)),
             pending_opens,
+            pending_load: Arc::new(Mutex::new(None)),
             focus_handle: cx.focus_handle(),
             last_progress: None,
         };
@@ -191,9 +191,7 @@ impl AppView {
             *self.buffer.write().unwrap() = Buffer::empty();
         }
         let snapshot = self.buffer.read().unwrap();
-        if let Err(err) = self.playback.reload(&self.device, &snapshot) {
-            eprintln!("failed to reload playback: {err:#}");
-        }
+        self.playback.reload(&snapshot);
         drop(snapshot);
 
         self.document
@@ -265,19 +263,32 @@ impl AppView {
         }
     }
 
-    fn open_path(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
-        let view = cx.entity();
-        cx.spawn_in(window, async move |_, window| {
-            let result = std::thread::spawn(move || Composition::load_from_path(&path)).join();
-            let _ = window.update(|window, cx| {
-                view.update(cx, |this, cx| match result {
-                    Ok(Ok(composition)) => this.load_composition(composition, window, cx),
-                    Ok(Err(err)) => this.show_load_error(&format!("{err:#}"), window, cx),
-                    Err(_) => this.show_load_error("failed to load file", window, cx),
-                });
-            });
-        })
-        .detach();
+    fn drain_pending_load(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((epoch, result)) = self.pending_load.lock().unwrap().take() else {
+            return;
+        };
+        if !self.document.read(cx).progress.is_epoch(epoch) {
+            return;
+        }
+        match result {
+            Ok(composition) => self.load_composition(composition, window, cx),
+            Err(err) => {
+                self.document.read(cx).progress.cancel();
+                self.show_load_error(&err, window, cx);
+                cx.notify();
+            }
+        }
+    }
+
+    fn open_path(&mut self, path: PathBuf, _window: &mut Window, cx: &mut Context<Self>) {
+        let epoch = self.document.read(cx).progress.begin("opening");
+        self.waveform.update(cx, |_, cx| cx.notify());
+        cx.notify();
+        let pending = self.pending_load.clone();
+        std::thread::spawn(move || {
+            let result = Composition::load_from_path(&path).map_err(|err| format!("{err:#}"));
+            *pending.lock().unwrap() = Some((epoch, result));
+        });
     }
 
     fn prompt_open_file(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -288,7 +299,7 @@ impl AppView {
             prompt: Some("Open".into()),
         });
         let view = cx.entity();
-        cx.spawn_in(window, async move |_, window| {
+        cx.spawn_in(window, async move |_, cx| {
             let paths = match receiver.await {
                 Ok(Ok(Some(paths))) => paths,
                 _ => return,
@@ -296,13 +307,8 @@ impl AppView {
             let Some(path) = paths.into_iter().next() else {
                 return;
             };
-            let result = std::thread::spawn(move || Composition::load_from_path(&path)).join();
-            let _ = window.update(|window, cx| {
-                view.update(cx, |this, cx| match result {
-                    Ok(Ok(composition)) => this.load_composition(composition, window, cx),
-                    Ok(Err(err)) => this.show_load_error(&format!("{err:#}"), window, cx),
-                    Err(_) => this.show_load_error("failed to load file", window, cx),
-                });
+            let _ = cx.update(|window, cx| {
+                view.update(cx, |this, cx| this.open_path(path, window, cx));
             });
         })
         .detach();
@@ -834,7 +840,6 @@ pub fn run(initial: Option<Composition>, device: Device) {
                     AppView::new(
                         shared_composition.clone(),
                         shared_buffer.clone(),
-                        device,
                         document,
                         playback,
                         pending_opens.clone(),

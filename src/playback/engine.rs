@@ -24,15 +24,24 @@ pub struct PlaybackShared {
     pub in_point: AtomicUsize,
     pub out_point: AtomicUsize,
     epoch: AtomicUsize,
-    source_rate: u32,
     output_rate: u32,
+    output_channels: usize,
 }
 
 impl PlaybackShared {
     pub fn new(provider: Arc<dyn PlaybackDataProvider>, output_rate: u32) -> Self {
+        let output_channels = provider.channel_count().max(1);
+        Self::with_output_layout(provider, output_rate, output_channels)
+    }
+
+    pub fn with_output_layout(
+        provider: Arc<dyn PlaybackDataProvider>,
+        output_rate: u32,
+        output_channels: usize,
+    ) -> Self {
         Self {
-            source_rate: provider.sample_rate(),
             output_rate,
+            output_channels: output_channels.max(1),
             provider,
             position: AtomicUsize::new(0),
             transport: AtomicU8::new(TransportState::Stopped.to_u8()),
@@ -103,11 +112,12 @@ impl PlaybackShared {
             return;
         }
 
-        let channels = self.provider.channel_count();
-        if channels == 0 {
+        let src_ch = self.provider.channel_count();
+        if src_ch == 0 {
             return;
         }
-        let out_frames = output.len() / channels;
+        let out_ch = self.output_channels.max(1);
+        let out_frames = output.len() / out_ch;
         if out_frames == 0 {
             return;
         }
@@ -115,7 +125,8 @@ impl PlaybackShared {
         let end = self.playback_end();
         let start_bound = self.playback_start();
         let looping = self.looping.load(Ordering::SeqCst);
-        let step = self.source_rate as f64 / self.output_rate as f64;
+        let src_rate = self.provider.sample_rate().max(1);
+        let step = src_rate as f64 / f64::from(self.output_rate.max(1));
         let epoch = self.epoch.load(Ordering::SeqCst);
         let origin = self.position.load(Ordering::SeqCst);
 
@@ -128,7 +139,7 @@ impl PlaybackShared {
             origin as f64
         };
 
-        let mut read_buf = vec![0.0f32; PLAYBACK_READ_FRAMES * channels];
+        let mut read_buf = vec![0.0f32; PLAYBACK_READ_FRAMES * src_ch];
         let mut buf_origin = 0usize;
         let mut buf_frames = 0usize;
         let mut reached_end = false;
@@ -148,7 +159,7 @@ impl PlaybackShared {
             if buf_frames == 0 || source_pos < buf_origin || source_pos - buf_origin >= buf_frames {
                 let remaining = end.saturating_add(1).saturating_sub(source_pos);
                 let take = remaining.min(PLAYBACK_READ_FRAMES).max(1);
-                let n = take * channels;
+                let n = take * src_ch;
                 if read_buf.len() < n {
                     read_buf.resize(n, 0.0);
                 }
@@ -158,9 +169,16 @@ impl PlaybackShared {
                 buf_frames = take;
             }
             let local = source_pos - buf_origin;
-            let base = local * channels;
-            for ch in 0..channels {
-                output[out_frame * channels + ch] = read_buf[base + ch];
+            let base = local * src_ch;
+            for ch in 0..out_ch {
+                let sample = if src_ch == 1 {
+                    read_buf[base]
+                } else if ch < src_ch {
+                    read_buf[base + ch]
+                } else {
+                    0.0
+                };
+                output[out_frame * out_ch + ch] = sample;
             }
             pos_f += step;
         }
@@ -196,9 +214,18 @@ impl PlaybackEngine {
             .context("failed to get default output config")?;
 
         let sample_format = default_config.sample_format();
-        let stream_config = stream_config_for_provider(device, &default_config, &provider)?;
+        let stream_config = StreamConfig {
+            channels: default_config.channels(),
+            sample_rate: default_config.sample_rate(),
+            buffer_size: cpal::BufferSize::Default,
+        };
         let output_rate = stream_config.sample_rate.0;
-        let shared = Arc::new(PlaybackShared::new(provider, output_rate));
+        let output_channels = stream_config.channels as usize;
+        let shared = Arc::new(PlaybackShared::with_output_layout(
+            provider,
+            output_rate,
+            output_channels,
+        ));
         let shared_cb = shared.clone();
 
         let stream = build_output_stream(device, &stream_config, sample_format, shared_cb.clone())
@@ -219,40 +246,6 @@ impl PlaybackEngine {
             shared,
         })
     }
-}
-
-fn stream_config_for_provider(
-    device: &Device,
-    default_config: &cpal::SupportedStreamConfig,
-    provider: &Arc<dyn PlaybackDataProvider>,
-) -> Result<StreamConfig> {
-    if provider.frames() == 0 {
-        return Ok(StreamConfig {
-            channels: default_config.channels(),
-            sample_rate: default_config.sample_rate(),
-            buffer_size: cpal::BufferSize::Default,
-        });
-    }
-
-    let channels = provider.channel_count().max(1) as u16;
-    let source_rate = provider.sample_rate();
-    let mut stream_config = StreamConfig {
-        channels,
-        sample_rate: cpal::SampleRate(source_rate),
-        buffer_size: cpal::BufferSize::Default,
-    };
-
-    let supports_source_rate = device.supported_output_configs()?.any(|c| {
-        c.channels() == channels
-            && c.min_sample_rate().0 <= source_rate
-            && c.max_sample_rate().0 >= source_rate
-    });
-
-    if !supports_source_rate {
-        stream_config.sample_rate = default_config.sample_rate();
-    }
-
-    Ok(stream_config)
 }
 
 fn build_output_stream(
@@ -353,5 +346,24 @@ mod tests {
         assert_eq!(shared.position(), 200);
         assert!(PLAYBACK_READ_FRAMES >= 1);
         assert_eq!(PLAYBACK_READ_FRAMES, 128);
+    }
+
+    #[test]
+    fn mono_source_upmixes_to_stereo_device() {
+        let samples: Vec<f32> = (0..50).map(|i| i as f32).collect();
+        let audio = DecodedAudio {
+            sample_rate: 44100,
+            channels: vec![samples.clone()],
+            peaks: vec![vec![]],
+        };
+        let shared = PlaybackShared::with_output_layout(Arc::new(audio), 44100, 2);
+        shared.set_transport(TransportState::Playing);
+        let mut out = vec![0.0; 20];
+        shared.fill_output(&mut out);
+        assert_eq!(out[0], 0.0);
+        assert_eq!(out[1], 0.0);
+        assert_eq!(out[2], 1.0);
+        assert_eq!(out[3], 1.0);
+        assert_eq!(shared.position(), 10);
     }
 }
