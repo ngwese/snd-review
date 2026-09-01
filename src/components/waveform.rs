@@ -17,6 +17,7 @@ use gpui_component::{
 
 use crate::audio::PEAK_BLOCK;
 use crate::model::buffer::Region;
+use crate::model::composition::EditId;
 use crate::model::document::BufferDocument;
 use crate::model::selection::Selection;
 
@@ -88,6 +89,7 @@ pub struct WaveformDisplay {
     scrollbar_width: f32,
     drag: Option<Drag>,
     hover_sample: Option<usize>,
+    hovered_edit: Option<EditId>,
 }
 
 impl WaveformDisplay {
@@ -109,11 +111,20 @@ impl WaveformDisplay {
             scrollbar_width: 0.0,
             drag: None,
             hover_sample: None,
+            hovered_edit: None,
         }
     }
 
     pub fn hover_sample(&self) -> Option<usize> {
         self.hover_sample
+    }
+
+    pub fn set_hovered_edit(&mut self, id: Option<EditId>, cx: &mut Context<Self>) {
+        if self.hovered_edit == id {
+            return;
+        }
+        self.hovered_edit = id;
+        cx.notify();
     }
 
     pub fn zoom_in(&mut self, cx: &mut Context<Self>) {
@@ -171,6 +182,7 @@ impl WaveformDisplay {
     pub fn reset_view(&mut self, cx: &mut Context<Self>) {
         self.drag = None;
         self.hover_sample = None;
+        self.hovered_edit = None;
         self.start_sample = 0.0;
         let frames = self.frames(cx);
         self.samples_per_pixel = if frames == 0 {
@@ -910,7 +922,7 @@ impl Render for WaveformDisplay {
         let hover_sample = self.hover_sample;
         let (modified_ranges, hover_ranges) = {
             let doc = self.document.read(cx);
-            let hovered = doc.hovered_edit();
+            let hovered = self.hovered_edit;
             let composition = doc.composition.read().unwrap();
             let modified = composition.modified_ranges();
             let hover = hovered

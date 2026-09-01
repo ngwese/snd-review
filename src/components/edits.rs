@@ -10,19 +10,26 @@ use gpui_component::{
     v_flex, ActiveTheme as _, StyledExt as _,
 };
 
+use crate::components::waveform::WaveformDisplay;
 use crate::model::composition::EditOp;
 use crate::model::document::BufferDocument;
 
 pub struct EditsPanel {
     document: Entity<BufferDocument>,
+    waveform: Entity<WaveformDisplay>,
     focus_handle: FocusHandle,
 }
 
 impl EditsPanel {
-    pub fn new(document: Entity<BufferDocument>, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        document: Entity<BufferDocument>,
+        waveform: Entity<WaveformDisplay>,
+        cx: &mut Context<Self>,
+    ) -> Self {
         cx.observe(&document, |_, _, cx| cx.notify()).detach();
         Self {
             document,
+            waveform,
             focus_handle: cx.focus_handle(),
         }
     }
@@ -93,7 +100,6 @@ impl Render for EditsPanel {
                     .into_iter()
                     .map(|(id, title, detail, current, future)| {
                         let document = self.document.clone();
-                        let hover_document = document.clone();
                         v_flex()
                             .id(("edit-card", id.0))
                             .w_full()
@@ -112,10 +118,13 @@ impl Render for EditsPanel {
                             .opacity(if future { 0.55 } else { 1.0 })
                             .cursor_pointer()
                             .hover(|this| this.bg(theme.secondary_hover))
-                            .on_hover(cx.listener(move |_, hovered: &bool, _, cx| {
-                                hover_document.update(cx, |doc, cx| {
-                                    doc.set_hovered_edit(if *hovered { Some(id) } else { None });
-                                    cx.notify();
+                            // AppView syncs playback from BufferDocument notifies.
+                            .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+                                this.waveform.update(cx, |view, cx| {
+                                    view.set_hovered_edit(
+                                        if *hovered { Some(id) } else { None },
+                                        cx,
+                                    );
                                 });
                             }))
                             .on_click(cx.listener(move |_, _, _, cx| {

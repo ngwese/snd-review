@@ -119,7 +119,7 @@ impl AppView {
         let waveform = cx.new(|cx| WaveformDisplay::new(document.clone(), cx));
         cx.observe(&waveform, |_, _, cx| cx.notify()).detach();
         let workspace = cx.new(|cx| WorkspacePanel::new(document.clone(), waveform.clone(), cx));
-        let edits = cx.new(|cx| EditsPanel::new(document.clone(), cx));
+        let edits = cx.new(|cx| EditsPanel::new(document.clone(), waveform.clone(), cx));
         let transients = cx.new(|cx| EmptyPane::new("TransientsPanel", "Transients", cx));
         let markers = cx.new(|cx| EmptyPane::new("MarkersPanel", "Markers", cx));
         let labels = cx.new(|cx| EmptyPane::new("LabelsPanel", "Labels", cx));
