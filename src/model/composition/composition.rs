@@ -217,7 +217,7 @@ impl Composition {
 
     pub fn undo(&mut self) -> bool {
         if let Some(tree) = self.edl.undo() {
-            self.tree = tree;
+            self.adopt_tree(tree);
             true
         } else {
             false
@@ -226,7 +226,7 @@ impl Composition {
 
     pub fn redo(&mut self) -> bool {
         if let Some(tree) = self.edl.redo() {
-            self.tree = tree;
+            self.adopt_tree(tree);
             true
         } else {
             false
@@ -235,11 +235,61 @@ impl Composition {
 
     pub fn jump_to_edit(&mut self, id: EditId) -> bool {
         if let Some(tree) = self.edl.jump_to(id) {
-            self.tree = tree;
+            self.adopt_tree(tree);
             true
         } else {
             false
         }
+    }
+
+    fn adopt_tree(&mut self, tree: ClipTree) {
+        let tree = self.tree_with_initial_media(tree);
+        self.tree = tree;
+        let _ = self.ensure_clip_peaks();
+    }
+
+    fn rebuild_from_initial_media(&self) -> Option<ClipTree> {
+        let InitialState::FromMedia { media_id } = self.initial else {
+            return None;
+        };
+        let media = self.pool.get(MediaId(media_id))?;
+        if media.frame_count == 0 {
+            return None;
+        }
+        Some(ClipTree::from_clip(Clip::from_media(
+            ClipId(1),
+            MediaId(media_id),
+            0,
+            media.frame_count,
+        )))
+    }
+
+    fn tree_with_initial_media(&mut self, tree: ClipTree) -> ClipTree {
+        if !tree.is_empty() || self.edl.cursor() != 0 {
+            return tree;
+        }
+        let Some(rebuilt) = self.rebuild_from_initial_media() else {
+            return tree;
+        };
+        self.edl.replace_init_snapshot(rebuilt.clone());
+        rebuilt
+    }
+
+    /// Regions changed by applied edits, in the current timeline.
+    ///
+    /// Adjacent landings from different edits stay separate so the waveform
+    /// can draw a gap between them.
+    pub fn modified_ranges(&self) -> Vec<(u64, u64)> {
+        super::edit_ranges::modified_ranges(self.edl.edits(), self.edl.cursor())
+    }
+
+    /// Where `id` landed on the current timeline, if that edit is applied.
+    pub fn ranges_for_edit(&self, id: EditId) -> Vec<(u64, u64)> {
+        let edits = self.edl.edits();
+        let Some(index) = edits.iter().position(|edit| edit.id == id) else {
+            return Vec::new();
+        };
+        super::edit_ranges::ranges_for_edit(edits, self.edl.cursor(), index)
     }
 
     fn fill_clipboard(&mut self, start: u64, len: u64) {
@@ -699,8 +749,10 @@ impl Composition {
     }
 
     pub fn apply_peak_caches(&mut self, updates: Vec<(u64, Clip)>) {
-        for (start, clip) in updates {
-            self.tree = self.tree.map_clip_at(start, |_| clip);
+        for (_, peaked) in updates {
+            self.tree = apply_clip_cache(&self.tree, &peaked);
+            self.edl
+                .map_snapshots(|tree| apply_clip_cache(tree, &peaked));
         }
     }
 
@@ -817,7 +869,7 @@ impl Composition {
             composition.replay(&op)?;
         }
         if let Some(tree) = composition.edl.jump_to_index(file.edit_cursor) {
-            composition.tree = tree;
+            composition.adopt_tree(tree);
         }
         Ok(composition)
     }
@@ -875,6 +927,31 @@ impl Composition {
         }
         assert_eq!(t, self.frames());
     }
+
+    #[cfg(test)]
+    fn replace_init_snapshot(&mut self, tree: ClipTree) {
+        self.edl.replace_init_snapshot(tree);
+    }
+}
+
+fn clip_cache_key(clip: &Clip) -> Option<(MediaId, u64, u64)> {
+    clip.source
+        .as_ref()
+        .map(|source| (source.media_id, source.offset, clip.len))
+}
+
+fn apply_clip_cache(tree: &ClipTree, peaked: &Clip) -> ClipTree {
+    let peaked_key = clip_cache_key(peaked);
+    tree.map_clips(|clip| {
+        let same =
+            clip.id == peaked.id || (peaked_key.is_some() && clip_cache_key(clip) == peaked_key);
+        if !same {
+            return clip.clone();
+        }
+        let mut clip = clip.clone();
+        clip.cache = peaked.cache.clone();
+        clip
+    })
 }
 
 fn media_ref_from_probed(probed: ProbedFile) -> MediaRef {
@@ -968,6 +1045,8 @@ mod tests {
         let samples = materialize(&comp);
         assert!(samples[0][5..10].iter().all(|&s| s == 0.0));
         assert_ne!(samples[0][4], 0.0);
+        assert_eq!(comp.modified_ranges(), vec![(5, 10)]);
+        assert_eq!(comp.ranges_for_edit(comp.current_edit()), vec![(5, 10)]);
     }
 
     #[test]
@@ -1028,6 +1107,33 @@ mod tests {
         assert_eq!(comp.frames(), 8);
         assert!(comp.jump_to_edit(after));
         assert_eq!(comp.frames(), 6);
+    }
+
+    #[test]
+    fn undo_to_init_keeps_original_media() {
+        let mut comp = Composition::from_media(sine_media(12, 1, 44100)).unwrap();
+        let frames = comp.frames();
+        let init = comp.current_edit();
+        comp.remove(2, 4);
+        assert_eq!(comp.frames(), 8);
+        assert!(comp.undo());
+        assert_eq!(comp.current_edit(), init);
+        assert_eq!(comp.frames(), frames);
+        assert!(comp.clip_at(0).is_some());
+        assert!(!comp.clip_at(0).unwrap().clip.cache.peaks.is_empty());
+    }
+
+    #[test]
+    fn empty_init_snapshot_rebuilds_from_media() {
+        let mut comp = Composition::from_media(sine_media(16, 1, 44100)).unwrap();
+        let frames = comp.frames();
+        let init = comp.current_edit();
+        comp.remove(0, 4);
+        comp.replace_init_snapshot(ClipTree::empty());
+        assert!(comp.jump_to_edit(init));
+        assert_eq!(comp.frames(), frames);
+        assert!(!comp.is_empty());
+        assert!(comp.clip_at(0).is_some());
     }
 
     #[test]

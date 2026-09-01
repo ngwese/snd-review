@@ -19,6 +19,7 @@ pub struct BufferDocument {
     pub current_position: Option<SamplePosition>,
     pub snap_zero_crossings: bool,
     pub progress: ProgressHandle,
+    hovered_edit: Option<EditId>,
     region_drag_anchor: Option<usize>,
     next_region_id: u64,
     next_marker_id: u64,
@@ -40,6 +41,7 @@ impl BufferDocument {
             current_position: None,
             snap_zero_crossings: false,
             progress: ProgressHandle::new(),
+            hovered_edit: None,
             region_drag_anchor: None,
             next_region_id: 1,
             next_marker_id: 1,
@@ -303,6 +305,7 @@ impl BufferDocument {
         self.selection = Selection::None;
         self.current_position = None;
         self.region_drag_anchor = None;
+        self.hovered_edit = None;
     }
 
     pub fn selection_span(&self) -> Option<(u64, u64)> {
@@ -382,6 +385,14 @@ impl BufferDocument {
             self.after_edit();
         }
         ok
+    }
+
+    pub fn hovered_edit(&self) -> Option<EditId> {
+        self.hovered_edit
+    }
+
+    pub fn set_hovered_edit(&mut self, id: Option<EditId>) {
+        self.hovered_edit = id;
     }
 
     pub fn edit_copy(&mut self) {

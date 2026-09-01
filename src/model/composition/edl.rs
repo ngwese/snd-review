@@ -128,6 +128,18 @@ impl Edl {
         self.cursor = index;
         Some(self.snapshot())
     }
+
+    pub fn map_snapshots(&mut self, mut map: impl FnMut(&ClipTree) -> ClipTree) {
+        for edit in &mut self.edits {
+            edit.snapshot = map(&edit.snapshot);
+        }
+    }
+
+    pub fn replace_init_snapshot(&mut self, snapshot: ClipTree) {
+        if let Some(init) = self.edits.first_mut() {
+            init.snapshot = snapshot;
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

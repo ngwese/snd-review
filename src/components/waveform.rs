@@ -57,6 +57,10 @@ const SCROLLBAR_HEIGHT: f32 = 14.0;
 const DRAG_MOVE_THRESHOLD_PX: f32 = 3.0;
 const POSITION_BAR_COLOR: gpui::Hsla = hsla(0.0, 0.72, 0.55, 1.0);
 const GHOST_BAR_COLOR: gpui::Hsla = hsla(0.0, 0.72, 0.55, 0.35);
+const MODIFIED_BAR_HEIGHT: f32 = 3.0;
+const MODIFIED_BAR_GAP: f32 = 1.0;
+const MODIFIED_BAR_COLOR: gpui::Hsla = hsla(0.08, 0.90, 0.55, 1.0);
+const MODIFIED_HOVER_FILL: gpui::Hsla = hsla(0.08, 0.90, 0.55, 0.18);
 
 enum Drag {
     Pan {
@@ -87,7 +91,8 @@ pub struct WaveformDisplay {
 }
 
 impl WaveformDisplay {
-    pub fn new(document: Entity<BufferDocument>, cx: &App) -> Self {
+    pub fn new(document: Entity<BufferDocument>, cx: &mut Context<Self>) -> Self {
+        cx.observe(&document, |_, _, cx| cx.notify()).detach();
         let frames = document.read(cx).frames();
         let samples_per_pixel = if frames == 0 {
             1.0
@@ -552,6 +557,90 @@ fn paint_vertical_bar(
     ));
 }
 
+fn range_x(
+    start: u64,
+    end: u64,
+    start_sample: f64,
+    samples_per_pixel: f64,
+    origin_x: f32,
+    width: f32,
+) -> Option<(f32, f32)> {
+    let x0 = sample_to_x(start as f64, start_sample, samples_per_pixel, origin_x);
+    let x1 = sample_to_x(end as f64, start_sample, samples_per_pixel, origin_x);
+    let left = x0.min(x1).max(origin_x);
+    let right = x0.max(x1).min(origin_x + width);
+    (right > left).then_some((left, right))
+}
+
+fn paint_range_overlays(
+    bounds: Bounds<Pixels>,
+    ranges: &[(u64, u64)],
+    start_sample: f64,
+    samples_per_pixel: f64,
+    color: gpui::Hsla,
+    window: &mut Window,
+) {
+    let origin_x = bounds.origin.x.as_f32();
+    let origin_y = bounds.origin.y.as_f32();
+    let width = bounds.size.width.as_f32();
+    let height = bounds.size.height.as_f32();
+    for &(start, end) in ranges {
+        let Some((left, right)) =
+            range_x(start, end, start_sample, samples_per_pixel, origin_x, width)
+        else {
+            continue;
+        };
+        window.paint_quad(fill(
+            Bounds {
+                origin: point(px(left), px(origin_y)),
+                size: size(px((right - left).max(1.0)), px(height)),
+            },
+            color,
+        ));
+    }
+}
+
+fn paint_modified_bars(
+    bounds: Bounds<Pixels>,
+    ranges: &[(u64, u64)],
+    start_sample: f64,
+    samples_per_pixel: f64,
+    window: &mut Window,
+) {
+    let origin_x = bounds.origin.x.as_f32();
+    let origin_y = bounds.origin.y.as_f32();
+    let width = bounds.size.width.as_f32();
+    let height = bounds.size.height.as_f32();
+    if height < MODIFIED_BAR_HEIGHT {
+        return;
+    }
+    let bar_y = origin_y + height - MODIFIED_BAR_HEIGHT;
+    for (ix, &(start, end)) in ranges.iter().enumerate() {
+        let Some((left, mut right)) =
+            range_x(start, end, start_sample, samples_per_pixel, origin_x, width)
+        else {
+            continue;
+        };
+        let adjacent = ranges
+            .get(ix + 1)
+            .is_some_and(|&(next_start, _)| next_start == end);
+        if adjacent {
+            right = (right - MODIFIED_BAR_GAP).max(left);
+        }
+        let bar_w = right - left;
+        if bar_w < 1.0 {
+            continue;
+        }
+        window.paint_quad(fill(
+            Bounds {
+                origin: point(px(left), px(bar_y)),
+                size: size(px(bar_w), px(MODIFIED_BAR_HEIGHT)),
+            },
+            MODIFIED_BAR_COLOR,
+        ));
+    }
+}
+
 fn paint_lane(
     bounds: Bounds<Pixels>,
     provider: &BufferDocument,
@@ -562,6 +651,8 @@ fn paint_lane(
     zero_color: gpui::Hsla,
     selection: &Selection,
     hover_sample: Option<usize>,
+    modified_ranges: &[(u64, u64)],
+    hover_ranges: &[(u64, u64)],
     window: &mut Window,
 ) {
     let width = bounds.size.width.as_f32();
@@ -703,6 +794,22 @@ fn paint_lane(
         }
     }
 
+    paint_range_overlays(
+        bounds,
+        hover_ranges,
+        start_sample,
+        samples_per_pixel,
+        MODIFIED_HOVER_FILL,
+        window,
+    );
+    paint_modified_bars(
+        bounds,
+        modified_ranges,
+        start_sample,
+        samples_per_pixel,
+        window,
+    );
+
     if let Some(sample) = hover_sample {
         paint_vertical_bar(
             bounds,
@@ -801,6 +908,16 @@ impl Render for WaveformDisplay {
         let start_sample = self.start_sample;
         let samples_per_pixel = self.samples_per_pixel;
         let hover_sample = self.hover_sample;
+        let (modified_ranges, hover_ranges) = {
+            let doc = self.document.read(cx);
+            let hovered = doc.hovered_edit();
+            let composition = doc.composition.read().unwrap();
+            let modified = composition.modified_ranges();
+            let hover = hovered
+                .map(|id| composition.ranges_for_edit(id))
+                .unwrap_or_default();
+            (modified, hover)
+        };
         let entity = cx.entity();
         let channel_count = WaveformDataProvider::channel_count(self.document.read(cx));
         let is_empty = WaveformDataProvider::frames(self.document.read(cx)) == 0;
@@ -947,6 +1064,9 @@ impl Render for WaveformDisplay {
                                                     },
                                                     {
                                                         let document = document.clone();
+                                                        let modified_ranges =
+                                                            modified_ranges.clone();
+                                                        let hover_ranges = hover_ranges.clone();
                                                         move |bounds, _, window, cx| {
                                                             let provider = document.read(cx);
                                                             paint_lane(
@@ -959,6 +1079,8 @@ impl Render for WaveformDisplay {
                                                                 zero,
                                                                 &selection,
                                                                 hover_sample,
+                                                                &modified_ranges,
+                                                                &hover_ranges,
                                                                 window,
                                                             );
                                                         }

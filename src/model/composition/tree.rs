@@ -149,6 +149,15 @@ impl ClipTree {
             root: Some(map_clip_at_node(root, frame, map)),
         }
     }
+
+    pub fn map_clips(&self, mut map: impl FnMut(&Clip) -> Clip) -> Self {
+        let Some(root) = &self.root else {
+            return Self::empty();
+        };
+        Self {
+            root: Some(map_clips_node(root, &mut map)),
+        }
+    }
 }
 
 fn collect_spans(node: &Node, start: u64, out: &mut Vec<ClipSpan>) {
@@ -303,6 +312,15 @@ fn map_clip_at_node(node: &Node, frame: u64, map: impl FnOnce(&Clip) -> Clip) ->
                     map_clip_at_node(right, frame - left_frames, map),
                 )
             }
+        }
+    }
+}
+
+fn map_clips_node(node: &Node, map: &mut impl FnMut(&Clip) -> Clip) -> Arc<Node> {
+    match node {
+        Node::Leaf(clip) => Arc::new(Node::Leaf(Arc::new(map(clip.as_ref())))),
+        Node::Branch { left, right, .. } => {
+            branch(map_clips_node(left, map), map_clips_node(right, map))
         }
     }
 }

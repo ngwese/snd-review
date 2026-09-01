@@ -3,6 +3,7 @@
 
 mod clip;
 mod composition;
+mod edit_ranges;
 mod edl;
 mod media;
 mod pager;
