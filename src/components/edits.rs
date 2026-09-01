@@ -4,7 +4,7 @@
 use gpui::{
     div, px, App, ClickEvent, Context, Entity, EventEmitter, FocusHandle, Focusable,
     InteractiveElement as _, IntoElement, ParentElement as _, Render,
-    StatefulInteractiveElement as _, Styled as _, Window,
+    StatefulInteractiveElement as _, Styled as _, Subscription, Window,
 };
 use gpui_component::{
     dock::{BasePanel, Panel, PanelEvent},
@@ -16,23 +16,41 @@ use crate::model::composition::EditOp;
 use crate::model::document::BufferDocument;
 
 pub struct EditsPanel {
-    document: Entity<BufferDocument>,
-    waveform: Entity<WaveformDisplay>,
+    document: Option<Entity<BufferDocument>>,
+    waveform: Option<Entity<WaveformDisplay>>,
     focus_handle: FocusHandle,
+    _document_observe: Option<Subscription>,
 }
 
 impl EditsPanel {
-    pub fn new(
+    pub fn new(cx: &mut Context<Self>) -> Self {
+        Self {
+            document: None,
+            waveform: None,
+            focus_handle: cx.focus_handle(),
+            _document_observe: None,
+        }
+    }
+
+    pub fn set_target(
+        &mut self,
         document: Entity<BufferDocument>,
         waveform: Entity<WaveformDisplay>,
         cx: &mut Context<Self>,
-    ) -> Self {
-        cx.observe(&document, |_, _, cx| cx.notify()).detach();
-        Self {
-            document,
-            waveform,
-            focus_handle: cx.focus_handle(),
+    ) {
+        self.document = Some(document);
+        self.waveform = Some(waveform);
+        if let Some(document) = &self.document {
+            self._document_observe = Some(cx.observe(document, |_, _, cx| cx.notify()));
         }
+        cx.notify();
+    }
+
+    pub fn clear_target(&mut self, cx: &mut Context<Self>) {
+        self.document = None;
+        self.waveform = None;
+        self._document_observe = None;
+        cx.notify();
     }
 }
 
@@ -71,7 +89,10 @@ impl Panel for EditsPanel {
 impl Render for EditsPanel {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
-        let doc = self.document.read(cx);
+        let Some(document) = self.document.clone() else {
+            return v_flex().id("edits-list").size_full().into_any_element();
+        };
+        let doc = document.read(cx);
         let composition = doc.composition.read().unwrap();
         let sample_rate = composition.sample_rate();
         let current = composition.current_edit();
@@ -120,7 +141,10 @@ impl Render for EditsPanel {
                             .hover(|this| this.bg(theme.secondary_hover))
                             // AppView syncs playback from BufferDocument notifies.
                             .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
-                                this.waveform.update(cx, |view, cx| {
+                                let Some(waveform) = this.waveform.as_ref() else {
+                                    return;
+                                };
+                                waveform.update(cx, |view, cx| {
                                     view.set_hovered_edit(
                                         if *hovered { Some(id) } else { None },
                                         cx,
@@ -129,12 +153,15 @@ impl Render for EditsPanel {
                             }))
                             .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
                                 if event.click_count() >= 2 {
-                                    this.document.update(cx, |doc, cx| {
+                                    let Some(document) = this.document.as_ref() else {
+                                        return;
+                                    };
+                                    document.update(cx, |doc, cx| {
                                         doc.jump_to_edit(id);
                                         cx.notify();
                                     });
-                                } else {
-                                    this.waveform.update(cx, |view, cx| {
+                                } else if let Some(waveform) = this.waveform.as_ref() {
+                                    waveform.update(cx, |view, cx| {
                                         view.scroll_edit_into_view(id, cx);
                                     });
                                 }
@@ -154,6 +181,7 @@ impl Render for EditsPanel {
                             )
                     }),
             )
+            .into_any_element()
     }
 }
 

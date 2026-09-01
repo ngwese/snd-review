@@ -3,14 +3,18 @@
 
 use gpui::{
     div, App, Context, EventEmitter, FocusHandle, Focusable, InteractiveElement as _, IntoElement,
-    Render, SharedString, Styled as _, Window,
+    ParentElement as _, Render, SharedString, Styled as _, Window,
 };
-use gpui_component::dock::{BasePanel, Panel, PanelEvent};
+use gpui_component::{
+    dock::{BasePanel, Panel, PanelEvent},
+    ActiveTheme as _,
+};
 
-/// Empty right-dock pane used as a placeholder tab.
+/// Empty dock pane used as a placeholder tab.
 pub struct EmptyPane {
     name: &'static str,
     title: SharedString,
+    message: Option<SharedString>,
     focus_handle: FocusHandle,
 }
 
@@ -19,8 +23,14 @@ impl EmptyPane {
         Self {
             name,
             title: title.into(),
+            message: None,
             focus_handle: cx.focus_handle(),
         }
+    }
+
+    pub fn with_message(mut self, message: impl Into<SharedString>) -> Self {
+        self.message = Some(message.into());
+        self
     }
 }
 
@@ -57,7 +67,16 @@ impl Panel for EmptyPane {
 }
 
 impl Render for EmptyPane {
-    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-        div().id(self.name).size_full()
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme().clone();
+        div()
+            .id(self.name)
+            .size_full()
+            .flex()
+            .items_center()
+            .justify_center()
+            .text_sm()
+            .text_color(theme.muted_foreground)
+            .children(self.message.clone())
     }
 }

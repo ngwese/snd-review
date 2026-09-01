@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: 2026 Greg Wuller
 // SPDX-License-Identifier: MIT
 
+use std::rc::Rc;
+
 use gpui::{
     div, App, Context, Entity, EventEmitter, FocusHandle, Focusable, IntoElement,
     ParentElement as _, Render, Styled as _, Window,
@@ -14,17 +16,23 @@ use crate::components::transport::Transport;
 use crate::components::waveform::WaveformDisplay;
 use crate::model::document::BufferDocument;
 use crate::playback::TransportState;
+use crate::session::DocumentId;
+
+type ActivatedFn = Rc<dyn Fn(DocumentId, &mut Window, &mut App)>;
 
 pub struct WorkspacePanel {
+    document_id: DocumentId,
     document: Entity<BufferDocument>,
     waveform: Entity<WaveformDisplay>,
     transport_state: TransportState,
     looping: bool,
+    on_activated: Option<ActivatedFn>,
     focus_handle: FocusHandle,
 }
 
 impl WorkspacePanel {
     pub fn new(
+        document_id: DocumentId,
         document: Entity<BufferDocument>,
         waveform: Entity<WaveformDisplay>,
         cx: &mut Context<Self>,
@@ -32,12 +40,18 @@ impl WorkspacePanel {
         cx.observe(&document, |_, _, cx| cx.notify()).detach();
         cx.observe(&waveform, |_, _, cx| cx.notify()).detach();
         Self {
+            document_id,
             document,
             waveform,
             transport_state: TransportState::Stopped,
             looping: false,
+            on_activated: None,
             focus_handle: cx.focus_handle(),
         }
+    }
+
+    pub fn set_on_activated(&mut self, handler: ActivatedFn) {
+        self.on_activated = Some(handler);
     }
 
     pub fn sync_transport(&mut self, state: TransportState, looping: bool, cx: &mut Context<Self>) {
@@ -64,11 +78,21 @@ impl BasePanel for WorkspacePanel {
     }
 
     fn closable(&self, _: &App) -> bool {
-        false
+        true
     }
 
     fn zoomable(&self, _: &App) -> bool {
         false
+    }
+
+    fn set_active(&mut self, active: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if !active {
+            return;
+        }
+        if let Some(handler) = self.on_activated.clone() {
+            let id = self.document_id;
+            handler(id, window, cx);
+        }
     }
 }
 

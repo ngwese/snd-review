@@ -15,10 +15,11 @@ use crate::model::Buffer;
 use super::anchors::{collect_anchors, next_anchor, previous_anchor};
 use super::engine::PlaybackEngine;
 use super::playhead::Playhead;
-use super::provider::{PlaybackDataProvider, SharedCompositionProvider};
+use super::provider::SharedCompositionProvider;
 use super::transport::{Transport, TransportState};
 
 pub struct PlaybackSession {
+    provider: Arc<SharedCompositionProvider>,
     playhead: Playhead,
     transport: Transport,
     engine: PlaybackEngine,
@@ -28,17 +29,21 @@ pub struct PlaybackSession {
 
 impl PlaybackSession {
     pub fn open(device: &Device, composition: Arc<RwLock<Composition>>) -> Result<Self> {
-        let provider: Arc<dyn PlaybackDataProvider> =
-            Arc::new(SharedCompositionProvider(composition));
+        let provider = Arc::new(SharedCompositionProvider::new(composition));
         let playhead = Playhead::new(provider.clone());
-        let engine = PlaybackEngine::open(device, provider)?;
+        let engine = PlaybackEngine::open(device, provider.clone())?;
         Ok(Self {
+            provider,
             playhead,
             transport: Transport::new(),
             engine,
             anchors: Vec::new(),
             active_region: None,
         })
+    }
+
+    pub fn bind_composition(&self, composition: Arc<RwLock<Composition>>) {
+        self.provider.bind(composition);
     }
 
     pub fn transport_state(&self) -> TransportState {

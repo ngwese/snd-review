@@ -14,27 +14,47 @@ pub trait PlaybackDataProvider: Send + Sync {
     fn read_interleaved(&self, start: usize, count: usize, dest: &mut [f32]);
 }
 
-pub struct SharedCompositionProvider(pub Arc<RwLock<Composition>>);
+/// Playback provider whose composition target can be swapped without replacing
+/// the `Arc<dyn PlaybackDataProvider>` the engine already holds.
+pub struct SharedCompositionProvider {
+    current: RwLock<Arc<RwLock<Composition>>>,
+}
+
+impl SharedCompositionProvider {
+    pub fn new(composition: Arc<RwLock<Composition>>) -> Self {
+        Self {
+            current: RwLock::new(composition),
+        }
+    }
+
+    pub fn bind(&self, composition: Arc<RwLock<Composition>>) {
+        *self.current.write().unwrap() = composition;
+    }
+
+    fn composition(&self) -> Arc<RwLock<Composition>> {
+        self.current.read().unwrap().clone()
+    }
+}
 
 impl PlaybackDataProvider for SharedCompositionProvider {
     fn sample_rate(&self) -> u32 {
-        self.0.read().unwrap().sample_rate()
+        self.composition().read().unwrap().sample_rate()
     }
 
     fn channel_count(&self) -> usize {
-        self.0.read().unwrap().channel_count()
+        self.composition().read().unwrap().channel_count()
     }
 
     fn frames(&self) -> usize {
-        self.0.read().unwrap().frames() as usize
+        self.composition().read().unwrap().frames() as usize
     }
 
     fn read_interleaved(&self, start: usize, count: usize, dest: &mut [f32]) {
-        let _ = self
-            .0
-            .read()
-            .unwrap()
-            .read_interleaved(start as u64, count as u64, dest);
+        let _ =
+            self.composition()
+                .read()
+                .unwrap()
+                .read_interleaved(start as u64, count as u64, dest);
     }
 }
 
@@ -99,6 +119,7 @@ fn read_planar_interleaved(channels: &[Vec<f32>], start: usize, count: usize, de
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::MediaRef;
 
     #[test]
     fn interleaves_stereo_frames() {
@@ -122,5 +143,32 @@ mod tests {
         let mut dest = [9.0; 4];
         audio.read_interleaved(1, 2, &mut dest);
         assert_eq!(dest, [0.0, 0.0, 0.0, 0.0]);
+    }
+
+    fn memory_composition(frames: usize) -> Composition {
+        use crate::model::composition::MediaId;
+        let samples = vec![vec![0.0; frames]];
+        let media = MediaRef::from_memory(MediaId(0), 44100, samples);
+        Composition::from_media(media).unwrap()
+    }
+
+    #[test]
+    fn bind_switches_provider_frames() {
+        let first = Arc::new(RwLock::new(memory_composition(8)));
+        let second = Arc::new(RwLock::new(memory_composition(32)));
+        let provider = SharedCompositionProvider::new(first);
+        assert_eq!(provider.frames(), 8);
+        provider.bind(second);
+        assert_eq!(provider.frames(), 32);
+    }
+
+    #[test]
+    fn bind_leaves_previous_composition_intact() {
+        let first = Arc::new(RwLock::new(memory_composition(8)));
+        let second = Arc::new(RwLock::new(memory_composition(32)));
+        let provider = SharedCompositionProvider::new(first.clone());
+        provider.bind(second);
+        assert_eq!(first.read().unwrap().frames(), 8);
+        assert_eq!(provider.frames(), 32);
     }
 }

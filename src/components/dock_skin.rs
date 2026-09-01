@@ -6,18 +6,26 @@ use std::sync::Arc;
 
 use gpui::{
     div, prelude::FluentBuilder as _, rems, AnyElement, AnyView, App, AppContext as _, Axis, Div,
-    Entity, InteractiveElement as _, IntoElement, ParentElement as _, SharedString, Stateful,
-    StatefulInteractiveElement as _, Styled as _, WeakEntity, Window,
+    Entity, Global, InteractiveElement as _, IntoElement, ParentElement as _, SharedString,
+    Stateful, StatefulInteractiveElement as _, Styled as _, WeakEntity, Window,
 };
 use gpui_component::{
+    button::{Button, ButtonVariants as _},
     dock::{
         BasePanelView, DockArea, DockAreaRenderer, DockContext, DockPlacement, DockSkin, NodeId,
         PanelHandle, TabGroupContext, TabGroupRenderer, TilesRenderer,
     },
     h_flex,
     tab::{Tab, TabBar},
-    ActiveTheme as _, Selectable as _, Sizable as _,
+    ActiveTheme as _, IconName, Selectable as _, Sizable as _,
 };
+
+/// Host callback used to close a center tab without dropping the document.
+pub struct CenterTabCloseHandler {
+    pub close: Rc<dyn Fn(u64, &mut Window, &mut App)>,
+}
+
+impl Global for CenterTabCloseHandler {}
 
 /// Dock appearance with small tabs, built on [`DockSkin`].
 pub struct CompactDockSkin {
@@ -105,6 +113,15 @@ impl CompactTabGroup {
         })
     }
 
+    fn is_left_dock_group(&self, group: &TabGroupContext, cx: &App) -> bool {
+        self.area.upgrade().is_some_and(|area| {
+            area.read(cx)
+                .layout(DockPlacement::Left)
+                .and_then(|tree| tree.find_node(group.node()))
+                .is_some()
+        })
+    }
+
     fn panel_title(
         panel: &Arc<dyn BasePanelView>,
         window: &mut Window,
@@ -119,7 +136,7 @@ impl CompactTabGroup {
         }
     }
 
-    fn render_right_tab_bar(
+    fn render_side_tab_bar(
         &self,
         group: &TabGroupContext,
         window: &mut Window,
@@ -145,7 +162,7 @@ impl CompactTabGroup {
             let group = group.clone();
             tabs.push(
                 div()
-                    .id(("right-tab", panel.panel_id(cx).as_u64()))
+                    .id(("side-tab", panel.panel_id(cx).as_u64()))
                     .flex()
                     .flex_none()
                     .items_center()
@@ -165,7 +182,7 @@ impl CompactTabGroup {
             );
         }
         h_flex()
-            .id("right-tab-bar")
+            .id("side-tab-bar")
             .w_full()
             .flex_none()
             .items_center()
@@ -179,7 +196,7 @@ impl CompactTabGroup {
 impl TabGroupRenderer for CompactTabGroup {
     fn frame(&self, group: &TabGroupContext, window: &mut Window, cx: &mut App) -> Stateful<Div> {
         let frame = self.inner.frame(group, window, cx);
-        if self.is_right_dock_group(group, cx) {
+        if self.is_right_dock_group(group, cx) || self.is_left_dock_group(group, cx) {
             frame.px(rems(0.5))
         } else {
             frame
@@ -201,8 +218,8 @@ impl TabGroupRenderer for CompactTabGroup {
         window: &mut Window,
         cx: &mut App,
     ) -> AnyElement {
-        if self.is_right_dock_group(group, cx) {
-            return self.render_right_tab_bar(group, window, cx);
+        if self.is_right_dock_group(group, cx) || self.is_left_dock_group(group, cx) {
+            return self.render_side_tab_bar(group, window, cx);
         }
 
         let active_id = group.active_panel().map(|panel| panel.panel_id(cx));
@@ -213,20 +230,49 @@ impl TabGroupRenderer for CompactTabGroup {
             .filter(|(_, panel)| panel.visible(cx))
             .map(|(ix, _)| ix)
             .collect();
+        if visible.len() == 1 {
+            let panel = &group.panels()[visible[0]];
+            if !panel.closable(cx) && panel.panel_name(cx) == "EmptyEditorsPanel" {
+                return div().into_any_element();
+            }
+        }
         let mut tabs = Vec::with_capacity(visible.len());
         for ix in visible {
             let panel = &group.panels()[ix];
             let selected = !group.is_collapsed() && Some(panel.panel_id(cx)) == active_id;
-            let group = group.clone();
-            tabs.push(
-                Tab::new()
-                    .small()
-                    .child(Self::panel_title(panel, window, cx))
-                    .selected(selected)
-                    .on_click(move |_, window, cx| {
-                        group.select_tab(ix, window, cx);
-                    }),
-            );
+            let closable = panel.closable(cx);
+            let panel_id = panel.panel_id(cx).as_u64();
+            let group_for_select = group.clone();
+            let group_for_close = group.clone();
+            let mut tab = Tab::new()
+                .small()
+                .child(Self::panel_title(panel, window, cx))
+                .selected(selected)
+                .on_click(move |_, window, cx| {
+                    group_for_select.select_tab(ix, window, cx);
+                });
+            if closable {
+                tab = tab.suffix(
+                    Button::new(("close-tab", panel_id))
+                        .ghost()
+                        .xsmall()
+                        .icon(IconName::Close)
+                        .tab_stop(false)
+                        .on_click(move |_, window, cx| {
+                            if let Some(handler) = cx.try_global::<CenterTabCloseHandler>() {
+                                let close = handler.close.clone();
+                                close(panel_id, window, cx);
+                            } else {
+                                group_for_close.close(
+                                    gpui_component::dock::PanelId::from_u64(panel_id),
+                                    window,
+                                    cx,
+                                );
+                            }
+                        }),
+                );
+            }
+            tabs.push(tab);
         }
         TabBar::new("tab-bar")
             .small()
