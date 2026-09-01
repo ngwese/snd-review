@@ -422,12 +422,14 @@ impl Render for AppView {
                                 .h_full()
                                 .items_center()
                                 .gap_2()
-                                .child(
-                                    Icon::empty()
-                                        .path("icons/app-mark.svg")
-                                        .with_size(px(16.))
-                                        .text_color(theme.foreground),
-                                )
+                                .when(!cfg!(target_os = "macos"), |this| {
+                                    this.child(
+                                        Icon::empty()
+                                            .path("icons/app-mark.svg")
+                                            .with_size(px(16.))
+                                            .text_color(theme.foreground),
+                                    )
+                                })
                                 .when_some(self.app_menu_bar.clone(), |this, menu_bar| {
                                     this.child(menu_bar)
                                 }),
