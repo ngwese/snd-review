@@ -159,6 +159,54 @@ pub struct ProjectFile {
     pub edit_cursor: usize,
 }
 
+pub const FACOMP_KIND: &str = "facomp";
+pub const FACOMP_FORMAT_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProjectEnvelope {
+    pub kind: String,
+    pub format_version: u32,
+    #[serde(flatten)]
+    pub project: ProjectFile,
+}
+
+impl ProjectEnvelope {
+    pub fn wrap(project: ProjectFile) -> Self {
+        Self {
+            kind: FACOMP_KIND.into(),
+            format_version: FACOMP_FORMAT_VERSION,
+            project,
+        }
+    }
+
+    pub fn from_json(json: &str) -> anyhow::Result<Self> {
+        use anyhow::{bail, Context};
+
+        let value: serde_json::Value = serde_json::from_str(json).context("parse project JSON")?;
+        let kind = value.get("kind").and_then(|v| v.as_str()).unwrap_or("");
+        if kind != FACOMP_KIND {
+            bail!("not a snd-review composition (kind {kind:?})");
+        }
+        let version = value
+            .get("format_version")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        match version {
+            0 => bail!("missing or invalid format_version"),
+            1 => serde_json::from_value(value).context("parse facomp v1"),
+            n if n > u64::from(FACOMP_FORMAT_VERSION) => {
+                bail!("this file requires a newer snd-review (format_version {n})")
+            }
+            n => bail!("unsupported format_version {n}"),
+        }
+    }
+
+    pub fn to_json(&self) -> anyhow::Result<String> {
+        use anyhow::Context;
+        serde_json::to_string_pretty(self).context("serialize project")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

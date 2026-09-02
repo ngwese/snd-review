@@ -1,13 +1,13 @@
 // SPDX-FileCopyrightText: 2026 Greg Wuller
 // SPDX-License-Identifier: MIT
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use anyhow::{bail, Context, Result};
 
 use super::clip::{Clip, ClipId, ClipSpan};
-use super::edl::{EditId, EditOp, Edl, InitialState, ProjectFile};
+use super::edl::{EditId, EditOp, Edl, InitialState, ProjectEnvelope, ProjectFile};
 use super::media::{MediaId, MediaPool, MediaRef};
 use super::pager::BlockPager;
 use super::tree::ClipTree;
@@ -108,6 +108,13 @@ impl Composition {
     }
 
     pub fn load_from_path(path: &Path) -> Result<Self> {
+        Ok(Self::load_from_path_with_warnings(path)?.0)
+    }
+
+    pub fn load_from_path_with_warnings(path: &Path) -> Result<(Self, Vec<String>)> {
+        if is_facomp_path(path) {
+            return Self::load_facomp(path);
+        }
         use std::collections::hash_map::DefaultHasher;
         use std::hash::{Hash, Hasher};
 
@@ -119,7 +126,36 @@ impl Composition {
             .join("snd-review")
             .join("blocks")
             .join(format!("{:x}", hasher.finish()));
-        Self::from_media(media_ref_from_probed(probed))?.with_spill_dir(spill)
+        Ok((
+            Self::from_media(media_ref_from_probed(probed))?.with_spill_dir(spill)?,
+            Vec::new(),
+        ))
+    }
+
+    pub fn load_facomp(path: &Path) -> Result<(Self, Vec<String>)> {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
+        let json = std::fs::read_to_string(path)
+            .with_context(|| format!("failed to read {}", path.display()))?;
+        let (mut composition, warnings) = Self::from_json_reprobing(&json)?;
+        let mut hasher = DefaultHasher::new();
+        path.hash(&mut hasher);
+        std::time::SystemTime::now().hash(&mut hasher);
+        let spill = std::env::temp_dir()
+            .join("snd-review")
+            .join("blocks")
+            .join(format!("{:x}", hasher.finish()));
+        composition = composition.with_spill_dir(spill)?;
+        Ok((composition, warnings))
+    }
+
+    pub fn suggested_facomp_name(&self) -> String {
+        format!("{}.facomp", self.display_name())
+    }
+
+    pub fn save_to_path(&self, path: &Path) -> Result<()> {
+        write_atomic(path, &self.to_json()?)
     }
 
     pub fn with_spill_dir(mut self, dir: impl AsRef<Path>) -> Result<Self> {
@@ -853,7 +889,7 @@ impl Composition {
     }
 
     pub fn to_json(&self) -> Result<String> {
-        serde_json::to_string_pretty(&self.to_project_file()).context("serialize project")
+        ProjectEnvelope::wrap(self.to_project_file()).to_json()
     }
 
     pub fn from_project_file(file: ProjectFile) -> Result<Self> {
@@ -890,8 +926,36 @@ impl Composition {
     }
 
     pub fn from_json(json: &str) -> Result<Self> {
-        let file: ProjectFile = serde_json::from_str(json).context("parse project JSON")?;
-        Self::from_project_file(file)
+        let envelope = ProjectEnvelope::from_json(json)?;
+        Self::from_project_file(envelope.project)
+    }
+
+    pub fn from_json_reprobing(json: &str) -> Result<(Self, Vec<String>)> {
+        let envelope = ProjectEnvelope::from_json(json)?;
+        let mut warnings = Vec::new();
+        let mut file = envelope.project;
+        let mut resolved = Vec::with_capacity(file.media.len());
+        for media in file.media {
+            let path_str = media.path.to_string_lossy();
+            if path_str.starts_with("memory://") {
+                resolved.push(media);
+                continue;
+            }
+            if !media.path.is_file() {
+                bail!("missing source media {}", media.path.display());
+            }
+            let probed = crate::audio::probe_file(&media.path)
+                .with_context(|| format!("failed to open source media {}", media.path.display()))?;
+            if probed.size_bytes != media.size_bytes || probed.modified != media.modified {
+                warnings.push(format!("source media changed: {}", media.path.display()));
+            }
+            let mut next = media_ref_from_probed(probed);
+            next.id = media.id;
+            next.path = media.path;
+            resolved.push(next);
+        }
+        file.media = resolved;
+        Ok((Self::from_project_file(file)?, warnings))
     }
 
     fn replay(&mut self, op: &EditOp) -> Result<()> {
@@ -978,9 +1042,41 @@ fn media_ref_from_probed(probed: ProbedFile) -> MediaRef {
         frame_count: probed.frame_count,
         bits_per_sample: probed.bits_per_sample,
         size_bytes: probed.size_bytes,
+        modified: probed.modified,
+        container_format: probed.container_format,
+        codec: probed.codec,
         hash: None,
         samples: probed.samples,
     }
+}
+
+pub fn is_facomp_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("facomp"))
+}
+
+fn write_atomic(path: &Path, contents: &str) -> Result<()> {
+    let file_name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "composition.facomp".into());
+    let dir = path.parent().filter(|p| !p.as_os_str().is_empty());
+    let tmp = match dir {
+        Some(dir) => dir.join(format!(".{file_name}.tmp")),
+        None => PathBuf::from(format!(".{file_name}.tmp")),
+    };
+    std::fs::write(&tmp, contents).with_context(|| format!("failed to write {}", tmp.display()))?;
+    if path.exists() {
+        let _ = std::fs::remove_file(path);
+    }
+    std::fs::rename(&tmp, path).with_context(|| {
+        format!(
+            "failed to replace {} with {}",
+            path.display(),
+            tmp.display()
+        )
+    })
 }
 
 pub struct FramesIter<'a> {
@@ -1192,10 +1288,50 @@ mod tests {
         let json = comp.to_json().unwrap();
         assert!(!json.contains("samples"));
         assert!(!json.contains("0.5"));
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(value["kind"], "facomp");
+        assert_eq!(value["format_version"], 1);
+        let media = &value["media"][0];
+        assert!(media.get("path").is_some());
+        assert!(media.get("size_bytes").is_some());
+        assert!(media.get("modified").is_some());
+        assert_eq!(media["container_format"], "memory");
+        assert_eq!(media["codec"], "pcm");
         let restored = Composition::from_json(&json).unwrap();
         assert_eq!(restored.frames(), comp.frames());
         assert_eq!(restored.current_edit().0, comp.current_edit().0);
         restored.assert_invariants();
+    }
+
+    #[test]
+    fn project_json_rejects_wrong_kind_and_future_version() {
+        let err = Composition::from_json(r#"{"kind":"other","format_version":1}"#)
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(err.contains("kind"));
+        let err = Composition::from_json(r#"{"kind":"facomp"}"#)
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(err.contains("format_version"));
+        let err = Composition::from_json(
+            r#"{"kind":"facomp","format_version":99,"sample_rate":1,"channel_count":1,"media":[],"initial":{"type":"empty"},"edits":[],"edit_cursor":0}"#,
+        )
+        .err()
+        .unwrap()
+        .to_string();
+        assert!(err.contains("newer snd-review"));
+    }
+
+    #[test]
+    fn suggested_facomp_name_appends_extension() {
+        let media = sine_media(4, 1, 44100);
+        let mut media = media;
+        media.path = std::path::PathBuf::from("take.wav");
+        let comp = Composition::from_media(media).unwrap();
+        assert_eq!(comp.suggested_facomp_name(), "take.wav.facomp");
+        assert_eq!(comp.display_name(), "take.wav");
     }
 
     #[test]
@@ -1262,6 +1398,58 @@ mod tests {
         assert!(!comp.needs_peak_build());
         progress.finish(epoch);
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn facomp_save_and_reload_reprobes_media() {
+        use std::io::Write;
+        fn write_sine_wav(path: &std::path::Path, channels: u16, frames: u32, sample_rate: u32) {
+            let bits_per_sample: u16 = 16;
+            let block_align = channels * bits_per_sample / 8;
+            let byte_rate = sample_rate * u32::from(block_align);
+            let data_len = frames * u32::from(block_align);
+            let mut out = std::fs::File::create(path).unwrap();
+            out.write_all(b"RIFF").unwrap();
+            out.write_all(&(36 + data_len).to_le_bytes()).unwrap();
+            out.write_all(b"WAVE").unwrap();
+            out.write_all(b"fmt ").unwrap();
+            out.write_all(&16u32.to_le_bytes()).unwrap();
+            out.write_all(&1u16.to_le_bytes()).unwrap();
+            out.write_all(&channels.to_le_bytes()).unwrap();
+            out.write_all(&sample_rate.to_le_bytes()).unwrap();
+            out.write_all(&byte_rate.to_le_bytes()).unwrap();
+            out.write_all(&block_align.to_le_bytes()).unwrap();
+            out.write_all(&bits_per_sample.to_le_bytes()).unwrap();
+            out.write_all(b"data").unwrap();
+            out.write_all(&data_len.to_le_bytes()).unwrap();
+            for i in 0..frames {
+                let t = i as f32 / sample_rate as f32;
+                let sample = (t * 440.0 * std::f32::consts::TAU).sin();
+                let pcm = (sample * 0.6 * i16::MAX as f32) as i16;
+                for _ in 0..channels {
+                    out.write_all(&pcm.to_le_bytes()).unwrap();
+                }
+            }
+        }
+        let dir = std::env::temp_dir();
+        let wav = dir.join("snd-composition-facomp-src.wav");
+        let facomp = dir.join("snd-composition-facomp-src.wav.facomp");
+        write_sine_wav(&wav, 1, 256, 44100);
+        let mut live = Composition::load_from_path(&wav).unwrap();
+        live.remove(10, 8);
+        live.save_to_path(&facomp).unwrap();
+        let json = std::fs::read_to_string(&facomp).unwrap();
+        assert!(json.contains("\"kind\": \"facomp\""));
+        assert!(!json.contains("samples"));
+        let (restored, warnings) = Composition::load_facomp(&facomp).unwrap();
+        assert!(warnings.is_empty());
+        assert_eq!(restored.frames(), live.frames());
+        assert_eq!(restored.sample_rate(), 44100);
+        let media = restored.pool().first().unwrap();
+        assert_eq!(media.container_format, "wav");
+        assert!(media.samples.is_none());
+        let _ = std::fs::remove_file(wav);
+        let _ = std::fs::remove_file(facomp);
     }
 
     #[test]

@@ -8,6 +8,6 @@ pub mod selection;
 pub mod snap;
 
 pub use buffer::{Buffer, BufferSource, ChannelScope, Marker, MarkerId, Region, RegionId};
-pub use composition::{Clipboard, Composition, EditId, EditOp, MediaRef};
+pub use composition::{is_facomp_path, Clipboard, Composition, EditId, EditOp, MediaRef};
 pub use document::BufferDocument;
 pub use selection::{SamplePosition, Selection};

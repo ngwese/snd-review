@@ -9,10 +9,11 @@ use std::time::Duration;
 
 use cpal::Device;
 use gpui::{
-    div, point, prelude::FluentBuilder as _, px, size, App, AppContext as _, Bounds, Context,
-    Entity, ExternalPaths, FocusHandle, Focusable, Global, InteractiveElement as _, IntoElement,
-    KeyContext, Menu, MenuItem, ParentElement as _, PathPromptOptions, Pixels, Render,
-    SharedString, Styled as _, TitlebarOptions, WeakEntity, Window, WindowBounds, WindowOptions,
+    div, hsla, point, prelude::FluentBuilder as _, px, rems, size, App, AppContext as _, Bounds,
+    Context, Entity, ExternalPaths, FocusHandle, Focusable, Global, InteractiveElement as _,
+    IntoElement, KeyContext, Menu, MenuItem, ParentElement as _, PathPromptOptions, Pixels, Render,
+    SharedString, StatefulInteractiveElement as _, Styled as _, TitlebarOptions, WeakEntity,
+    Window, WindowBounds, WindowOptions,
 };
 use gpui_component::{
     button::{Button, ButtonVariants as _},
@@ -22,29 +23,30 @@ use gpui_component::{
     },
     h_flex,
     menu::AppMenuBar,
-    v_flex, ActiveTheme as _, GlobalState, Icon, IconName, Root, Selectable as _, Sizable as _,
-    Theme, ThemeMode, TitleBar, WindowExt as _,
+    v_flex, ActiveTheme as _, Disableable as _, GlobalState, Icon, IconName, Root, Selectable as _,
+    Sizable as _, StyledExt as _, Theme, ThemeMode, TitleBar, WindowExt as _,
 };
 
 use crate::assets::AppAssets;
 use crate::commands::{
     install_keybindings, About, EditCopy, EditCut, EditDelete, EditDuplicate, EditPaste, EditRedo,
-    EditRemove, EditRollLeft, EditRollRight, EditTrim, EditUndo, Open, Quit, TransportEnd,
-    TransportHome, TransportLoop, TransportNext, TransportPlayPause, TransportPrevious,
-    TransportStart, TransportStop, ViewExplorer, ViewFitAll, ViewFrame, ViewHistory, ViewScript,
-    ViewZoomIn, ViewZoomOut,
+    EditRemove, EditRollLeft, EditRollRight, EditTrim, EditUndo, Open, Quit, Render as RenderFile,
+    Save, SaveAs, TransportEnd, TransportHome, TransportLoop, TransportNext, TransportPlayPause,
+    TransportPrevious, TransportStart, TransportStop, ViewExplorer, ViewFitAll, ViewFrame,
+    ViewHistory, ViewScript, ViewZoomIn, ViewZoomOut,
 };
 use crate::components::dock_skin::{CenterTabCloseHandler, CompactDockSkin};
 use crate::components::edits::EditsPanel;
 use crate::components::empty_pane::EmptyPane;
 use crate::components::explorer::{ExplorerEvent, ExplorerPanel};
 use crate::components::header_meta::HeaderMeta;
+use crate::components::render_sheet::RenderSheet;
 use crate::components::repl::ReplPanel;
 use crate::components::status_bar::{FileStatus, FileStatusBar};
 use crate::components::waveform::{ToggleZeroCrossing, WaveformDisplay};
 use crate::components::workspace::WorkspacePanel;
 use crate::model::composition::Composition;
-use crate::model::{Buffer, BufferDocument};
+use crate::model::{is_facomp_path, Buffer, BufferDocument};
 use crate::playback::{PlaybackSession, TransportState};
 use crate::progress::ProgressState;
 use crate::script::{EvalOutput, ScriptHost};
@@ -77,7 +79,10 @@ pub struct AppView {
     playback: PlaybackSession,
     app_menu_bar: Option<Entity<AppMenuBar>>,
     pending_opens: Arc<Mutex<Vec<PathBuf>>>,
-    pending_load: Arc<Mutex<Vec<(DocumentId, u64, Result<Composition, String>)>>>,
+    pending_load: Arc<Mutex<Vec<(DocumentId, u64, Result<(Composition, Vec<String>), String>)>>>,
+    pending_render: Arc<Mutex<Vec<(DocumentId, u64, Result<(), String>)>>>,
+    render_sheet: Entity<RenderSheet>,
+    render_sheet_open: bool,
     focus_handle: FocusHandle,
     last_progress: Option<ProgressState>,
     script_dock_size: Pixels,
@@ -103,6 +108,7 @@ impl AppView {
                 this.update(cx, |this, cx| {
                     this.drain_pending_opens(window, cx);
                     this.drain_pending_load(window, cx);
+                    this.drain_pending_render(window, cx);
                     if let Some(views) = this.active_views() {
                         views.document.update(cx, |doc, cx| {
                             if this.playback.poll(doc) {
@@ -175,6 +181,8 @@ impl AppView {
         let labels = cx.new(|cx| EmptyPane::new("LabelsPanel", "Labels", cx));
         let script = ScriptHost::new().expect("lua runtime");
         let repl = cx.new(|cx| ReplPanel::new(window, cx));
+        let render_sheet = cx.new(|cx| RenderSheet::new(window, cx));
+        cx.observe(&render_sheet, |_, _, cx| cx.notify()).detach();
         repl.update(cx, |repl, _| {
             let app = app.clone();
             repl.set_handler(Rc::new(move |code, window, cx| {
@@ -244,6 +252,9 @@ impl AppView {
             app_menu_bar: (!cfg!(target_os = "macos")).then(|| AppMenuBar::new(cx)),
             pending_opens,
             pending_load: Arc::new(Mutex::new(Vec::new())),
+            pending_render: Arc::new(Mutex::new(Vec::new())),
+            render_sheet,
+            render_sheet_open: false,
             focus_handle: cx.focus_handle(),
             last_progress: None,
             script_dock_size: px(160.),
@@ -311,7 +322,7 @@ impl AppView {
         if let Some(path) = self
             .session
             .get(id)
-            .and_then(|doc| doc.source_path.as_ref())
+            .and_then(|doc| doc.project_path.as_ref().or(doc.source_path.as_ref()))
         {
             if let Some(name) = path.file_name() {
                 let name = name.to_string_lossy();
@@ -786,7 +797,9 @@ impl AppView {
     }
 
     pub(crate) fn script_path(&self, id: DocumentId) -> Option<PathBuf> {
-        self.session.get(id).and_then(|doc| doc.source_path.clone())
+        self.session
+            .get(id)
+            .and_then(|doc| doc.project_path.clone().or_else(|| doc.source_path.clone()))
     }
 
     pub(crate) fn script_open(
@@ -842,6 +855,9 @@ impl AppView {
     ) -> Result<(), String> {
         match command_id {
             "file.open" => self.prompt_open_file(window, cx),
+            "file.save" => self.save_active(window, cx),
+            "file.save_as" => self.prompt_save_as(window, cx),
+            "file.render" => self.open_render_sheet(window, cx),
             "file.quit" => cx.quit(),
             "help.about" => {
                 window.open_alert_dialog(cx, |alert, _, _| {
@@ -988,6 +1004,267 @@ impl AppView {
         });
     }
 
+    fn show_media_warning(&self, message: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let message = message.to_string();
+        window.open_alert_dialog(cx, move |alert, _, _| {
+            alert
+                .title("Source media changed")
+                .description(message.clone())
+        });
+    }
+
+    fn show_save_error(&self, message: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let message = message.to_string();
+        window.open_alert_dialog(cx, move |alert, _, _| {
+            alert.title("Failed to save").description(message.clone())
+        });
+    }
+
+    fn suggested_save_directory(&self, id: DocumentId, cx: &App) -> PathBuf {
+        if let Some(doc) = self.session.get(id) {
+            if let Some(parent) = doc
+                .project_path
+                .as_ref()
+                .or(doc.source_path.as_ref())
+                .and_then(|path| path.parent())
+            {
+                return parent.to_path_buf();
+            }
+        }
+        if let Some(views) = self.views.get(&id) {
+            if let Some(parent) = views
+                .composition
+                .read()
+                .unwrap()
+                .pool()
+                .first()
+                .and_then(|media| media.path.parent())
+            {
+                return parent.to_path_buf();
+            }
+        }
+        let _ = cx;
+        std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+    }
+
+    fn save_active(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(id) = self.session.active() else {
+            self.show_save_error("No composition is open.", window, cx);
+            return;
+        };
+        if let Some(path) = self
+            .session
+            .get(id)
+            .and_then(|doc| doc.project_path.clone())
+        {
+            self.write_project(id, path, window, cx);
+        } else {
+            self.prompt_save_as(window, cx);
+        }
+    }
+
+    fn prompt_save_as(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(id) = self.session.active() else {
+            self.show_save_error("No composition is open.", window, cx);
+            return;
+        };
+        let directory = self.suggested_save_directory(id, cx);
+        let suggested = self
+            .views
+            .get(&id)
+            .map(|views| views.composition.read().unwrap().suggested_facomp_name())
+            .unwrap_or_else(|| "untitled.facomp".into());
+        let receiver = cx.prompt_for_new_path(&directory, Some(&suggested));
+        let view = cx.entity();
+        cx.spawn_in(window, async move |_, cx| {
+            let path = match receiver.await {
+                Ok(Ok(Some(path))) => path,
+                _ => return,
+            };
+            let _ = cx.update(|window, cx| {
+                view.update(cx, |this, cx| {
+                    this.write_project(id, path, window, cx);
+                });
+            });
+        })
+        .detach();
+    }
+
+    fn write_project(
+        &mut self,
+        id: DocumentId,
+        path: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(views) = self.views.get(&id) else {
+            self.show_save_error("Composition is not open.", window, cx);
+            return;
+        };
+        let result = views.composition.read().unwrap().save_to_path(&path);
+        match result {
+            Ok(()) => {
+                if let Some(doc) = self.session.get_mut(id) {
+                    doc.project_path = Some(path);
+                }
+                self.refresh_explorer(cx);
+                self.update_window_title(window, cx);
+                cx.notify();
+            }
+            Err(err) => self.show_save_error(&format!("{err:#}"), window, cx),
+        }
+    }
+
+    fn open_render_sheet(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(id) = self.session.active() else {
+            window.open_alert_dialog(cx, |alert, _, _| {
+                alert
+                    .title("Nothing to render")
+                    .description("Open a composition before rendering.")
+            });
+            return;
+        };
+        let Some(views) = self.views.get(&id).cloned() else {
+            return;
+        };
+        let directory = self.suggested_save_directory(id, cx);
+        let composition = views.composition.clone();
+        self.render_sheet.update(cx, |sheet, cx| {
+            sheet.configure(&composition.read().unwrap(), directory, window, cx);
+        });
+        self.render_sheet_open = true;
+        cx.notify();
+    }
+
+    fn close_render_sheet(&mut self, cx: &mut Context<Self>) {
+        if !self.render_sheet_open {
+            return;
+        }
+        self.render_sheet_open = false;
+        cx.notify();
+    }
+
+    fn render_sheet_overlay(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme().clone();
+        let can_render = self.render_sheet.read(cx).can_render(cx);
+        let sheet = self.render_sheet.clone();
+        div()
+            .id("render-sheet-layer")
+            .absolute()
+            .inset_0()
+            .occlude()
+            .child(
+                div()
+                    .id("render-sheet-backdrop")
+                    .absolute()
+                    .inset_0()
+                    .bg(hsla(0., 0., 0., 0.25))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.close_render_sheet(cx);
+                    })),
+            )
+            .child(
+                v_flex()
+                    .id("render-sheet-panel")
+                    .absolute()
+                    .top_0()
+                    .left(rems(5.))
+                    .right(rems(5.))
+                    .bg(theme.background)
+                    .border_l_1()
+                    .border_r_1()
+                    .border_b_1()
+                    .border_color(theme.border)
+                    .shadow_xl()
+                    .occlude()
+                    .child(div().px_4().py_2().font_semibold().child("Render"))
+                    .child(div().px_4().py_1().w_full().child(sheet.clone()))
+                    .child(
+                        h_flex()
+                            .w_full()
+                            .px_4()
+                            .py_3()
+                            .justify_end()
+                            .gap_2()
+                            .child(
+                                Button::new("render-cancel")
+                                    .outline()
+                                    .label("Cancel")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.close_render_sheet(cx);
+                                    })),
+                            )
+                            .child(
+                                Button::new("render-go")
+                                    .primary()
+                                    .label("Render")
+                                    .disabled(!can_render)
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.start_render(&sheet, window, cx);
+                                    })),
+                            ),
+                    ),
+            )
+    }
+
+    fn start_render(
+        &mut self,
+        sheet: &Entity<RenderSheet>,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(id) = self.session.active() else {
+            return;
+        };
+        let Some(job) = sheet.read(cx).job(cx) else {
+            return;
+        };
+        let Some(views) = self.views.get(&id).cloned() else {
+            return;
+        };
+        self.close_render_sheet(cx);
+        let epoch = views.document.read(cx).progress.begin("rendering");
+        let progress = views.document.read(cx).progress.clone();
+        views.waveform.update(cx, |_, cx| cx.notify());
+        cx.notify();
+        let pending = self.pending_render.clone();
+        let composition = views.composition.clone();
+        std::thread::spawn(move || {
+            let result = {
+                let guard = composition.read().unwrap();
+                crate::render::render_to_path(&guard, &job, Some(&progress), epoch)
+                    .map_err(|err| format!("{err:#}"))
+            };
+            pending.lock().unwrap().push((id, epoch, result));
+        });
+    }
+
+    fn drain_pending_render(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let completed = std::mem::take(&mut *self.pending_render.lock().unwrap());
+        for (id, epoch, result) in completed {
+            let Some(views) = self.views.get(&id) else {
+                continue;
+            };
+            if !views.document.read(cx).progress.is_epoch(epoch) {
+                continue;
+            }
+            views.document.read(cx).progress.finish(epoch);
+            match result {
+                Ok(()) => {
+                    views.waveform.update(cx, |_, cx| cx.notify());
+                    cx.notify();
+                }
+                Err(err) => {
+                    let message = err.clone();
+                    window.open_alert_dialog(cx, move |alert, _, _| {
+                        alert.title("Render failed").description(message.clone())
+                    });
+                    cx.notify();
+                }
+            }
+        }
+    }
+
     fn drain_pending_opens(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let paths = std::mem::take(&mut *self.pending_opens.lock().unwrap());
         for path in paths {
@@ -1006,7 +1283,12 @@ impl AppView {
                 continue;
             }
             match result {
-                Ok(composition) => self.push_loaded_composition(id, composition, window, cx),
+                Ok((composition, warnings)) => {
+                    self.push_loaded_composition(id, composition, window, cx);
+                    if !warnings.is_empty() {
+                        self.show_media_warning(&warnings.join("\n"), window, cx);
+                    }
+                }
                 Err(err) => {
                     if let Some(views) = self.views.get(&id) {
                         views.document.read(cx).progress.cancel();
@@ -1028,6 +1310,11 @@ impl AppView {
         let composition = Arc::new(RwLock::new(Composition::new(44100, 2)));
         let buffer = Arc::new(RwLock::new(Buffer::empty()));
         let id = self.add_document(composition, buffer, Some(path.clone()), window, cx);
+        if is_facomp_path(&path) {
+            if let Some(doc) = self.session.get_mut(id) {
+                doc.project_path = Some(path.clone());
+            }
+        }
         self.apply_active(window, cx);
         let Some(views) = self.views.get(&id) else {
             return;
@@ -1037,7 +1324,8 @@ impl AppView {
         cx.notify();
         let pending = self.pending_load.clone();
         std::thread::spawn(move || {
-            let result = Composition::load_from_path(&path).map_err(|err| format!("{err:#}"));
+            let result =
+                Composition::load_from_path_with_warnings(&path).map_err(|err| format!("{err:#}"));
             pending.lock().unwrap().push((id, epoch, result));
         });
     }
@@ -1177,60 +1465,84 @@ impl Render for AppView {
                         ),
                     )
                     .child(
-                        h_flex()
-                            .w_full()
-                            .flex_none()
-                            .px_3()
-                            .py_2()
-                            .gap_2()
-                            .items_center()
-                            .border_b_1()
-                            .border_color(theme.border)
-                            .bg(theme.title_bar)
-                            .child(
-                                Button::new("toggle-explorer-dock")
-                                    .ghost()
-                                    .small()
-                                    .icon(explorer_icon)
-                                    .tooltip(explorer_tooltip)
-                                    .selected(explorer_open)
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.toggle_explorer_dock(window, cx);
-                                    })),
-                            )
-                            .child(self.header_meta.clone())
-                            .child(
-                                Button::new("toggle-script-dock")
-                                    .ghost()
-                                    .small()
-                                    .icon(console_icon)
-                                    .tooltip(console_tooltip)
-                                    .selected(console_open)
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.toggle_script_dock(window, cx);
-                                    })),
-                            )
-                            .child(
-                                Button::new("toggle-edits-dock")
-                                    .ghost()
-                                    .small()
-                                    .icon(edits_icon)
-                                    .tooltip(edits_tooltip)
-                                    .selected(edits_open)
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.toggle_edits_dock(window, cx);
-                                    })),
-                            ),
-                    )
-                    .child(
                         div()
+                            .relative()
                             .flex_1()
                             .min_h_0()
                             .w_full()
-                            .child(self.dock_area.clone()),
-                    )
-                    .child(FileStatusBar::new(file_status).with_progress_message(progress_message)),
+                            .child(
+                                v_flex()
+                                    .size_full()
+                                    .child(
+                                        h_flex()
+                                            .w_full()
+                                            .flex_none()
+                                            .px_3()
+                                            .py_2()
+                                            .gap_2()
+                                            .items_center()
+                                            .border_b_1()
+                                            .border_color(theme.border)
+                                            .bg(theme.title_bar)
+                                            .child(
+                                                Button::new("toggle-explorer-dock")
+                                                    .ghost()
+                                                    .small()
+                                                    .icon(explorer_icon)
+                                                    .tooltip(explorer_tooltip)
+                                                    .selected(explorer_open)
+                                                    .on_click(cx.listener(
+                                                        |this, _, window, cx| {
+                                                            this.toggle_explorer_dock(window, cx);
+                                                        },
+                                                    )),
+                                            )
+                                            .child(self.header_meta.clone())
+                                            .child(
+                                                Button::new("toggle-script-dock")
+                                                    .ghost()
+                                                    .small()
+                                                    .icon(console_icon)
+                                                    .tooltip(console_tooltip)
+                                                    .selected(console_open)
+                                                    .on_click(cx.listener(
+                                                        |this, _, window, cx| {
+                                                            this.toggle_script_dock(window, cx);
+                                                        },
+                                                    )),
+                                            )
+                                            .child(
+                                                Button::new("toggle-edits-dock")
+                                                    .ghost()
+                                                    .small()
+                                                    .icon(edits_icon)
+                                                    .tooltip(edits_tooltip)
+                                                    .selected(edits_open)
+                                                    .on_click(cx.listener(
+                                                        |this, _, window, cx| {
+                                                            this.toggle_edits_dock(window, cx);
+                                                        },
+                                                    )),
+                                            ),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .min_h_0()
+                                            .w_full()
+                                            .child(self.dock_area.clone()),
+                                    )
+                                    .child(
+                                        FileStatusBar::new(file_status)
+                                            .with_progress_message(progress_message),
+                                    ),
+                            )
+                            .when(self.render_sheet_open, |this| {
+                                this.child(self.render_sheet_overlay(cx))
+                            }),
+                    ),
             )
+            .children(Root::render_sheet_layer(window, cx))
             .children(Root::render_dialog_layer(window, cx))
     }
 }
@@ -1284,6 +1596,18 @@ fn quit(_: &Quit, cx: &mut App) {
 
 fn open(_: &Open, cx: &mut App) {
     let _ = crate::commands::dispatch("file.open", cx);
+}
+
+fn save(_: &Save, cx: &mut App) {
+    let _ = crate::commands::dispatch("file.save", cx);
+}
+
+fn save_as(_: &SaveAs, cx: &mut App) {
+    let _ = crate::commands::dispatch("file.save_as", cx);
+}
+
+fn render_cmd(_: &RenderFile, cx: &mut App) {
+    let _ = crate::commands::dispatch("file.render", cx);
 }
 
 fn about(_: &About, cx: &mut App) {
@@ -1398,6 +1722,10 @@ fn app_menus(explorer: bool, history: bool, script: bool) -> Vec<Menu> {
     vec![
         Menu::new("File").items([
             MenuItem::action("Open...", Open),
+            MenuItem::action("Save", Save),
+            MenuItem::action("Save As...", SaveAs),
+            MenuItem::separator(),
+            MenuItem::action("Render...", RenderFile),
             MenuItem::separator(),
             MenuItem::action("Quit", Quit),
         ]),
@@ -1441,6 +1769,9 @@ fn apply_app_menus(explorer: bool, history: bool, script: bool, cx: &mut App) {
 
 fn install_app_menu(cx: &mut App) {
     cx.on_action(open);
+    cx.on_action(save);
+    cx.on_action(save_as);
+    cx.on_action(render_cmd);
     cx.on_action(quit);
     cx.on_action(about);
     cx.on_action(transport_home);

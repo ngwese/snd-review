@@ -11,6 +11,9 @@ actions!(
     snd_review,
     [
         Open,
+        Save,
+        SaveAs,
+        Render,
         About,
         Quit,
         TransportHome,
@@ -56,6 +59,9 @@ const WAVEFORM_HOVER_KEY_CONTEXT: &str = "WaveformHover";
 
 const KNOWN_COMMANDS: &[&str] = &[
     "file.open",
+    "file.save",
+    "file.save_as",
+    "file.render",
     "file.quit",
     "help.about",
     "view.fit_all",
@@ -276,6 +282,9 @@ fn binding_in(command_id: &str, keystrokes: &str, context: &str) -> Option<KeyBi
     }
     Some(match command_id {
         "file.open" => KeyBinding::new(keystrokes, Open, Some(context)),
+        "file.save" => KeyBinding::new(keystrokes, Save, Some(context)),
+        "file.save_as" => KeyBinding::new(keystrokes, SaveAs, Some(context)),
+        "file.render" => KeyBinding::new(keystrokes, Render, Some(context)),
         "file.quit" => KeyBinding::new(keystrokes, Quit, Some(context)),
         "help.about" => KeyBinding::new(keystrokes, About, Some(context)),
         "view.fit_all" => KeyBinding::new(keystrokes, ViewFitAll, Some(context)),
@@ -360,6 +369,11 @@ mod tests {
             Some("transport.play_pause")
         );
         assert_eq!(map.get("cmd-o").map(String::as_str), Some("file.open"));
+        assert_eq!(map.get("cmd-s").map(String::as_str), Some("file.save"));
+        assert_eq!(
+            map.get("cmd-shift-s").map(String::as_str),
+            Some("file.save_as")
+        );
         assert_eq!(map.get("cmd-z").map(String::as_str), Some("edit.undo"));
         assert_eq!(map.get("cmd-x").map(String::as_str), Some("edit.cut"));
         assert_eq!(map.get("cmd-c").map(String::as_str), Some("edit.copy"));

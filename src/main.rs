@@ -16,6 +16,7 @@ mod components;
 mod model;
 mod playback;
 mod progress;
+mod render;
 mod script;
 mod session;
 

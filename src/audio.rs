@@ -34,6 +34,9 @@ pub struct ProbedFile {
     pub frame_count: u64,
     pub bits_per_sample: Option<u32>,
     pub size_bytes: u64,
+    pub modified: SystemTime,
+    pub container_format: String,
+    pub codec: String,
     pub samples: Option<Arc<Vec<Vec<f32>>>>,
 }
 
@@ -184,6 +187,13 @@ pub fn probe_file(path: &Path) -> Result<ProbedFile> {
         .unwrap_or(0);
     let bits_per_sample = codec_bits_per_sample(&track.codec_params);
     let frame_count = track.codec_params.n_frames.filter(|n| *n > 0);
+    let container_format = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("unknown")
+        .to_string();
+    let codec = track.codec_params.codec.to_string();
+    let modified = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
     if let Some(frame_count) = frame_count {
         if sample_rate != 0 && channel_count != 0 {
             return Ok(ProbedFile {
@@ -193,6 +203,9 @@ pub fn probe_file(path: &Path) -> Result<ProbedFile> {
                 frame_count,
                 bits_per_sample,
                 size_bytes: metadata.len(),
+                modified,
+                container_format,
+                codec,
                 samples: None,
             });
         }
@@ -206,6 +219,9 @@ pub fn probe_file(path: &Path) -> Result<ProbedFile> {
         frame_count: audio.frames() as u64,
         bits_per_sample,
         size_bytes: metadata.len(),
+        modified,
+        container_format,
+        codec,
         samples: Some(Arc::new(audio.channels)),
     })
 }
@@ -441,6 +457,12 @@ fn probe_flac_header(path: &Path, size_bytes: u64) -> Option<ProbedFile> {
         frame_count: info.frame_count,
         bits_per_sample: info.bits_per_sample,
         size_bytes,
+        modified: fs::metadata(path)
+            .ok()
+            .and_then(|meta| meta.modified().ok())
+            .unwrap_or(SystemTime::UNIX_EPOCH),
+        container_format: "flac".into(),
+        codec: "flac".into(),
         samples: None,
     })
 }

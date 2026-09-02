@@ -23,6 +23,7 @@ impl DocumentId {
 pub struct OpenDocument {
     pub id: DocumentId,
     pub source_path: Option<PathBuf>,
+    pub project_path: Option<PathBuf>,
     pub tab_open: bool,
 }
 
@@ -69,8 +70,15 @@ impl DocumentSession {
 
     pub fn find_by_path(&self, path: &Path) -> Option<DocumentId> {
         self.documents.iter().find_map(|doc| {
-            let source = doc.source_path.as_deref()?;
-            paths_equivalent(source, path).then_some(doc.id)
+            let matches_source = doc
+                .source_path
+                .as_deref()
+                .is_some_and(|source| paths_equivalent(source, path));
+            let matches_project = doc
+                .project_path
+                .as_deref()
+                .is_some_and(|project| paths_equivalent(project, path));
+            (matches_source || matches_project).then_some(doc.id)
         })
     }
 
@@ -81,6 +89,7 @@ impl DocumentSession {
         self.documents.push(OpenDocument {
             id,
             source_path,
+            project_path: None,
             tab_open: true,
         });
         self.active = Some(id);
@@ -217,6 +226,14 @@ mod tests {
         session.ensure_tab(found);
         assert_eq!(session.len(), 2);
         assert_eq!(session.active(), Some(a));
+    }
+
+    #[test]
+    fn find_by_path_matches_project_path() {
+        let mut session = DocumentSession::new();
+        let a = session.push(Some(path("a.wav")));
+        session.get_mut(a).unwrap().project_path = Some(path("a.wav.facomp"));
+        assert_eq!(session.find_by_path(Path::new("a.wav.facomp")), Some(a));
     }
 
     #[test]
