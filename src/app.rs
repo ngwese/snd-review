@@ -29,23 +29,28 @@ use gpui_component::{
 
 use crate::assets::AppAssets;
 use crate::commands::{
-    install_keybindings, About, EditCopy, EditCut, EditDelete, EditDuplicate, EditPaste, EditRedo,
-    EditRemove, EditRollLeft, EditRollRight, EditTrim, EditUndo, Open, Quit, Render as RenderFile,
-    Save, SaveAs, TransportEnd, TransportHome, TransportLoop, TransportNext, TransportPlayPause,
-    TransportPrevious, TransportStart, TransportStop, ViewExplorer, ViewFitAll, ViewFrame,
-    ViewHistory, ViewScript, ViewZoomIn, ViewZoomOut,
+    install_keybindings, About, AddMarker, AddMarkerAtHover, DeleteMarker, EditCopy, EditCut,
+    EditDelete, EditDuplicate, EditPaste, EditRedo, EditRemove, EditRollLeft, EditRollRight,
+    EditTrim, EditUndo, InvertSelection, MarkerTypeBlue, MarkerTypePurple, MarkerTypeYellow, Open,
+    Quit, Render as RenderFile, Save, SaveAs, SelectAll, SelectNone, TransportEnd, TransportHome,
+    TransportLoop, TransportNext, TransportPlayPause, TransportPrevious, TransportStart,
+    TransportStop, ViewExplorer, ViewFitAll, ViewFrame, ViewHistory, ViewScript, ViewZoomIn,
+    ViewZoomOut,
 };
 use crate::components::dock_skin::{CenterTabCloseHandler, CompactDockSkin};
 use crate::components::edits::EditsPanel;
 use crate::components::empty_pane::EmptyPane;
 use crate::components::explorer::{ExplorerEvent, ExplorerPanel};
 use crate::components::header_meta::HeaderMeta;
+use crate::components::markers::MarkersPanel;
 use crate::components::render_sheet::RenderSheet;
 use crate::components::repl::ReplPanel;
 use crate::components::status_bar::{FileStatus, FileStatusBar};
 use crate::components::waveform::{ToggleZeroCrossing, WaveformDisplay};
 use crate::components::workspace::WorkspacePanel;
-use crate::model::composition::Composition;
+use crate::model::composition::{
+    default_marker_type, Composition, MARKER_TYPE_BLUE, MARKER_TYPE_PURPLE, MARKER_TYPE_YELLOW,
+};
 use crate::model::{is_facomp_path, Buffer, BufferDocument};
 use crate::playback::{PlaybackSession, TransportState};
 use crate::progress::ProgressState;
@@ -71,6 +76,7 @@ pub struct AppView {
     dock_area: Entity<DockArea>,
     explorer: Entity<ExplorerPanel>,
     edits: Entity<EditsPanel>,
+    markers: Entity<MarkersPanel>,
     header_meta: Entity<HeaderMeta>,
     empty_editors: Entity<EmptyPane>,
     repl: Entity<ReplPanel>,
@@ -81,12 +87,15 @@ pub struct AppView {
     pending_opens: Arc<Mutex<Vec<PathBuf>>>,
     pending_load: Arc<Mutex<Vec<(DocumentId, u64, Result<(Composition, Vec<String>), String>)>>>,
     pending_render: Arc<Mutex<Vec<(DocumentId, u64, Result<(), String>)>>>,
+    pending_loaded_scripts: Vec<DocumentId>,
     render_sheet: Entity<RenderSheet>,
     render_sheet_open: bool,
     focus_handle: FocusHandle,
     last_progress: Option<ProgressState>,
     script_dock_size: Pixels,
     last_waveform_over: bool,
+    active_marker_type: String,
+    add_marker_at_hover: bool,
 }
 
 impl AppView {
@@ -106,6 +115,7 @@ impl AppView {
                 .await;
             let still_alive = cx.update(|window, cx| {
                 this.update(cx, |this, cx| {
+                    this.drain_pending_loaded_scripts(window, cx);
                     this.drain_pending_opens(window, cx);
                     this.drain_pending_load(window, cx);
                     this.drain_pending_render(window, cx);
@@ -168,17 +178,18 @@ impl AppView {
         let initial_target = session.active().and_then(|id| views.get(&id).cloned());
         let header_meta = cx.new(|cx| HeaderMeta::new(cx));
         let edits = cx.new(|cx| EditsPanel::new(cx));
+        let markers = cx.new(|cx| MarkersPanel::new(cx));
         if let Some(views) = initial_target {
             edits.update(cx, |edits, cx| {
                 edits.set_target(views.document.clone(), views.waveform.clone(), cx);
+            });
+            markers.update(cx, |markers, cx| {
+                markers.set_target(views.document.clone(), views.waveform.clone(), cx);
             });
             header_meta.update(cx, |meta, cx| {
                 meta.set_target(Some(views.document), Some(views.waveform), cx);
             });
         }
-        let transients = cx.new(|cx| EmptyPane::new("TransientsPanel", "Transients", cx));
-        let markers = cx.new(|cx| EmptyPane::new("MarkersPanel", "Markers", cx));
-        let labels = cx.new(|cx| EmptyPane::new("LabelsPanel", "Labels", cx));
         let script = ScriptHost::new().expect("lua runtime");
         let repl = cx.new(|cx| ReplPanel::new(window, cx));
         let render_sheet = cx.new(|cx| RenderSheet::new(window, cx));
@@ -196,9 +207,7 @@ impl AppView {
             None => panel_handle(empty_editors.clone()),
         };
         let edits_handle = panel_handle(edits.clone());
-        let transients_handle = panel_handle(transients);
-        let markers_handle = panel_handle(markers);
-        let labels_handle = panel_handle(labels);
+        let markers_handle = panel_handle(markers.clone());
         dock_area.update(cx, |area, cx| {
             area.set_center(DockLayout::tabs().panel_view(center_handle, cx), window, cx);
             area.set_dock(
@@ -214,9 +223,7 @@ impl AppView {
                 DockPlacement::Right,
                 DockLayout::tabs()
                     .panel_view(edits_handle, cx)
-                    .panel_view(transients_handle, cx)
-                    .panel_view(markers_handle, cx)
-                    .panel_view(labels_handle, cx),
+                    .panel_view(markers_handle, cx),
                 window,
                 cx,
             );
@@ -243,6 +250,7 @@ impl AppView {
             dock_area,
             explorer,
             edits,
+            markers,
             header_meta,
             empty_editors,
             repl,
@@ -253,12 +261,15 @@ impl AppView {
             pending_opens,
             pending_load: Arc::new(Mutex::new(Vec::new())),
             pending_render: Arc::new(Mutex::new(Vec::new())),
+            pending_loaded_scripts: Vec::new(),
             render_sheet,
             render_sheet_open: false,
             focus_handle: cx.focus_handle(),
             last_progress: None,
             script_dock_size: px(160.),
             last_waveform_over: false,
+            active_marker_type: default_marker_type().to_string(),
+            add_marker_at_hover: true,
         };
         this.load_init_lua(window, cx);
         this.refresh_explorer(cx);
@@ -424,6 +435,9 @@ impl AppView {
             self.edits.update(cx, |edits, cx| {
                 edits.set_target(views.document.clone(), views.waveform.clone(), cx);
             });
+            self.markers.update(cx, |markers, cx| {
+                markers.set_target(views.document.clone(), views.waveform.clone(), cx);
+            });
             self.header_meta.update(cx, |meta, cx| {
                 meta.set_target(Some(views.document), Some(views.waveform), cx);
             });
@@ -432,6 +446,8 @@ impl AppView {
                 .bind_composition(self.idle_composition.clone());
             self.playback.reload(&Buffer::empty());
             self.edits.update(cx, |edits, cx| edits.clear_target(cx));
+            self.markers
+                .update(cx, |markers, cx| markers.clear_target(cx));
             self.header_meta.update(cx, |meta, cx| {
                 meta.set_target(None, None, cx);
             });
@@ -629,13 +645,14 @@ impl AppView {
         let Some(views) = self.views.get(&id).cloned() else {
             return;
         };
-        views.document.read(cx).progress.cancel();
         {
             *views.composition.write().unwrap() = composition;
         }
         {
             *views.buffer.write().unwrap() = Buffer::empty();
         }
+        views.document.read(cx).progress.cancel();
+        self.spawn_peak_build(id, cx);
         views
             .document
             .update(cx, |doc, _| doc.reset_for_new_buffer());
@@ -648,10 +665,8 @@ impl AppView {
             self.playback.sync_from_document(views.document.read(cx));
             self.update_window_title(window, cx);
         }
-        self.spawn_peak_build(id, cx);
         self.refresh_explorer(cx);
-        self.dock_area.update(cx, |_, cx| cx.notify());
-        self.fire_loaded_script(id, window, cx);
+        self.pending_loaded_scripts.push(id);
         cx.notify();
     }
 
@@ -696,6 +711,8 @@ impl AppView {
             self.explorer_dock_open(cx),
             self.edits_dock_open(cx),
             self.script_dock_open(cx),
+            &self.active_marker_type,
+            self.add_marker_at_hover,
             cx,
         );
         if let Some(bar) = self.app_menu_bar.clone() {
@@ -938,6 +955,32 @@ impl AppView {
             "edit.trim" => self.run_edit(cx, |doc| doc.edit_trim()),
             "edit.roll_left" => self.run_edit(cx, |doc| doc.edit_roll(-1)),
             "edit.roll_right" => self.run_edit(cx, |doc| doc.edit_roll(1)),
+            "selection.select_all" => self.run_edit(cx, |doc| doc.select_all()),
+            "selection.select_none" => self.run_edit(cx, |doc| doc.clear_selection()),
+            "selection.invert" => self.run_edit(cx, |doc| doc.invert_selection()),
+            "selection.marker_type_blue" => self.set_active_marker_type(MARKER_TYPE_BLUE, cx),
+            "selection.marker_type_yellow" => self.set_active_marker_type(MARKER_TYPE_YELLOW, cx),
+            "selection.marker_type_purple" => self.set_active_marker_type(MARKER_TYPE_PURPLE, cx),
+            "selection.add_at_hover" => {
+                self.add_marker_at_hover = !self.add_marker_at_hover;
+                self.sync_view_menus(cx);
+                cx.notify();
+            }
+            "selection.add_marker" => {
+                let kind = self.active_marker_type.clone();
+                let sample = self.marker_target_sample(cx).unwrap_or(0);
+                self.run_edit(cx, |doc| {
+                    doc.add_marker_of_type(sample, &kind);
+                });
+            }
+            "selection.delete_marker" => {
+                let kind = self.active_marker_type.clone();
+                if let Some(sample) = self.marker_target_sample(cx) {
+                    self.run_edit(cx, |doc| {
+                        doc.remove_marker_at_type(sample, &kind);
+                    });
+                }
+            }
             other => return Err(format!("unknown command `{other}`")),
         }
         Ok(())
@@ -959,6 +1002,30 @@ impl AppView {
         self.spawn_peak_build(id, cx);
     }
 
+    fn set_active_marker_type(&mut self, marker_type: &str, cx: &mut Context<Self>) {
+        if self.active_marker_type == marker_type {
+            return;
+        }
+        self.active_marker_type = marker_type.to_string();
+        self.sync_view_menus(cx);
+        cx.notify();
+    }
+
+    fn marker_target_sample(&self, cx: &App) -> Option<usize> {
+        let views = self.active_views()?;
+        if self.add_marker_at_hover {
+            if let Some(sample) = views.waveform.read(cx).hover_sample() {
+                return Some(sample);
+            }
+        }
+        views
+            .document
+            .read(cx)
+            .current_position
+            .as_ref()
+            .map(|pos| pos.sample)
+    }
+
     fn spawn_peak_build(&self, id: DocumentId, cx: &mut Context<Self>) {
         let Some(views) = self.views.get(&id) else {
             return;
@@ -974,10 +1041,8 @@ impl AppView {
         let epoch = progress.begin("building peaks");
         views.waveform.update(cx, |_, cx| cx.notify());
         std::thread::spawn(move || {
-            let result = {
-                let composition = composition.read().unwrap();
-                composition.build_missing_peak_caches(Some(&progress), epoch)
-            };
+            let result =
+                Composition::build_missing_peak_caches_shared(&composition, Some(&progress), epoch);
             match result {
                 Ok(updates) => {
                     if !updates.is_empty() {
@@ -1272,6 +1337,15 @@ impl AppView {
         }
     }
 
+    fn drain_pending_loaded_scripts(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let ids = std::mem::take(&mut self.pending_loaded_scripts);
+        for id in ids {
+            if self.views.contains_key(&id) {
+                self.fire_loaded_script(id, window, cx);
+            }
+        }
+    }
+
     fn drain_pending_load(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let completed = std::mem::take(&mut *self.pending_load.lock().unwrap());
         for (id, epoch, result) in completed {
@@ -1323,9 +1397,10 @@ impl AppView {
         views.waveform.update(cx, |_, cx| cx.notify());
         cx.notify();
         let pending = self.pending_load.clone();
+        let progress = views.document.read(cx).progress.clone();
         std::thread::spawn(move || {
-            let result =
-                Composition::load_from_path_with_warnings(&path).map_err(|err| format!("{err:#}"));
+            let result = Composition::load_from_path_with_progress(&path, Some(&progress), epoch)
+                .map_err(|err| format!("{err:#}"));
             pending.lock().unwrap().push((id, epoch, result));
         });
     }
@@ -1718,7 +1793,49 @@ fn edit_roll_right(_: &EditRollRight, cx: &mut App) {
     let _ = crate::commands::dispatch("edit.roll_right", cx);
 }
 
-fn app_menus(explorer: bool, history: bool, script: bool) -> Vec<Menu> {
+fn select_all(_: &SelectAll, cx: &mut App) {
+    let _ = crate::commands::dispatch("selection.select_all", cx);
+}
+
+fn select_none(_: &SelectNone, cx: &mut App) {
+    let _ = crate::commands::dispatch("selection.select_none", cx);
+}
+
+fn invert_selection(_: &InvertSelection, cx: &mut App) {
+    let _ = crate::commands::dispatch("selection.invert", cx);
+}
+
+fn marker_type_blue(_: &MarkerTypeBlue, cx: &mut App) {
+    let _ = crate::commands::dispatch("selection.marker_type_blue", cx);
+}
+
+fn marker_type_yellow(_: &MarkerTypeYellow, cx: &mut App) {
+    let _ = crate::commands::dispatch("selection.marker_type_yellow", cx);
+}
+
+fn marker_type_purple(_: &MarkerTypePurple, cx: &mut App) {
+    let _ = crate::commands::dispatch("selection.marker_type_purple", cx);
+}
+
+fn add_marker_at_hover(_: &AddMarkerAtHover, cx: &mut App) {
+    let _ = crate::commands::dispatch("selection.add_at_hover", cx);
+}
+
+fn add_marker(_: &AddMarker, cx: &mut App) {
+    let _ = crate::commands::dispatch("selection.add_marker", cx);
+}
+
+fn delete_marker(_: &DeleteMarker, cx: &mut App) {
+    let _ = crate::commands::dispatch("selection.delete_marker", cx);
+}
+
+fn app_menus(
+    explorer: bool,
+    history: bool,
+    script: bool,
+    marker_type: &str,
+    add_at_hover: bool,
+) -> Vec<Menu> {
     vec![
         Menu::new("File").items([
             MenuItem::action("Open...", Open),
@@ -1745,6 +1862,25 @@ fn app_menus(explorer: bool, history: bool, script: bool) -> Vec<Menu> {
             MenuItem::action("Roll Source Left", EditRollLeft),
             MenuItem::action("Roll Source Right", EditRollRight),
         ]),
+        Menu::new("Selection").items([
+            MenuItem::action("Select All", SelectAll),
+            MenuItem::action("Select None", SelectNone),
+            MenuItem::action("Invert", InvertSelection),
+            MenuItem::separator(),
+            MenuItem::submenu(
+                Menu::new("Marker Type").items([
+                    MenuItem::action("Blue", MarkerTypeBlue)
+                        .checked(marker_type == MARKER_TYPE_BLUE),
+                    MenuItem::action("Yellow", MarkerTypeYellow)
+                        .checked(marker_type == MARKER_TYPE_YELLOW),
+                    MenuItem::action("Purple", MarkerTypePurple)
+                        .checked(marker_type == MARKER_TYPE_PURPLE),
+                ]),
+            ),
+            MenuItem::action("Add at Hover", AddMarkerAtHover).checked(add_at_hover),
+            MenuItem::action("Add Marker", AddMarker),
+            MenuItem::action("Delete Marker", DeleteMarker),
+        ]),
         Menu::new("View").items([
             MenuItem::action("Explorer", ViewExplorer).checked(explorer),
             MenuItem::action("History", ViewHistory).checked(history),
@@ -1758,9 +1894,22 @@ fn app_menus(explorer: bool, history: bool, script: bool) -> Vec<Menu> {
     ]
 }
 
-fn apply_app_menus(explorer: bool, history: bool, script: bool, cx: &mut App) {
-    cx.set_menus(app_menus(explorer, history, script));
-    let owned = app_menus(explorer, history, script)
+fn apply_app_menus(
+    explorer: bool,
+    history: bool,
+    script: bool,
+    marker_type: &str,
+    add_at_hover: bool,
+    cx: &mut App,
+) {
+    cx.set_menus(app_menus(
+        explorer,
+        history,
+        script,
+        marker_type,
+        add_at_hover,
+    ));
+    let owned = app_menus(explorer, history, script, marker_type, add_at_hover)
         .into_iter()
         .map(|menu| menu.owned())
         .collect();
@@ -1800,8 +1949,17 @@ fn install_app_menu(cx: &mut App) {
     cx.on_action(edit_trim);
     cx.on_action(edit_roll_left);
     cx.on_action(edit_roll_right);
+    cx.on_action(select_all);
+    cx.on_action(select_none);
+    cx.on_action(invert_selection);
+    cx.on_action(marker_type_blue);
+    cx.on_action(marker_type_yellow);
+    cx.on_action(marker_type_purple);
+    cx.on_action(add_marker_at_hover);
+    cx.on_action(add_marker);
+    cx.on_action(delete_marker);
     install_keybindings(cx);
-    apply_app_menus(false, false, false, cx);
+    apply_app_menus(false, false, false, default_marker_type(), true, cx);
     cx.activate(true);
 }
 

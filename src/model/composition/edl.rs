@@ -3,6 +3,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use super::markers::Marker;
 use super::tree::ClipTree;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -157,10 +158,12 @@ pub struct ProjectFile {
     pub initial: InitialState,
     pub edits: Vec<EditOp>,
     pub edit_cursor: usize,
+    #[serde(default)]
+    pub markers: Vec<Marker>,
 }
 
 pub const FACOMP_KIND: &str = "facomp";
-pub const FACOMP_FORMAT_VERSION: u32 = 1;
+pub const FACOMP_FORMAT_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProjectEnvelope {
@@ -182,19 +185,14 @@ impl ProjectEnvelope {
     pub fn from_json(json: &str) -> anyhow::Result<Self> {
         use anyhow::{bail, Context};
 
-        let value: serde_json::Value = serde_json::from_str(json).context("parse project JSON")?;
-        let kind = value.get("kind").and_then(|v| v.as_str()).unwrap_or("");
-        if kind != FACOMP_KIND {
-            bail!("not a snd-review composition (kind {kind:?})");
+        let envelope: Self = serde_json::from_str(json).context("parse project JSON")?;
+        if envelope.kind != FACOMP_KIND {
+            bail!("not a snd-review composition (kind {:?})", envelope.kind);
         }
-        let version = value
-            .get("format_version")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0);
-        match version {
+        match envelope.format_version {
+            1 | 2 => Ok(envelope),
             0 => bail!("missing or invalid format_version"),
-            1 => serde_json::from_value(value).context("parse facomp v1"),
-            n if n > u64::from(FACOMP_FORMAT_VERSION) => {
+            n if n > FACOMP_FORMAT_VERSION => {
                 bail!("this file requires a newer snd-review (format_version {n})")
             }
             n => bail!("unsupported format_version {n}"),

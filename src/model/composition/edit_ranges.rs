@@ -190,6 +190,23 @@ pub fn map_point_through_op(frame: u64, op: &EditOp) -> u64 {
     first_mapped_frame(&ranges, op, frame)
 }
 
+/// Map a timeline point through an op. Returns `None` if the point was deleted.
+pub fn map_point_if_kept(frame: u64, op: &EditOp) -> Option<u64> {
+    let ranges = map_range_through_op(frame, frame.saturating_add(1), op);
+    ranges.first().map(|(start, _)| *start)
+}
+
+/// Inverse of [`map_point_if_kept`] for undo / jumping backward.
+pub fn map_point_if_kept_inverse(frame: u64, op: &EditOp) -> Option<u64> {
+    match op {
+        EditOp::Trim { start, .. } => Some(start.saturating_add(frame)),
+        other => match invert_op(other) {
+            Some(inv) => map_point_if_kept(frame, &inv),
+            None => Some(frame),
+        },
+    }
+}
+
 /// Map an inclusive `[start, end]` selection through an op.
 pub fn map_inclusive_through_op(start: u64, end: u64, op: &EditOp) -> Option<(u64, u64)> {
     let end_excl = end.saturating_add(1);

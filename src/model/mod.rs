@@ -7,7 +7,11 @@ pub mod document;
 pub mod selection;
 pub mod snap;
 
-pub use buffer::{Buffer, BufferSource, ChannelScope, Marker, MarkerId, Region, RegionId};
-pub use composition::{is_facomp_path, Clipboard, Composition, EditId, EditOp, MediaRef};
+pub use buffer::{Buffer, BufferSource, ChannelScope, Region, RegionId};
+pub use composition::{
+    default_marker_type, is_facomp_path, marker_type_color, Clipboard, Composition, EditId, EditOp,
+    Marker, MarkerId, MediaRef, DEFAULT_MARKER_TYPES, MARKER_TYPE_BLUE, MARKER_TYPE_PURPLE,
+    MARKER_TYPE_YELLOW,
+};
 pub use document::BufferDocument;
 pub use selection::{SamplePosition, Selection};

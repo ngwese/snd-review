@@ -62,12 +62,12 @@ impl PlaybackSession {
         }
     }
 
-    pub fn refresh_anchors(&mut self, buffer: &Buffer) {
-        self.anchors = collect_anchors(buffer);
+    pub fn refresh_anchors(&mut self, doc: &BufferDocument) {
+        self.anchors = collect_anchors(doc);
     }
 
     fn refresh_anchors_from_doc(&mut self, doc: &BufferDocument) {
-        self.refresh_anchors(&doc.buffer.read().unwrap());
+        self.refresh_anchors(doc);
     }
 
     fn apply_to_engine(&self) {
@@ -223,12 +223,12 @@ impl PlaybackSession {
         }
     }
 
-    pub fn reload(&mut self, buffer: &Buffer) {
+    pub fn reload(&mut self, _buffer: &Buffer) {
         self.stop();
         self.playhead.set_position(0);
         self.playhead.clear_in_out();
         self.active_region = None;
-        self.anchors = collect_anchors(buffer);
+        self.anchors.clear();
         self.engine.shared.bump_epoch();
         self.apply_to_engine();
     }

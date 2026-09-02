@@ -2,12 +2,13 @@
 // SPDX-License-Identifier: MIT
 
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, RwLock};
 
 use anyhow::{bail, Context, Result};
 
 use super::clip::{Clip, ClipId, ClipSpan};
 use super::edl::{EditId, EditOp, Edl, InitialState, ProjectEnvelope, ProjectFile};
+use super::markers::{MarkerId, MarkerList};
 use super::media::{MediaId, MediaPool, MediaRef};
 use super::pager::BlockPager;
 use super::tree::ClipTree;
@@ -41,6 +42,7 @@ pub struct Composition {
     next_clip_id: u64,
     clipboard: Clipboard,
     initial: InitialState,
+    markers: MarkerList,
 }
 
 impl Composition {
@@ -60,6 +62,7 @@ impl Composition {
                 clips: Vec::new(),
             },
             initial: InitialState::Empty,
+            markers: MarkerList::new(),
         }
     }
 
@@ -95,6 +98,7 @@ impl Composition {
             initial: InitialState::FromMedia {
                 media_id: media_id.0,
             },
+            markers: MarkerList::new(),
         };
         let peaked = composed
             .pool
@@ -112,13 +116,27 @@ impl Composition {
     }
 
     pub fn load_from_path_with_warnings(path: &Path) -> Result<(Self, Vec<String>)> {
+        Self::load_from_path_with_progress(path, None, 0)
+    }
+
+    pub fn load_from_path_with_progress(
+        path: &Path,
+        progress: Option<&ProgressHandle>,
+        epoch: u64,
+    ) -> Result<(Self, Vec<String>)> {
         if is_facomp_path(path) {
-            return Self::load_facomp(path);
+            return Self::load_facomp_with_progress(path, progress, epoch);
         }
         use std::collections::hash_map::DefaultHasher;
         use std::hash::{Hash, Hasher};
 
+        if let Some(progress) = progress {
+            progress.set_fraction(epoch, 0.2);
+        }
         let probed = crate::audio::probe_file(path)?;
+        if let Some(progress) = progress {
+            progress.set_fraction(epoch, 0.8);
+        }
         let mut hasher = DefaultHasher::new();
         path.hash(&mut hasher);
         std::time::SystemTime::now().hash(&mut hasher);
@@ -133,12 +151,29 @@ impl Composition {
     }
 
     pub fn load_facomp(path: &Path) -> Result<(Self, Vec<String>)> {
+        Self::load_facomp_with_progress(path, None, 0)
+    }
+
+    fn load_facomp_with_progress(
+        path: &Path,
+        progress: Option<&ProgressHandle>,
+        epoch: u64,
+    ) -> Result<(Self, Vec<String>)> {
         use std::collections::hash_map::DefaultHasher;
         use std::hash::{Hash, Hasher};
 
+        if let Some(progress) = progress {
+            progress.set_fraction(epoch, 0.05);
+        }
         let json = std::fs::read_to_string(path)
             .with_context(|| format!("failed to read {}", path.display()))?;
+        if let Some(progress) = progress {
+            progress.set_fraction(epoch, 0.2);
+        }
         let (mut composition, warnings) = Self::from_json_reprobing(&json)?;
+        if let Some(progress) = progress {
+            progress.set_fraction(epoch, 0.85);
+        }
         let mut hasher = DefaultHasher::new();
         path.hash(&mut hasher);
         std::time::SystemTime::now().hash(&mut hasher);
@@ -147,6 +182,9 @@ impl Composition {
             .join("blocks")
             .join(format!("{:x}", hasher.finish()));
         composition = composition.with_spill_dir(spill)?;
+        if let Some(progress) = progress {
+            progress.set_fraction(epoch, 1.0);
+        }
         Ok((composition, warnings))
     }
 
@@ -194,6 +232,32 @@ impl Composition {
 
     pub fn is_empty(&self) -> bool {
         self.tree.frames() == 0
+    }
+
+    pub fn markers(&self) -> &MarkerList {
+        &self.markers
+    }
+
+    pub fn add_marker(
+        &mut self,
+        frame: u64,
+        marker_type: impl Into<String>,
+        color: [f32; 4],
+        note: Option<String>,
+    ) -> Option<MarkerId> {
+        self.markers.insert(frame, marker_type, color, note)
+    }
+
+    pub fn remove_marker(&mut self, id: MarkerId) -> bool {
+        self.markers.remove(id)
+    }
+
+    pub fn remove_marker_at(&mut self, frame: u64) -> bool {
+        self.markers.remove_at(frame)
+    }
+
+    pub fn remove_marker_at_type(&mut self, frame: u64, marker_type: &str) -> bool {
+        self.markers.remove_at_type(frame, marker_type)
     }
 
     pub fn pool(&self) -> &MediaPool {
@@ -250,12 +314,18 @@ impl Composition {
     }
 
     fn commit(&mut self, op: EditOp, tree: ClipTree) {
+        self.markers.remap_through_op(&op);
         self.tree = tree;
         self.edl.push(op, self.tree.clone());
     }
 
     pub fn undo(&mut self) -> bool {
+        if !self.edl.can_undo() {
+            return false;
+        }
+        let op = self.edl.current().op.clone();
         if let Some(tree) = self.edl.undo() {
+            self.markers.remap_through_inverse(&op);
             self.adopt_tree(tree);
             true
         } else {
@@ -264,7 +334,12 @@ impl Composition {
     }
 
     pub fn redo(&mut self) -> bool {
+        if !self.edl.can_redo() {
+            return false;
+        }
+        let op = self.edl.edits()[self.edl.cursor() + 1].op.clone();
         if let Some(tree) = self.edl.redo() {
+            self.markers.remap_through_op(&op);
             self.adopt_tree(tree);
             true
         } else {
@@ -273,11 +348,32 @@ impl Composition {
     }
 
     pub fn jump_to_edit(&mut self, id: EditId) -> bool {
+        let from = self.edl.cursor();
         if let Some(tree) = self.edl.jump_to(id) {
+            let to = self.edl.cursor();
+            self.remap_markers_between(from, to);
             self.adopt_tree(tree);
             true
         } else {
             false
+        }
+    }
+
+    fn remap_markers_between(&mut self, from: usize, to: usize) {
+        let ops: Vec<EditOp> = self
+            .edl
+            .edits()
+            .iter()
+            .map(|edit| edit.op.clone())
+            .collect();
+        if to > from {
+            for op in &ops[from + 1..=to] {
+                self.markers.remap_through_op(op);
+            }
+        } else if to < from {
+            for op in ops[to + 1..=from].iter().rev() {
+                self.markers.remap_through_inverse(op);
+            }
         }
     }
 
@@ -877,6 +973,88 @@ impl Composition {
         Ok(updated)
     }
 
+    /// Same work as [`Self::build_missing_peak_caches`], but drops the
+    /// composition read lock between peak chunks so the UI can paint.
+    pub fn build_missing_peak_caches_shared(
+        composition: &RwLock<Self>,
+        progress: Option<&ProgressHandle>,
+        epoch: u64,
+    ) -> Result<Vec<(u64, Clip)>> {
+        let (jobs, channel_count, total) = {
+            let this = composition.read().unwrap();
+            let channel_count = this.channel_count;
+            let jobs: Vec<(u64, Arc<Clip>)> = this
+                .tree
+                .spans()
+                .into_iter()
+                .filter(|span| span.clip.needs_peak_cache())
+                .map(|span| (span.start, span.clip.clone()))
+                .collect();
+            let total: u64 = jobs
+                .iter()
+                .map(|(_, clip)| clip.len.saturating_mul(channel_count as u64))
+                .sum();
+            (jobs, channel_count, total)
+        };
+        let mut done = 0u64;
+        let mut updated = Vec::new();
+        if let Some(progress) = progress {
+            progress.set_ratio(epoch, 0, total.max(1));
+        }
+        for (start, clip) in jobs {
+            if progress.is_some_and(|p| !p.is_epoch(epoch)) {
+                break;
+            }
+            let mut peaks = vec![Vec::new(); channel_count];
+            let mut min = f32::MAX;
+            let mut max = f32::MIN;
+            let mut pos = 0u64;
+            let mut chunk = vec![0.0; PEAK_BLOCK];
+            while pos < clip.len {
+                if progress.is_some_and(|p| !p.is_epoch(epoch)) {
+                    return Ok(updated);
+                }
+                let take = ((clip.len - pos) as usize).min(PEAK_BLOCK);
+                {
+                    let this = composition.read().unwrap();
+                    for ch in 0..channel_count {
+                        let dest = &mut chunk[..take];
+                        this.read_clip_channel(clip.as_ref(), ch, pos, dest)?;
+                        let mut pmin = f32::MAX;
+                        let mut pmax = f32::MIN;
+                        for &s in dest.iter() {
+                            pmin = pmin.min(s);
+                            pmax = pmax.max(s);
+                            min = min.min(s);
+                            max = max.max(s);
+                        }
+                        peaks[ch].push(if pmin <= pmax {
+                            (pmin, pmax)
+                        } else {
+                            (0.0, 0.0)
+                        });
+                        done += take as u64;
+                        if let Some(progress) = progress {
+                            progress.set_ratio(epoch, done, total.max(1));
+                        }
+                    }
+                }
+                pos += take as u64;
+            }
+            let mut peaked = (*clip).clone();
+            peaked.cache = super::clip::ClipCache {
+                min: if min <= max { Some(min) } else { None },
+                max: if min <= max { Some(max) } else { None },
+                peaks,
+            };
+            updated.push((start, peaked));
+        }
+        if let Some(progress) = progress {
+            progress.set_fraction(epoch, 1.0);
+        }
+        Ok(updated)
+    }
+
     pub fn to_project_file(&self) -> ProjectFile {
         ProjectFile {
             sample_rate: self.sample_rate,
@@ -885,6 +1063,7 @@ impl Composition {
             initial: self.initial.clone(),
             edits: self.edl.ops_from_first_user(),
             edit_cursor: self.edl.cursor(),
+            markers: self.markers.to_vec(),
         }
     }
 
@@ -922,6 +1101,7 @@ impl Composition {
         if let Some(tree) = composition.edl.jump_to_index(file.edit_cursor) {
             composition.adopt_tree(tree);
         }
+        composition.markers = MarkerList::from_vec(file.markers);
         Ok(composition)
     }
 
@@ -944,15 +1124,27 @@ impl Composition {
             if !media.path.is_file() {
                 bail!("missing source media {}", media.path.display());
             }
-            let probed = crate::audio::probe_file(&media.path)
-                .with_context(|| format!("failed to open source media {}", media.path.display()))?;
-            if probed.size_bytes != media.size_bytes || probed.modified != media.modified {
-                warnings.push(format!("source media changed: {}", media.path.display()));
+            let meta = std::fs::metadata(&media.path)
+                .with_context(|| format!("failed to stat source media {}", media.path.display()))?;
+            if media_stats_match(&media, &meta) {
+                resolved.push(media);
+                continue;
             }
-            let mut next = media_ref_from_probed(probed);
-            next.id = media.id;
-            next.path = media.path;
-            resolved.push(next);
+            warnings.push(format!("source media changed: {}", media.path.display()));
+            match crate::audio::probe_header(&media.path) {
+                Ok(probed) => {
+                    let mut next = media_ref_from_probed(probed);
+                    next.id = media.id;
+                    next.path = media.path;
+                    resolved.push(next);
+                }
+                Err(_) => {
+                    let mut next = media;
+                    next.size_bytes = meta.len();
+                    next.modified = meta.modified().unwrap_or(std::time::UNIX_EPOCH);
+                    resolved.push(next);
+                }
+            }
         }
         file.media = resolved;
         Ok((Self::from_project_file(file)?, warnings))
@@ -1031,6 +1223,23 @@ fn apply_clip_cache(tree: &ClipTree, peaked: &Clip) -> ClipTree {
         clip.cache = peaked.cache.clone();
         clip
     })
+}
+
+fn media_stats_match(media: &MediaRef, meta: &std::fs::Metadata) -> bool {
+    if meta.len() != media.size_bytes {
+        return false;
+    }
+    let Ok(modified) = meta.modified() else {
+        return true;
+    };
+    let stored = media
+        .modified
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let actual = modified
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    stored.as_secs() == actual.as_secs()
 }
 
 fn media_ref_from_probed(probed: ProbedFile) -> MediaRef {
@@ -1290,7 +1499,7 @@ mod tests {
         assert!(!json.contains("0.5"));
         let value: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(value["kind"], "facomp");
-        assert_eq!(value["format_version"], 1);
+        assert_eq!(value["format_version"], 2);
         let media = &value["media"][0];
         assert!(media.get("path").is_some());
         assert!(media.get("size_bytes").is_some());
@@ -1305,16 +1514,23 @@ mod tests {
 
     #[test]
     fn project_json_rejects_wrong_kind_and_future_version() {
-        let err = Composition::from_json(r#"{"kind":"other","format_version":1}"#)
-            .err()
-            .unwrap()
-            .to_string();
+        let err = Composition::from_json(
+            r#"{"kind":"other","format_version":1,"sample_rate":1,"channel_count":1,"media":[],"initial":{"type":"empty"},"edits":[],"edit_cursor":0}"#,
+        )
+        .err()
+        .unwrap()
+        .to_string();
         assert!(err.contains("kind"));
         let err = Composition::from_json(r#"{"kind":"facomp"}"#)
             .err()
             .unwrap()
             .to_string();
-        assert!(err.contains("format_version"));
+        assert!(
+            err.contains("format_version")
+                || err.contains("missing field")
+                || err.contains("parse project JSON"),
+            "{err}"
+        );
         let err = Composition::from_json(
             r#"{"kind":"facomp","format_version":99,"sample_rate":1,"channel_count":1,"media":[],"initial":{"type":"empty"},"edits":[],"edit_cursor":0}"#,
         )
@@ -1401,6 +1617,52 @@ mod tests {
     }
 
     #[test]
+    fn shared_peak_build_fills_file_backed_caches() {
+        use std::io::Write;
+        fn write_sine_wav(path: &std::path::Path, channels: u16, frames: u32, sample_rate: u32) {
+            let bits_per_sample: u16 = 16;
+            let block_align = channels * bits_per_sample / 8;
+            let byte_rate = sample_rate * u32::from(block_align);
+            let data_len = frames * u32::from(block_align);
+            let mut out = std::fs::File::create(path).unwrap();
+            out.write_all(b"RIFF").unwrap();
+            out.write_all(&(36 + data_len).to_le_bytes()).unwrap();
+            out.write_all(b"WAVE").unwrap();
+            out.write_all(b"fmt ").unwrap();
+            out.write_all(&16u32.to_le_bytes()).unwrap();
+            out.write_all(&1u16.to_le_bytes()).unwrap();
+            out.write_all(&channels.to_le_bytes()).unwrap();
+            out.write_all(&sample_rate.to_le_bytes()).unwrap();
+            out.write_all(&byte_rate.to_le_bytes()).unwrap();
+            out.write_all(&block_align.to_le_bytes()).unwrap();
+            out.write_all(&bits_per_sample.to_le_bytes()).unwrap();
+            out.write_all(b"data").unwrap();
+            out.write_all(&data_len.to_le_bytes()).unwrap();
+            for i in 0..frames {
+                let t = i as f32 / sample_rate as f32;
+                let sample = (t * 440.0 * std::f32::consts::TAU).sin();
+                let pcm = (sample * 0.6 * i16::MAX as f32) as i16;
+                for _ in 0..channels {
+                    out.write_all(&pcm.to_le_bytes()).unwrap();
+                }
+            }
+        }
+        let path = std::env::temp_dir().join("snd-composition-shared-peak-test.wav");
+        write_sine_wav(&path, 1, 512, 44100);
+        let lock = std::sync::RwLock::new(Composition::load_from_path(&path).unwrap());
+        assert!(lock.read().unwrap().needs_peak_build());
+        let progress = crate::progress::ProgressHandle::new();
+        let epoch = progress.begin("building peaks");
+        let updates =
+            Composition::build_missing_peak_caches_shared(&lock, Some(&progress), epoch).unwrap();
+        assert!(!updates.is_empty());
+        lock.write().unwrap().apply_peak_caches(updates);
+        assert!(!lock.read().unwrap().needs_peak_build());
+        progress.finish(epoch);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn facomp_save_and_reload_reprobes_media() {
         use std::io::Write;
         fn write_sine_wav(path: &std::path::Path, channels: u16, frames: u32, sample_rate: u32) {
@@ -1450,6 +1712,42 @@ mod tests {
         assert!(media.samples.is_none());
         let _ = std::fs::remove_file(wav);
         let _ = std::fs::remove_file(facomp);
+    }
+
+    #[test]
+    fn facomp_reload_skips_audio_probe_when_stats_match() {
+        let dummy = std::env::temp_dir().join("snd-facomp-not-audio.bin");
+        std::fs::write(&dummy, b"not an audio file at all!!").unwrap();
+        let meta = std::fs::metadata(&dummy).unwrap();
+        let media = MediaRef {
+            id: MediaId(1),
+            path: dummy.clone(),
+            sample_rate: 44100,
+            channel_count: 1,
+            frame_count: 1000,
+            bits_per_sample: Some(16),
+            size_bytes: meta.len(),
+            modified: meta.modified().unwrap_or(std::time::UNIX_EPOCH),
+            container_format: "wav".into(),
+            codec: "pcm".into(),
+            hash: None,
+            samples: None,
+        };
+        let file = ProjectFile {
+            sample_rate: 44100,
+            channel_count: 1,
+            media: vec![media],
+            initial: InitialState::FromMedia { media_id: 1 },
+            edits: Vec::new(),
+            edit_cursor: 0,
+            markers: Vec::new(),
+        };
+        let json = ProjectEnvelope::wrap(file).to_json().unwrap();
+        let (comp, warnings) = Composition::from_json_reprobing(&json).unwrap();
+        assert!(warnings.is_empty());
+        assert_eq!(comp.frames(), 1000);
+        assert!(comp.pool().first().unwrap().samples.is_none());
+        let _ = std::fs::remove_file(dummy);
     }
 
     #[test]
@@ -1533,5 +1831,62 @@ mod tests {
         comp.assert_invariants();
         assert_eq!(comp.frames(), 4);
         assert!(comp.spans().iter().all(|s| s.clip.len > 0));
+    }
+
+    #[test]
+    fn markers_remap_through_cut_and_undo() {
+        use super::super::markers::{marker_type_color, MARKER_TYPE_BLUE};
+
+        let mut comp = Composition::from_media(sine_media(40, 1, 44100)).unwrap();
+        let blue = marker_type_color(MARKER_TYPE_BLUE).unwrap();
+        comp.add_marker(5, MARKER_TYPE_BLUE, blue, None).unwrap();
+        comp.add_marker(15, MARKER_TYPE_BLUE, blue, None).unwrap();
+        comp.add_marker(30, MARKER_TYPE_BLUE, blue, None).unwrap();
+        comp.cut(10, 10);
+        let frames: Vec<u64> = comp.markers().iter().map(|m| m.frame).collect();
+        assert_eq!(frames, vec![5, 20]);
+        assert!(comp.undo());
+        let frames: Vec<u64> = comp.markers().iter().map(|m| m.frame).collect();
+        assert_eq!(frames, vec![5, 30]);
+    }
+
+    #[test]
+    fn project_json_v1_loads_without_markers() {
+        let json = r#"{
+            "kind":"facomp",
+            "format_version":1,
+            "sample_rate":44100,
+            "channel_count":1,
+            "media":[],
+            "initial":{"type":"empty"},
+            "edits":[],
+            "edit_cursor":0
+        }"#;
+        let restored = Composition::from_json(json).unwrap();
+        assert!(restored.markers().is_empty());
+        assert_eq!(restored.sample_rate(), 44100);
+    }
+
+    #[test]
+    fn project_json_round_trip_keeps_markers() {
+        use super::super::markers::{marker_type_color, MARKER_TYPE_BLUE, MARKER_TYPE_YELLOW};
+
+        let mut comp = Composition::from_media(sine_media(12, 1, 44100)).unwrap();
+        let blue = marker_type_color(MARKER_TYPE_BLUE).unwrap();
+        let yellow = marker_type_color(MARKER_TYPE_YELLOW).unwrap();
+        comp.add_marker(3, MARKER_TYPE_BLUE, blue, None).unwrap();
+        comp.add_marker(8, MARKER_TYPE_YELLOW, yellow, Some("cue".into()))
+            .unwrap();
+        let json = comp.to_json().unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(value["format_version"], 2);
+        assert_eq!(value["markers"].as_array().unwrap().len(), 2);
+        let restored = Composition::from_json(&json).unwrap();
+        let markers: Vec<_> = restored.markers().iter().cloned().collect();
+        assert_eq!(markers.len(), 2);
+        assert_eq!(markers[0].frame, 3);
+        assert_eq!(markers[0].marker_type, MARKER_TYPE_BLUE);
+        assert_eq!(markers[1].frame, 8);
+        assert_eq!(markers[1].note.as_deref(), Some("cue"));
     }
 }

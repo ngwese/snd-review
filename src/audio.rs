@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Greg Wuller
 // SPDX-License-Identifier: MIT
 
-use std::io::Read;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::{fs, fs::File, path::Path, time::SystemTime};
@@ -146,13 +146,14 @@ pub fn load_buffer(path: &Path) -> Result<Buffer> {
             codec: meta.codec,
         }),
         regions: Vec::new(),
-        markers: Vec::new(),
     })
 }
 
 /// Probe a file for rate, channels, and length. Fully decodes only when the
 /// container does not report a frame count.
-pub fn probe_file(path: &Path) -> Result<ProbedFile> {
+/// Header-only probe. Never decodes PCM; fails if the container does not
+/// report a frame count.
+pub fn probe_header(path: &Path) -> Result<ProbedFile> {
     let metadata =
         fs::metadata(path).with_context(|| format!("failed to stat {}", path.display()))?;
     if let Some(probed) = probe_flac_header(path, metadata.len()) {
@@ -194,36 +195,57 @@ pub fn probe_file(path: &Path) -> Result<ProbedFile> {
         .to_string();
     let codec = track.codec_params.codec.to_string();
     let modified = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
-    if let Some(frame_count) = frame_count {
-        if sample_rate != 0 && channel_count != 0 {
-            return Ok(ProbedFile {
-                path: path.to_path_buf(),
-                sample_rate,
-                channel_count,
-                frame_count,
-                bits_per_sample,
-                size_bytes: metadata.len(),
-                modified,
-                container_format,
-                codec,
-                samples: None,
-            });
-        }
+    let Some(frame_count) = frame_count else {
+        bail!(
+            "audio header does not report frame count: {}",
+            path.display()
+        );
+    };
+    if sample_rate == 0 || channel_count == 0 {
+        bail!(
+            "audio header is missing sample rate or channels: {}",
+            path.display()
+        );
     }
-    drop(format);
-    let audio = decode(path)?;
     Ok(ProbedFile {
         path: path.to_path_buf(),
-        sample_rate: audio.sample_rate,
-        channel_count: audio.channel_count(),
-        frame_count: audio.frames() as u64,
+        sample_rate,
+        channel_count,
+        frame_count,
         bits_per_sample,
         size_bytes: metadata.len(),
         modified,
         container_format,
         codec,
-        samples: Some(Arc::new(audio.channels)),
+        samples: None,
     })
+}
+
+pub fn probe_file(path: &Path) -> Result<ProbedFile> {
+    match probe_header(path) {
+        Ok(probed) => Ok(probed),
+        Err(_) => {
+            let metadata =
+                fs::metadata(path).with_context(|| format!("failed to stat {}", path.display()))?;
+            let audio = decode(path)?;
+            Ok(ProbedFile {
+                path: path.to_path_buf(),
+                sample_rate: audio.sample_rate,
+                channel_count: audio.channel_count(),
+                frame_count: audio.frames() as u64,
+                bits_per_sample: None,
+                size_bytes: metadata.len(),
+                modified: metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH),
+                container_format: path
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .unwrap_or("unknown")
+                    .to_string(),
+                codec: "pcm".into(),
+                samples: Some(Arc::new(audio.channels)),
+            })
+        }
+    }
 }
 
 /// Decode `count` frames starting at `start`, without loading the whole file.
@@ -474,38 +496,62 @@ struct FlacStreaminfo {
     frame_count: u64,
 }
 
+fn skip_id3v2(file: &mut File) -> Option<()> {
+    let mut hdr = [0u8; 10];
+    file.read_exact(&mut hdr).ok()?;
+    if &hdr[0..3] != b"ID3" {
+        file.seek(SeekFrom::Start(0)).ok()?;
+        return Some(());
+    }
+    let size = ((u64::from(hdr[6]) & 0x7f) << 21)
+        | ((u64::from(hdr[7]) & 0x7f) << 14)
+        | ((u64::from(hdr[8]) & 0x7f) << 7)
+        | (u64::from(hdr[9]) & 0x7f);
+    file.seek(SeekFrom::Start(10 + size)).ok()?;
+    Some(())
+}
+
 fn parse_flac_streaminfo(path: &Path) -> Option<FlacStreaminfo> {
     let mut file = File::open(path).ok()?;
+    skip_id3v2(&mut file)?;
     let mut magic = [0u8; 4];
     file.read_exact(&mut magic).ok()?;
     if &magic != b"fLaC" {
         return None;
     }
-    let mut block_hdr = [0u8; 4];
-    file.read_exact(&mut block_hdr).ok()?;
-    if block_hdr[0] & 0x7f != 0 {
-        return None;
+    loop {
+        let mut block_hdr = [0u8; 4];
+        file.read_exact(&mut block_hdr).ok()?;
+        let last = block_hdr[0] & 0x80 != 0;
+        let block_type = block_hdr[0] & 0x7f;
+        let len = u32::from_be_bytes([0, block_hdr[1], block_hdr[2], block_hdr[3]]) as usize;
+        if block_type == 0 {
+            if len < 18 {
+                return None;
+            }
+            let mut payload = vec![0u8; len];
+            file.read_exact(&mut payload).ok()?;
+            let packed = u64::from_be_bytes(payload[10..18].try_into().ok()?);
+            let sample_rate = (packed >> 44) as u32;
+            let channel_count = ((packed >> 41) & 7) as usize + 1;
+            let bits = ((packed >> 36) & 0x1f) as u32 + 1;
+            let frame_count = packed & ((1u64 << 36) - 1);
+            if sample_rate == 0 || channel_count == 0 || frame_count == 0 {
+                return None;
+            }
+            return Some(FlacStreaminfo {
+                sample_rate,
+                channel_count,
+                bits_per_sample: Some(bits),
+                frame_count,
+            });
+        }
+        file.seek(SeekFrom::Current(len as i64)).ok()?;
+        if last {
+            break;
+        }
     }
-    let len = u32::from_be_bytes([0, block_hdr[1], block_hdr[2], block_hdr[3]]) as usize;
-    if len < 18 {
-        return None;
-    }
-    let mut payload = vec![0u8; len];
-    file.read_exact(&mut payload).ok()?;
-    let packed = u64::from_be_bytes(payload[10..18].try_into().ok()?);
-    let sample_rate = (packed >> 44) as u32;
-    let channel_count = ((packed >> 41) & 7) as usize + 1;
-    let bits = ((packed >> 36) & 0x1f) as u32 + 1;
-    let frame_count = packed & ((1u64 << 36) - 1);
-    if sample_rate == 0 || channel_count == 0 || frame_count == 0 {
-        return None;
-    }
-    Some(FlacStreaminfo {
-        sample_rate,
-        channel_count,
-        bits_per_sample: Some(bits),
-        frame_count,
-    })
+    None
 }
 
 fn codec_bits_per_sample(params: &CodecParameters) -> Option<u32> {

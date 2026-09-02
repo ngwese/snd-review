@@ -7,6 +7,7 @@ use crate::model::buffer::{ChannelScope, RegionId};
 use crate::model::document::BufferDocument;
 use crate::session::DocumentId;
 
+use super::marker::{list_markers, marker_id_from_lua, parse_add_marker, LuaMarker};
 use super::region::LuaRegion;
 use super::selection::{channels_from_lua, optional_i64, LuaSelection};
 use super::{host_from_lua, with_document};
@@ -93,6 +94,9 @@ impl UserData for LuaComposition {
                 Ok(regions)
             })
         });
+        fields.add_field_method_get("markers", |lua, this| {
+            with_document(lua, this.id, |doc| Ok(list_markers(doc, this.id)))
+        });
     }
 
     fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
@@ -144,6 +148,52 @@ impl UserData for LuaComposition {
             after_edit(lua, this.id)?;
             Ok(removed)
         });
+        methods.add_method("add_marker", |lua, this, args: mlua::MultiValue| {
+            let spec = parse_add_marker(args)?;
+            let id = with_document(lua, this.id, |doc| {
+                Ok(doc.add_marker(spec.frame, &spec.marker_type, spec.color, spec.note))
+            })?;
+            after_edit(lua, this.id)?;
+            Ok(id.map(|id| LuaMarker { doc: this.id, id }))
+        });
+        methods.add_method("remove_marker", |lua, this, target: Value| {
+            let id = marker_id_from_lua(target)?;
+            let removed = with_document(lua, this.id, |doc| Ok(doc.remove_marker(id)))?;
+            after_edit(lua, this.id)?;
+            Ok(removed)
+        });
+        methods.add_method(
+            "remove_marker_at",
+            |lua, this, (frame, marker_type): (i64, Option<String>)| {
+                let frame = frame.max(0) as usize;
+                let removed = with_document(lua, this.id, |doc| {
+                    Ok(match marker_type.as_deref() {
+                        Some(marker_type) => doc.remove_marker_at_type(frame, marker_type),
+                        None => doc.remove_marker_at(frame),
+                    })
+                })?;
+                after_edit(lua, this.id)?;
+                Ok(removed)
+            },
+        );
+        methods.add_method(
+            "marker_at",
+            |lua, this, (frame, marker_type): (i64, Option<String>)| {
+                let frame = frame.max(0) as u64;
+                with_document(lua, this.id, |doc| {
+                    let composition = doc.composition.read().unwrap();
+                    let markers = composition.markers();
+                    let found = match marker_type.as_deref() {
+                        Some(marker_type) => markers.get_at_type(frame, marker_type),
+                        None => markers.get_at(frame),
+                    };
+                    Ok(found.map(|marker| LuaMarker {
+                        doc: this.id,
+                        id: marker.id,
+                    }))
+                })
+            },
+        );
         methods.add_method("undo", |lua, this, ()| {
             edit(lua, this.id, |doc| doc.edit_undo())
         });

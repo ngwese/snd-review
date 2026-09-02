@@ -2,6 +2,9 @@
   "bindings": {
     "a": "view.fit_all",
     "f": "view.frame",
+    "m": "selection.add_marker",
+    "d": "selection.delete_marker",
+    "secondary-a": "selection.select_all",
     "secondary-=": "view.zoom_in",
     "secondary-+": "view.zoom_in",
     "secondary-shift-=": "view.zoom_in",

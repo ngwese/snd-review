@@ -27,6 +27,7 @@ pub struct WorkspacePanel {
     transport_state: TransportState,
     looping: bool,
     on_activated: Option<ActivatedFn>,
+    last_doc_fingerprint: Option<(u64, String)>,
 }
 
 impl WorkspacePanel {
@@ -36,8 +37,17 @@ impl WorkspacePanel {
         waveform: Entity<WaveformDisplay>,
         cx: &mut Context<Self>,
     ) -> Self {
-        cx.observe(&document, |_, _, cx| cx.notify()).detach();
-        cx.observe(&waveform, |_, _, cx| cx.notify()).detach();
+        cx.observe(&document, |this, entity, cx| {
+            let composition = entity.read(cx).composition.read().unwrap();
+            let next = (composition.frames(), composition.display_name());
+            drop(composition);
+            if this.last_doc_fingerprint.as_ref() == Some(&next) {
+                return;
+            }
+            this.last_doc_fingerprint = Some(next);
+            cx.notify();
+        })
+        .detach();
         Self {
             document_id,
             document,
@@ -45,6 +55,7 @@ impl WorkspacePanel {
             transport_state: TransportState::Stopped,
             looping: false,
             on_activated: None,
+            last_doc_fingerprint: None,
         }
     }
 

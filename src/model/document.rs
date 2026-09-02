@@ -3,10 +3,10 @@
 
 use std::sync::{Arc, RwLock};
 
-use super::buffer::{Buffer, ChannelScope, MarkerId, Region, RegionId};
+use super::buffer::{Buffer, ChannelScope, Region, RegionId};
 use super::composition::{
     map_inclusive_through_inverse, map_inclusive_through_op, map_point_through_inverse,
-    map_point_through_op, Composition, EditId, EditOp,
+    map_point_through_op, marker_type_color, Composition, EditId, EditOp, MarkerId,
 };
 use super::selection::{SamplePosition, Selection};
 use super::snap::nearest_zero_crossing;
@@ -24,7 +24,6 @@ pub struct BufferDocument {
     pub progress: ProgressHandle,
     region_drag_anchor: Option<usize>,
     next_region_id: u64,
-    next_marker_id: u64,
 }
 
 impl BufferDocument {
@@ -45,7 +44,6 @@ impl BufferDocument {
             progress: ProgressHandle::new(),
             region_drag_anchor: None,
             next_region_id: 1,
-            next_marker_id: 1,
         }
     }
 
@@ -310,22 +308,79 @@ impl BufferDocument {
         self.selection = Selection::None;
     }
 
-    pub fn add_marker(&mut self, sample: usize, channels: ChannelScope) -> MarkerId {
-        let id = MarkerId(self.next_marker_id);
-        self.next_marker_id += 1;
-        self.buffer
+    pub fn invert_selection(&mut self) {
+        let frames = self.frames();
+        if frames == 0 {
+            self.clear_selection();
+            return;
+        }
+        let last = frames.saturating_sub(1);
+        match &self.selection {
+            Selection::None | Selection::Position(_) => self.select_all(),
+            Selection::Region { start, end, .. } => {
+                let start = *start;
+                let end = *end;
+                if start == 0 && end >= last {
+                    self.clear_selection();
+                    return;
+                }
+                let touches_start = start == 0;
+                let touches_end = end >= last;
+                if touches_start && !touches_end {
+                    self.select_range(end.saturating_add(1), last, ChannelScope::all());
+                } else if touches_end && !touches_start {
+                    self.select_range(0, start.saturating_sub(1), ChannelScope::all());
+                } else {
+                    let prefix_len = start;
+                    let suffix_len = last.saturating_sub(end);
+                    if prefix_len >= suffix_len && start > 0 {
+                        self.select_range(0, start - 1, ChannelScope::all());
+                    } else if end < last {
+                        self.select_range(end + 1, last, ChannelScope::all());
+                    } else {
+                        self.clear_selection();
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn add_marker(
+        &mut self,
+        sample: usize,
+        marker_type: &str,
+        color: [f32; 4],
+        note: Option<String>,
+    ) -> Option<MarkerId> {
+        let sample = self.clamp_sample(sample);
+        self.composition
             .write()
             .unwrap()
-            .markers
-            .push(super::buffer::Marker {
-                id,
-                sample,
-                channels,
-                color: None,
-                label_type: None,
-                message: None,
-            });
-        id
+            .add_marker(sample as u64, marker_type, color, note)
+    }
+
+    pub fn add_marker_of_type(&mut self, sample: usize, marker_type: &str) -> Option<MarkerId> {
+        let color = marker_type_color(marker_type)
+            .or_else(|| marker_type_color(super::composition::default_marker_type()))?;
+        self.add_marker(sample, marker_type, color, None)
+    }
+
+    pub fn remove_marker(&mut self, id: MarkerId) -> bool {
+        self.composition.write().unwrap().remove_marker(id)
+    }
+
+    pub fn remove_marker_at(&mut self, sample: usize) -> bool {
+        self.composition
+            .write()
+            .unwrap()
+            .remove_marker_at(sample as u64)
+    }
+
+    pub fn remove_marker_at_type(&mut self, sample: usize, marker_type: &str) -> bool {
+        self.composition
+            .write()
+            .unwrap()
+            .remove_marker_at_type(sample as u64, marker_type)
     }
 
     pub fn selection_position_sample(&self) -> Option<usize> {
@@ -793,5 +848,94 @@ mod tests {
         doc.edit_paste();
         assert_eq!(doc.frames(), 110);
         assert_eq!(doc.current_position.as_ref().map(|p| p.sample), Some(60));
+    }
+
+    #[test]
+    fn invert_selection_covers_edges_and_interior() {
+        let mut doc = test_document(100);
+        doc.invert_selection();
+        assert!(matches!(
+            doc.selection,
+            Selection::Region {
+                start: 0,
+                end: 99,
+                ..
+            }
+        ));
+        doc.invert_selection();
+        assert!(matches!(doc.selection, Selection::None));
+
+        doc.select_range(0, 40, ChannelScope::all());
+        doc.invert_selection();
+        assert!(matches!(
+            doc.selection,
+            Selection::Region {
+                start: 41,
+                end: 99,
+                ..
+            }
+        ));
+
+        doc.select_range(50, 99, ChannelScope::all());
+        doc.invert_selection();
+        assert!(matches!(
+            doc.selection,
+            Selection::Region {
+                start: 0,
+                end: 49,
+                ..
+            }
+        ));
+
+        doc.select_range(10, 20, ChannelScope::all());
+        doc.invert_selection();
+        assert!(matches!(
+            doc.selection,
+            Selection::Region {
+                start: 21,
+                end: 99,
+                ..
+            }
+        ));
+
+        doc.select_range(80, 90, ChannelScope::all());
+        doc.invert_selection();
+        assert!(matches!(
+            doc.selection,
+            Selection::Region {
+                start: 0,
+                end: 79,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn add_and_remove_marker_at_caret() {
+        let mut doc = test_document(100);
+        let id = doc.add_marker_of_type(40, "Blue").unwrap();
+        assert_eq!(
+            doc.composition
+                .read()
+                .unwrap()
+                .markers()
+                .get(id)
+                .unwrap()
+                .frame,
+            40
+        );
+        assert!(doc.remove_marker_at(40));
+        assert!(doc.composition.read().unwrap().markers().is_empty());
+    }
+
+    #[test]
+    fn add_marker_is_unique_per_type_at_position() {
+        let mut doc = test_document(100);
+        assert!(doc.add_marker_of_type(40, "Blue").is_some());
+        assert!(doc.add_marker_of_type(40, "Blue").is_none());
+        assert!(doc.add_marker_of_type(40, "Yellow").is_some());
+        assert_eq!(doc.composition.read().unwrap().markers().len(), 2);
+        assert!(doc.remove_marker_at_type(40, "Blue"));
+        assert_eq!(doc.composition.read().unwrap().markers().len(), 1);
     }
 }

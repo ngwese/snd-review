@@ -42,6 +42,15 @@ actions!(
         EditTrim,
         EditRollLeft,
         EditRollRight,
+        SelectAll,
+        SelectNone,
+        InvertSelection,
+        MarkerTypeBlue,
+        MarkerTypeYellow,
+        MarkerTypePurple,
+        AddMarkerAtHover,
+        AddMarker,
+        DeleteMarker,
     ]
 );
 
@@ -51,10 +60,10 @@ const DEFAULT_KEYMAP: &str = include_str!("../assets/keymap.json");
 /// typing in the Script panel or other text fields.
 const APP_KEY_CONTEXT: &str = "App";
 
-/// Fit/frame letter keys apply while the waveform is focused.
+/// Letter keys that type in text fields apply while the waveform is focused.
 const WAVEFORM_KEY_CONTEXT: &str = "Waveform";
 
-/// Fit/frame letter keys also apply while the pointer is over the waveform.
+/// Those letter keys also apply while the pointer is over the waveform.
 const WAVEFORM_HOVER_KEY_CONTEXT: &str = "WaveformHover";
 
 const KNOWN_COMMANDS: &[&str] = &[
@@ -90,6 +99,15 @@ const KNOWN_COMMANDS: &[&str] = &[
     "edit.trim",
     "edit.roll_left",
     "edit.roll_right",
+    "selection.select_all",
+    "selection.select_none",
+    "selection.invert",
+    "selection.marker_type_blue",
+    "selection.marker_type_yellow",
+    "selection.marker_type_purple",
+    "selection.add_at_hover",
+    "selection.add_marker",
+    "selection.delete_marker",
 ];
 
 /// Command IDs that keymap, menus, and Lua `app:command` share.
@@ -258,7 +276,9 @@ fn valid_keystrokes(spec: &str) -> bool {
 
 fn bindings_for(command_id: &str, keystrokes: &str) -> Vec<KeyBinding> {
     let contexts: &[&str] = match command_id {
-        "view.fit_all" | "view.frame" => &[WAVEFORM_KEY_CONTEXT, WAVEFORM_HOVER_KEY_CONTEXT],
+        "view.fit_all" | "view.frame" | "selection.add_marker" | "selection.delete_marker" => {
+            &[WAVEFORM_KEY_CONTEXT, WAVEFORM_HOVER_KEY_CONTEXT]
+        }
         _ => &[APP_KEY_CONTEXT],
     };
     contexts
@@ -313,6 +333,19 @@ fn binding_in(command_id: &str, keystrokes: &str, context: &str) -> Option<KeyBi
         "edit.trim" => KeyBinding::new(keystrokes, EditTrim, Some(context)),
         "edit.roll_left" => KeyBinding::new(keystrokes, EditRollLeft, Some(context)),
         "edit.roll_right" => KeyBinding::new(keystrokes, EditRollRight, Some(context)),
+        "selection.select_all" => KeyBinding::new(keystrokes, SelectAll, Some(context)),
+        "selection.select_none" => KeyBinding::new(keystrokes, SelectNone, Some(context)),
+        "selection.invert" => KeyBinding::new(keystrokes, InvertSelection, Some(context)),
+        "selection.marker_type_blue" => KeyBinding::new(keystrokes, MarkerTypeBlue, Some(context)),
+        "selection.marker_type_yellow" => {
+            KeyBinding::new(keystrokes, MarkerTypeYellow, Some(context))
+        }
+        "selection.marker_type_purple" => {
+            KeyBinding::new(keystrokes, MarkerTypePurple, Some(context))
+        }
+        "selection.add_at_hover" => KeyBinding::new(keystrokes, AddMarkerAtHover, Some(context)),
+        "selection.add_marker" => KeyBinding::new(keystrokes, AddMarker, Some(context)),
+        "selection.delete_marker" => KeyBinding::new(keystrokes, DeleteMarker, Some(context)),
         _ => return None,
     })
 }
@@ -344,6 +377,18 @@ mod tests {
         let map = parse_and_flatten(DEFAULT_KEYMAP, Platform::Macos).unwrap();
         assert_eq!(map.get("a").map(String::as_str), Some("view.fit_all"));
         assert_eq!(map.get("f").map(String::as_str), Some("view.frame"));
+        assert_eq!(
+            map.get("m").map(String::as_str),
+            Some("selection.add_marker")
+        );
+        assert_eq!(
+            map.get("d").map(String::as_str),
+            Some("selection.delete_marker")
+        );
+        assert_eq!(
+            map.get("secondary-a").map(String::as_str),
+            Some("selection.select_all")
+        );
         assert_eq!(
             map.get("secondary-=").map(String::as_str),
             Some("view.zoom_in")
@@ -430,13 +475,20 @@ mod tests {
     }
 
     #[test]
-    fn fit_and_frame_keys_are_scoped_to_the_waveform() {
-        let fit = bindings_for("view.fit_all", "a");
-        assert_eq!(fit.len(), 2);
-        assert!(fit.iter().all(|binding| binding.predicate().is_some()));
-        let frame = bindings_for("view.frame", "f");
-        assert_eq!(frame.len(), 2);
-        assert!(frame.iter().all(|binding| binding.predicate().is_some()));
+    fn letter_keys_are_scoped_to_the_waveform() {
+        for (command_id, keystrokes) in [
+            ("view.fit_all", "a"),
+            ("view.frame", "f"),
+            ("selection.add_marker", "m"),
+            ("selection.delete_marker", "d"),
+        ] {
+            let bindings = bindings_for(command_id, keystrokes);
+            assert_eq!(bindings.len(), 2, "{command_id}");
+            assert!(
+                bindings.iter().all(|binding| binding.predicate().is_some()),
+                "{command_id}"
+            );
+        }
     }
 
     #[test]

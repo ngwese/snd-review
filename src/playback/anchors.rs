@@ -1,13 +1,15 @@
 // SPDX-FileCopyrightText: 2026 Greg Wuller
 // SPDX-License-Identifier: MIT
 
-use crate::model::Buffer;
+use crate::model::document::BufferDocument;
 
-pub fn collect_anchors(buffer: &Buffer) -> Vec<usize> {
-    let mut anchors: Vec<usize> = buffer
-        .markers
+pub fn collect_anchors(doc: &BufferDocument) -> Vec<usize> {
+    let composition = doc.composition.read().unwrap();
+    let buffer = doc.buffer.read().unwrap();
+    let mut anchors: Vec<usize> = composition
+        .markers()
         .iter()
-        .map(|m| m.sample)
+        .map(|marker| marker.frame as usize)
         .chain(buffer.regions.iter().flat_map(|r| [r.start, r.end]))
         .collect();
     anchors.sort_unstable();
@@ -26,38 +28,36 @@ pub fn next_anchor(anchors: &[usize], pos: usize) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::audio::DecodedAudio;
-    use crate::model::buffer::{ChannelScope, Marker, MarkerId, Region, RegionId};
+    use crate::model::buffer::{ChannelScope, Region, RegionId};
+    use crate::model::composition::{
+        marker_type_color, Composition, MediaId, MediaRef, MARKER_TYPE_BLUE,
+    };
+    use crate::model::document::BufferDocument;
 
-    fn test_buffer() -> Buffer {
-        Buffer {
-            audio: DecodedAudio {
-                sample_rate: 44100,
-                channels: vec![vec![0.0; 1000]],
-                peaks: vec![vec![]],
-            },
-            source: None,
-            regions: vec![Region::new(RegionId(1), 100, 200, ChannelScope::all())],
-            markers: vec![Marker {
-                id: MarkerId(1),
-                sample: 50,
-                channels: ChannelScope::all(),
-                color: None,
-                label_type: None,
-                message: None,
-            }],
-        }
+    fn test_document() -> BufferDocument {
+        let samples = vec![vec![0.0; 1000]];
+        let media = MediaRef::from_memory(MediaId(0), 44100, samples);
+        let mut doc = BufferDocument::new(Composition::from_media(media).unwrap());
+        let blue = marker_type_color(MARKER_TYPE_BLUE).unwrap();
+        doc.add_marker(50, MARKER_TYPE_BLUE, blue, None);
+        doc.buffer.write().unwrap().regions.push(Region::new(
+            RegionId(1),
+            100,
+            200,
+            ChannelScope::all(),
+        ));
+        doc
     }
 
     #[test]
     fn collects_markers_and_region_bounds() {
-        let anchors = collect_anchors(&test_buffer());
+        let anchors = collect_anchors(&test_document());
         assert_eq!(anchors, vec![50, 100, 200]);
     }
 
     #[test]
     fn navigates_anchors() {
-        let anchors = collect_anchors(&test_buffer());
+        let anchors = collect_anchors(&test_document());
         assert_eq!(previous_anchor(&anchors, 150), Some(100));
         assert_eq!(next_anchor(&anchors, 150), Some(200));
         assert_eq!(next_anchor(&anchors, 250), None);

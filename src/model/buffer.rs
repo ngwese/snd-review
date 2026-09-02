@@ -8,9 +8,6 @@ use crate::audio::DecodedAudio;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct RegionId(pub u64);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct MarkerId(pub u64);
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ChannelScope {
     AllChannels,
@@ -79,22 +76,11 @@ impl Region {
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct Marker {
-    pub id: MarkerId,
-    pub sample: usize,
-    pub channels: ChannelScope,
-    pub color: Option<[f32; 4]>,
-    pub label_type: Option<String>,
-    pub message: Option<String>,
-}
-
 #[derive(Debug)]
 pub struct Buffer {
     pub audio: DecodedAudio,
     pub source: Option<BufferSource>,
     pub regions: Vec<Region>,
-    pub markers: Vec<Marker>,
 }
 
 impl Buffer {
@@ -107,7 +93,6 @@ impl Buffer {
             },
             source: None,
             regions: vec![],
-            markers: vec![],
         }
     }
 

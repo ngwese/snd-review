@@ -10,7 +10,7 @@ use gpui_component::{
     ActiveTheme as _,
 };
 
-/// Empty dock pane used as a placeholder tab.
+/// Empty dock pane used when no composition is open.
 pub struct EmptyPane {
     name: &'static str,
     title: SharedString,

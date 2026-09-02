@@ -5,6 +5,7 @@ mod access;
 mod app;
 mod composition;
 mod host;
+mod marker;
 mod region;
 mod selection;
 
@@ -16,14 +17,16 @@ mod tests {
     use std::cell::RefCell;
     use std::rc::Rc;
 
-    use crate::model::composition::Composition;
+    use crate::model::composition::{Composition, MediaId, MediaRef};
     use crate::model::Buffer;
 
     use super::*;
 
     fn test_host() -> (ScriptHost, Rc<RefCell<TestWorld>>) {
         let world = Rc::new(RefCell::new(TestWorld::new()));
-        let composition = Composition::new(44100, 2);
+        let samples = vec![vec![0.0; 1000], vec![0.0; 1000]];
+        let media = MediaRef::from_memory(MediaId(0), 44100, samples);
+        let composition = Composition::from_media(media).expect("composition");
         world
             .borrow_mut()
             .push(composition, Buffer::empty(), "fixture", None);
@@ -80,6 +83,32 @@ mod tests {
             doc.buffer.read().unwrap().regions[0].label.as_deref(),
             Some("intro"),
         );
+    }
+
+    #[test]
+    fn markers_can_be_created_listed_and_removed() {
+        let (mut host, world) = test_host();
+        let out = host.eval(
+            r#"
+            local c = app.active
+            local a = c:add_marker({ frame = 40, type = "Blue", note = "cue" })
+            local b = c:add_marker(40, "Yellow")
+            local dup = c:add_marker(40, "Blue")
+            local at_blue = c:marker_at(40, "Blue")
+            local frame, kind, note = at_blue.frame, at_blue.type, at_blue.note
+            c:remove_marker(a)
+            b:remove()
+            c:add_marker(80)
+            c:remove_marker_at(80)
+            return dup == nil, frame, kind, note, #c.markers
+            "#,
+        );
+        assert!(out.error.is_none(), "{:?}", out.error);
+        assert_eq!(out.result.as_deref(), Some("true\t40\tBlue\tcue\t0"));
+        let world = world.borrow();
+        let id = world.active.unwrap();
+        let doc = world.docs.get(&id).unwrap();
+        assert!(doc.composition.read().unwrap().markers().is_empty());
     }
 
     #[test]

@@ -6,8 +6,8 @@ use gpui::{
     actions, canvas, div, fill, hsla, point, px, relative, size, App, Bounds, Context,
     DispatchPhase, Entity, FocusHandle, Focusable, InteractiveElement as _, IntoElement,
     MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement as _, PathBuilder,
-    Pixels, Render, ScrollWheelEvent, SharedString, StatefulInteractiveElement as _, Styled as _,
-    Window,
+    Pixels, Render, Rgba, ScrollWheelEvent, SharedString, StatefulInteractiveElement as _,
+    Styled as _, Window,
 };
 use gpui_component::{
     h_flex,
@@ -63,6 +63,9 @@ const MODIFIED_BAR_HEIGHT: f32 = 3.0;
 const MODIFIED_BAR_GAP: f32 = 1.0;
 const MODIFIED_BAR_COLOR: gpui::Hsla = hsla(0.08, 0.90, 0.55, 1.0);
 const MODIFIED_HOVER_FILL: gpui::Hsla = hsla(0.08, 0.90, 0.55, 0.18);
+const MARKER_BAR_OPACITY: f32 = 0.35;
+const MARKER_TRIANGLE_BASE: f32 = 5.0;
+const MARKER_TRIANGLE_HEIGHT: f32 = 5.0;
 
 enum Drag {
     Pan {
@@ -86,6 +89,8 @@ pub struct WaveformDisplay {
     samples_per_pixel: f64,
     viewport_width: f32,
     content_origin_x: f32,
+    content_origin_y: f32,
+    content_height: f32,
     scrollbar_origin_x: f32,
     scrollbar_width: f32,
     drag: Option<Drag>,
@@ -110,6 +115,8 @@ impl WaveformDisplay {
             samples_per_pixel: samples_per_pixel.max(MIN_SAMPLES_PER_PIXEL),
             viewport_width: 0.0,
             content_origin_x: 0.0,
+            content_origin_y: 0.0,
+            content_height: 0.0,
             scrollbar_origin_x: 0.0,
             scrollbar_width: 0.0,
             drag: None,
@@ -161,6 +168,21 @@ impl WaveformDisplay {
                 &ranges,
             );
         }
+        if (self.start_sample - before).abs() > f64::EPSILON {
+            cx.notify();
+        }
+    }
+
+    pub fn scroll_sample_into_view(&mut self, sample: f64, cx: &mut Context<Self>) {
+        let frames = self.frames(cx) as f64;
+        let before = self.start_sample;
+        apply_scroll_to_frame(
+            &mut self.start_sample,
+            self.samples_per_pixel,
+            self.viewport_width,
+            frames,
+            sample,
+        );
         if (self.start_sample - before).abs() > f64::EPSILON {
             cx.notify();
         }
@@ -287,7 +309,13 @@ impl WaveformDisplay {
         self.start_sample + local * self.samples_per_pixel
     }
 
-    fn set_hover_at(&mut self, x: f32, cx: &mut Context<Self>) {
+    fn set_hover_at(&mut self, x: f32, y: f32, cx: &mut Context<Self>) {
+        if self.content_height > 0.0
+            && (y < self.content_origin_y || y > self.content_origin_y + self.content_height)
+        {
+            self.clear_hover(cx);
+            return;
+        }
         let next = hover_sample_from_x(
             x,
             self.content_origin_x,
@@ -313,9 +341,6 @@ impl WaveformDisplay {
             return;
         }
         self.pointer_over = hovered;
-        if !hovered {
-            self.hover_sample = None;
-        }
         cx.notify();
     }
 
@@ -335,15 +360,31 @@ impl WaveformDisplay {
         self.clamp_scroll(cx);
     }
 
-    fn remember_viewport(&mut self, bounds: Bounds<Pixels>, cx: &mut Context<Self>) {
+    fn remember_viewport(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        reset_union: bool,
+        cx: &mut Context<Self>,
+    ) {
         let width = bounds.size.width.as_f32();
+        let height = bounds.size.height.as_f32();
+        let x = bounds.origin.x.as_f32();
+        let y = bounds.origin.y.as_f32();
+        if reset_union {
+            self.content_origin_y = y;
+            self.content_height = height;
+        } else {
+            let bottom = (self.content_origin_y + self.content_height).max(y + height);
+            self.content_origin_y = self.content_origin_y.min(y);
+            self.content_height = bottom - self.content_origin_y;
+        }
         if width <= 1.0 {
             return;
         }
         let first = self.viewport_width <= 1.0;
         let changed = (self.viewport_width - width).abs() > 2.0;
         self.viewport_width = width;
-        self.content_origin_x = bounds.origin.x.as_f32();
+        self.content_origin_x = x;
         if first {
             self.start_sample = 0.0;
             self.samples_per_pixel = self.max_samples_per_pixel(cx);
@@ -442,10 +483,10 @@ fn install_global_drag_listeners(entity: Entity<WaveformDisplay>, window: &mut W
                 return;
             }
             entity.update(cx, |this, cx| {
-                if this.drag.is_none() {
-                    return;
+                if this.drag.is_some() {
+                    this.handle_drag_move(event.position.x.as_f32(), cx);
                 }
-                this.handle_drag_move(event.position.x.as_f32(), cx);
+                this.set_hover_at(event.position.x.as_f32(), event.position.y.as_f32(), cx);
             });
         }
     });
@@ -594,6 +635,107 @@ fn paint_region_overlay(
     );
 }
 
+fn marker_hsla(color: [f32; 4]) -> gpui::Hsla {
+    Rgba {
+        r: color[0],
+        g: color[1],
+        b: color[2],
+        a: color[3],
+    }
+    .into()
+}
+
+fn paint_marker_triangle(bounds: Bounds<Pixels>, x: f32, builder: &mut PathBuilder) {
+    let origin_y = bounds.origin.y.as_f32();
+    let half = MARKER_TRIANGLE_BASE / 2.0;
+    builder.move_to(point(px(x - half), px(origin_y)));
+    builder.line_to(point(px(x + half), px(origin_y)));
+    builder.line_to(point(px(x), px(origin_y + MARKER_TRIANGLE_HEIGHT)));
+    builder.close();
+}
+
+/// One slot per pixel column. Markers are ordered by frame, so adjacent
+/// overview hits share a column and collapse to a single bar/triangle.
+fn marker_paint_slots(
+    markers: &[(u64, [f32; 4])],
+    start_sample: f64,
+    samples_per_pixel: f64,
+    origin_x: f32,
+    width: f32,
+) -> Vec<(f32, [f32; 4])> {
+    let vis_start = start_sample.max(0.0);
+    let vis_end = start_sample + width as f64 * samples_per_pixel;
+    let mut slots: Vec<(f32, [f32; 4])> = Vec::new();
+    let mut last_col: Option<i32> = None;
+    for &(frame, color) in markers {
+        let sample = frame as f64;
+        if sample + samples_per_pixel < vis_start || sample > vis_end {
+            continue;
+        }
+        let x = clamp_bar_x(
+            sample_to_x(sample, start_sample, samples_per_pixel, origin_x),
+            origin_x,
+            width,
+        );
+        let col = x.floor() as i32;
+        if last_col == Some(col) {
+            if let Some(slot) = slots.last_mut() {
+                slot.1 = color;
+            }
+            continue;
+        }
+        last_col = Some(col);
+        slots.push((x, color));
+    }
+    slots
+}
+
+fn paint_markers(
+    bounds: Bounds<Pixels>,
+    markers: &[(u64, [f32; 4])],
+    channel: usize,
+    start_sample: f64,
+    samples_per_pixel: f64,
+    window: &mut Window,
+) {
+    let origin_x = bounds.origin.x.as_f32();
+    let origin_y = bounds.origin.y.as_f32();
+    let width = bounds.size.width.as_f32();
+    let height = bounds.size.height.as_f32();
+    let slots = marker_paint_slots(markers, start_sample, samples_per_pixel, origin_x, width);
+    let mut triangles: Vec<([f32; 4], PathBuilder)> = Vec::new();
+    for &(x, color) in &slots {
+        let fill_color = marker_hsla(color);
+        window.paint_quad(fill(
+            Bounds {
+                origin: point(px(x), px(origin_y)),
+                size: size(px(1.0), px(height)),
+            },
+            fill_color.opacity(MARKER_BAR_OPACITY),
+        ));
+        if channel != 0 {
+            continue;
+        }
+        let builder = if let Some((_, builder)) = triangles
+            .iter_mut()
+            .find(|(existing, _)| *existing == color)
+        {
+            builder
+        } else {
+            triangles.push((color, PathBuilder::fill()));
+            &mut triangles.last_mut().unwrap().1
+        };
+        paint_marker_triangle(bounds, x + 0.5, builder);
+    }
+    if channel == 0 {
+        for (color, builder) in triangles {
+            if let Ok(path) = builder.build() {
+                window.paint_path(path, marker_hsla(color));
+            }
+        }
+    }
+}
+
 fn paint_vertical_bar(
     bounds: Bounds<Pixels>,
     sample: usize,
@@ -715,6 +857,7 @@ fn paint_lane(
     hover_sample: Option<usize>,
     modified_ranges: &[(u64, u64)],
     hover_ranges: &[(u64, u64)],
+    markers: &[(u64, [f32; 4])],
     window: &mut Window,
 ) {
     let width = bounds.size.width.as_f32();
@@ -872,6 +1015,14 @@ fn paint_lane(
         samples_per_pixel,
         window,
     );
+    paint_markers(
+        bounds,
+        markers,
+        channel,
+        start_sample,
+        samples_per_pixel,
+        window,
+    );
 
     if let Some(sample) = hover_sample {
         paint_vertical_bar(
@@ -977,7 +1128,7 @@ impl Render for WaveformDisplay {
         let start_sample = self.start_sample;
         let samples_per_pixel = self.samples_per_pixel;
         let hover_sample = self.hover_sample;
-        let (modified_ranges, hover_ranges) = {
+        let (modified_ranges, hover_ranges, markers) = {
             let doc = self.document.read(cx);
             let hovered = self.hovered_edit;
             let composition = doc.composition.read().unwrap();
@@ -985,7 +1136,12 @@ impl Render for WaveformDisplay {
             let hover = hovered
                 .map(|id| composition.ranges_for_edit(id))
                 .unwrap_or_default();
-            (modified, hover)
+            let markers: Vec<(u64, [f32; 4])> = composition
+                .markers()
+                .iter()
+                .map(|marker| (marker.frame, marker.color))
+                .collect();
+            (modified, hover, markers)
         };
         let entity = cx.entity();
         let channel_count = WaveformDataProvider::channel_count(self.document.read(cx));
@@ -1057,14 +1213,13 @@ impl Render for WaveformDisplay {
                                 .h_full()
                                 .on_mouse_move(cx.listener(
                                     |this, event: &MouseMoveEvent, _, cx| {
-                                        this.set_hover_at(event.position.x.as_f32(), cx);
+                                        this.set_hover_at(
+                                            event.position.x.as_f32(),
+                                            event.position.y.as_f32(),
+                                            cx,
+                                        );
                                     },
                                 ))
-                                .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
-                                    if !*hovered {
-                                        this.clear_hover(cx);
-                                    }
-                                }))
                                 .children((0..channel_count).map(|ch| {
                                     let document = document.clone();
                                     let entity = entity.clone();
@@ -1138,7 +1293,11 @@ impl Render for WaveformDisplay {
                                                         let entity = entity.clone();
                                                         move |bounds, _, cx| {
                                                             entity.update(cx, |this, cx| {
-                                                                this.remember_viewport(bounds, cx);
+                                                                this.remember_viewport(
+                                                                    bounds,
+                                                                    ch == 0,
+                                                                    cx,
+                                                                );
                                                             });
                                                             bounds
                                                         }
@@ -1148,6 +1307,7 @@ impl Render for WaveformDisplay {
                                                         let modified_ranges =
                                                             modified_ranges.clone();
                                                         let hover_ranges = hover_ranges.clone();
+                                                        let markers = markers.clone();
                                                         move |bounds, _, window, cx| {
                                                             let provider = document.read(cx);
                                                             paint_lane(
@@ -1162,6 +1322,7 @@ impl Render for WaveformDisplay {
                                                                 hover_sample,
                                                                 &modified_ranges,
                                                                 &hover_ranges,
+                                                                &markers,
                                                                 window,
                                                             );
                                                         }
@@ -1466,5 +1627,26 @@ mod tests {
         let x = sample_to_x(999.0, 0.0, 10.0, origin);
         assert!((x - 109.9).abs() < 1e-3);
         assert_eq!(clamp_bar_x(x, origin, width), origin + width - 1.0);
+    }
+
+    #[test]
+    fn overview_markers_collapse_to_one_column() {
+        let blue = [0.0, 0.0, 1.0, 1.0];
+        let yellow = [1.0, 1.0, 0.0, 1.0];
+        let markers = [(0, blue), (100, yellow), (200, blue)];
+        let zoomed = marker_paint_slots(&markers, 0.0, 100.0, 0.0, 10.0);
+        assert_eq!(zoomed.len(), 3);
+        let overview = marker_paint_slots(&markers, 0.0, 1000.0, 0.0, 10.0);
+        assert_eq!(overview.len(), 1);
+        assert_eq!(overview[0].1, blue);
+    }
+
+    #[test]
+    fn offscreen_markers_are_not_slotted() {
+        let blue = [0.0, 0.0, 1.0, 1.0];
+        let markers = [(0, blue), (1_400, blue), (9_000, blue)];
+        let slots = marker_paint_slots(&markers, 1000.0, 10.0, 0.0, 100.0);
+        assert_eq!(slots.len(), 1);
+        assert!((slots[0].0 - 40.0).abs() < 1e-3);
     }
 }
