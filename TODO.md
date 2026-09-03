@@ -6,3 +6,5 @@
       (re)loading a composition
 - [ ] Profile composition loading when loading a large FLAC file;
       determine stall when the file must be probed
+- [ ] Find the performance regression when loading a composition
+      that has edits

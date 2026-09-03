@@ -60,10 +60,10 @@ const DEFAULT_KEYMAP: &str = include_str!("../assets/keymap.json");
 /// typing in the Script panel or other text fields.
 const APP_KEY_CONTEXT: &str = "App";
 
-/// Letter keys that type in text fields apply while the waveform is focused.
+/// Keys that type in text fields apply while the waveform is focused.
 const WAVEFORM_KEY_CONTEXT: &str = "Waveform";
 
-/// Those letter keys also apply while the pointer is over the waveform.
+/// Those keys also apply while the pointer is over the waveform.
 const WAVEFORM_HOVER_KEY_CONTEXT: &str = "WaveformHover";
 
 const KNOWN_COMMANDS: &[&str] = &[
@@ -276,9 +276,11 @@ fn valid_keystrokes(spec: &str) -> bool {
 
 fn bindings_for(command_id: &str, keystrokes: &str) -> Vec<KeyBinding> {
     let contexts: &[&str] = match command_id {
-        "view.fit_all" | "view.frame" | "selection.add_marker" | "selection.delete_marker" => {
-            &[WAVEFORM_KEY_CONTEXT, WAVEFORM_HOVER_KEY_CONTEXT]
-        }
+        "view.fit_all"
+        | "view.frame"
+        | "selection.add_marker"
+        | "selection.delete_marker"
+        | "transport.play_pause" => &[WAVEFORM_KEY_CONTEXT, WAVEFORM_HOVER_KEY_CONTEXT],
         _ => &[APP_KEY_CONTEXT],
     };
     contexts
@@ -470,7 +472,7 @@ mod tests {
     fn keymap_bindings_are_scoped_to_the_app_view() {
         let binding = binding_for("edit.delete", "backspace").expect("backspace");
         assert!(binding.predicate().is_some());
-        let binding = binding_for("transport.play_pause", "space").expect("space");
+        let binding = binding_for("transport.stop", "k").expect("stop");
         assert!(binding.predicate().is_some());
     }
 
@@ -481,6 +483,7 @@ mod tests {
             ("view.frame", "f"),
             ("selection.add_marker", "m"),
             ("selection.delete_marker", "d"),
+            ("transport.play_pause", "space"),
         ] {
             let bindings = bindings_for(command_id, keystrokes);
             assert_eq!(bindings.len(), 2, "{command_id}");
