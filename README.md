@@ -1,7 +1,6 @@
-# snd-review
+# FieldAssist
 
-Scrollable, zoomable multi-channel waveform viewer with region selection and
-transport playback.
+Review, edit, and process audio coming in from the field.
 
 See [BUILDING.md](BUILDING.md) for build, packaging, and app-icon generation.
 

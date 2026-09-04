@@ -24,8 +24,7 @@ fn main() {
     let icon_escaped = icon.display().to_string().replace('\\', "/");
     let out_dir = std::env::var("OUT_DIR").expect("OUT_DIR");
     let rc_path = std::path::Path::new(&out_dir).join("app_icon.rc");
-    std::fs::write(&rc_path, format!("1 ICON \"{icon_escaped}\"\n"))
-        .expect("write app_icon.rc");
+    std::fs::write(&rc_path, format!("1 ICON \"{icon_escaped}\"\n")).expect("write app_icon.rc");
 
     embed_resource::compile(&rc_path, embed_resource::NONE)
         .manifest_optional()

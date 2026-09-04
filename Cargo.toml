@@ -1,8 +1,8 @@
 [package]
-name = "snd-review"
-version = "0.1.0"
+name = "FieldAssist"
+version = "0.2.0"
 edition = "2021"
-description = "Scrollable, zoomable multi-channel waveform display"
+description = "Review, edit, and process audio coming in from the field"
 license = "MIT"
 
 [dependencies]

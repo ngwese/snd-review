@@ -1,4 +1,4 @@
-# Building snd-review
+# Building FieldAssist
 
 ## Requirements
 
@@ -25,7 +25,7 @@ assets live in [assets/app-icon/](assets/app-icon/):
 | File | Used by |
 | --- | --- |
 | `app-icon.ico` | Embedded into the Windows executable at compile time |
-| `AppIcon.icns` | Copied into `snd-review.app/Contents/Resources/` |
+| `AppIcon.icns` | Copied into `FieldAssist.app/Contents/Resources/` |
 | `app-icon.png` | 512px PNG of the same artwork |
 
 After changing the SVG, regenerate those files (requires
@@ -47,19 +47,19 @@ terminal:
 
 ```bash
 ./script/bundle-macos
-open target/release/snd-review.app
+open target/release/FieldAssist.app
 ```
 
-Install into `~/Applications` and put `snd-review` on your PATH (no sudo):
+Install into `~/Applications` and put `FieldAssist` on your PATH (no sudo):
 
 ```bash
 ./script/bundle-macos --install
-snd-review --help
-snd-review path/to/audio.wav
+FieldAssist --help
+FieldAssist path/to/audio.wav
 ```
 
-That copies the bundle to `~/Applications/snd-review.app` and symlinks
-`~/.local/bin/snd-review` to the binary inside it. If `~/.local/bin` is not
+That copies the bundle to `~/Applications/FieldAssist.app` and symlinks
+`~/.local/bin/FieldAssist` to the binary inside it. If `~/.local/bin` is not
 already on your PATH, add this to `~/.zshrc` and open a new terminal:
 
 ```bash
@@ -75,26 +75,26 @@ the terminal:
 powershell -File script/bundle-windows.ps1
 ```
 
-That writes `target\release\snd-review.exe`. Double-click it, or run it from
+That writes `target\release\FieldAssist.exe`. Double-click it, or run it from
 a console:
 
 ```powershell
-.\target\release\snd-review.exe
-.\target\release\snd-review.exe --help
-.\target\release\snd-review.exe path\to\audio.wav
+.\target\release\FieldAssist.exe
+.\target\release\FieldAssist.exe --help
+.\target\release\FieldAssist.exe path\to\audio.wav
 ```
 
-Install into `%LOCALAPPDATA%\snd-review`, put `snd-review` on your PATH, and
+Install into `%LOCALAPPDATA%\FieldAssist`, put `FieldAssist` on your PATH, and
 add a Start Menu shortcut (no admin):
 
 ```powershell
 powershell -File script/bundle-windows.ps1 --install
-snd-review --help
-snd-review path\to\audio.wav
+FieldAssist --help
+FieldAssist path\to\audio.wav
 ```
 
-That copies the exe to `%LOCALAPPDATA%\snd-review\snd-review.exe`, links
-`%USERPROFILE%\.local\bin\snd-review.exe` to it, and creates a Start Menu
+That copies the exe to `%LOCALAPPDATA%\FieldAssist\FieldAssist.exe`, links
+`%USERPROFILE%\.local\bin\FieldAssist.exe` to it, and creates a Start Menu
 shortcut. If `~\.local\bin` is not already on your PATH, add it in PowerShell
 and open a new terminal:
 

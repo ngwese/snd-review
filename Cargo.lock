@@ -3,6 +3,30 @@
 version = 4
 
 [[package]]
+name = "FieldAssist"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "cpal",
+ "embed-resource",
+ "flacenc",
+ "gpui",
+ "gpui-component",
+ "gpui-component-assets",
+ "gpui_platform",
+ "hound",
+ "mlua",
+ "ogg",
+ "rubato",
+ "rusty_vorbis",
+ "serde",
+ "serde_json",
+ "symphonia",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "accesskit"
 version = "0.24.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6591,30 +6615,6 @@ checksum = "4aaa7368fcf4852a4c2dd92df0cace6a71f2091ca0a23391ce7f3a31833f1523"
 dependencies = [
  "borsh",
  "serde_core",
-]
-
-[[package]]
-name = "snd-review"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "clap",
- "cpal",
- "embed-resource",
- "flacenc",
- "gpui",
- "gpui-component",
- "gpui-component-assets",
- "gpui_platform",
- "hound",
- "mlua",
- "ogg",
- "rubato",
- "rusty_vorbis",
- "serde",
- "serde_json",
- "symphonia",
- "windows-sys 0.61.2",
 ]
 
 [[package]]

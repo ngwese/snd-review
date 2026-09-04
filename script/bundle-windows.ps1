@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: 2026 Greg Wuller
 # SPDX-License-Identifier: MIT
 #
-# Build a double-clickable snd-review.exe and optionally install it for
+# Build a double-clickable FieldAssist.exe and optionally install it for
 # the Start Menu and CLI use.
 
 Set-StrictMode -Version Latest
@@ -18,10 +18,10 @@ function Show-Usage {
     @"
 Usage: script/bundle-windows.ps1 [--install]
 
-Build a Windows executable at target/release/snd-review.exe.
+Build a Windows executable at target/release/FieldAssist.exe.
 
-      --install   Copy the exe to %LOCALAPPDATA%\snd-review\snd-review.exe,
-                  copy it to %USERPROFILE%\.local\bin\snd-review.exe, and
+      --install   Copy the exe to %LOCALAPPDATA%\FieldAssist\FieldAssist.exe,
+                  copy it to %USERPROFILE%\.local\bin\FieldAssist.exe, and
                   add a Start Menu shortcut
   -h, --help      Show this help
 "@
@@ -57,14 +57,14 @@ if ($cargoToml -notmatch '(?m)^version = "([^"]+)"') {
 }
 $version = $Matches[1]
 
-Write-Host "Building snd-review $version (release)..."
+Write-Host "Building FieldAssist $version (release)..."
 cargo build --release
 if ($LASTEXITCODE -ne 0) {
     exit $LASTEXITCODE
 }
 
 $targetDir = if ($env:CARGO_TARGET_DIR) { $env:CARGO_TARGET_DIR } else { Join-Path $root "target" }
-$binary = Join-Path $targetDir "release\snd-review.exe"
+$binary = Join-Path $targetDir "release\FieldAssist.exe"
 if (-not (Test-Path -LiteralPath $binary)) {
     Write-Error "missing release binary: $binary"
     exit 1
@@ -76,10 +76,10 @@ if (-not $install) {
     exit 0
 }
 
-$appDestDir = Join-Path $env:LOCALAPPDATA "snd-review"
-$appDest = Join-Path $appDestDir "snd-review.exe"
+$appDestDir = Join-Path $env:LOCALAPPDATA "FieldAssist"
+$appDest = Join-Path $appDestDir "FieldAssist.exe"
 $binDir = Join-Path $env:USERPROFILE ".local\bin"
-$cliLink = Join-Path $binDir "snd-review.exe"
+$cliLink = Join-Path $binDir "FieldAssist.exe"
 
 New-Item -ItemType Directory -Force -Path $appDestDir | Out-Null
 Copy-Item -Force -LiteralPath $binary -Destination $appDest
@@ -95,12 +95,12 @@ catch {
 
 $startMenu = Join-Path $env:APPDATA "Microsoft\Windows\Start Menu\Programs"
 New-Item -ItemType Directory -Force -Path $startMenu | Out-Null
-$shortcutPath = Join-Path $startMenu "snd-review.lnk"
+$shortcutPath = Join-Path $startMenu "FieldAssist.lnk"
 $wsh = New-Object -ComObject WScript.Shell
 $shortcut = $wsh.CreateShortcut($shortcutPath)
 $shortcut.TargetPath = $appDest
 $shortcut.WorkingDirectory = $appDestDir
-$shortcut.Description = "Scrollable, zoomable multi-channel waveform display"
+$shortcut.Description = "Review, edit, and process audio coming in from the field"
 $shortcut.IconLocation = "$appDest,0"
 $shortcut.Save()
 

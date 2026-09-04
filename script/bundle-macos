@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: 2026 Greg Wuller
 # SPDX-License-Identifier: MIT
 #
-# Build a double-clickable snd-review.app and optionally install it for
+# Build a double-clickable FieldAssist.app and optionally install it for
 # Finder and CLI use.
 
 set -euo pipefail
@@ -11,10 +11,10 @@ usage() {
   cat <<'EOF'
 Usage: script/bundle-macos [--install]
 
-Build a macOS application bundle at target/release/snd-review.app.
+Build a macOS application bundle at target/release/FieldAssist.app.
 
-      --install   Copy the bundle to ~/Applications/snd-review.app and
-                  symlink ~/.local/bin/snd-review to the bundled binary
+      --install   Copy the bundle to ~/Applications/FieldAssist.app and
+                  symlink ~/.local/bin/FieldAssist to the bundled binary
   -h, --help      Show this help
 EOF
 }
@@ -52,16 +52,16 @@ if [[ -z "$version" ]]; then
   exit 1
 fi
 
-echo "Building snd-review ${version} (release)..."
+echo "Building FieldAssist ${version} (release)..."
 cargo build --release
 
-binary="$root/target/release/snd-review"
+binary="$root/target/release/FieldAssist"
 if [[ ! -x "$binary" ]]; then
   echo "error: missing release binary: $binary" >&2
   exit 1
 fi
 
-app="$root/target/release/snd-review.app"
+app="$root/target/release/FieldAssist.app"
 contents="$app/Contents"
 macos_dir="$contents/MacOS"
 resources="$contents/Resources"
@@ -71,8 +71,8 @@ mkdir -p "$macos_dir" "$resources"
 
 sed "s/__VERSION__/${version}/g" "$root/macos/Info.plist" > "$contents/Info.plist"
 printf 'APPL????' > "$contents/PkgInfo"
-cp "$binary" "$macos_dir/snd-review"
-chmod +x "$macos_dir/snd-review"
+cp "$binary" "$macos_dir/FieldAssist"
+chmod +x "$macos_dir/FieldAssist"
 
 icon="$root/assets/app-icon/AppIcon.icns"
 if [[ ! -f "$icon" ]]; then
@@ -95,17 +95,17 @@ if [[ "$install" != true ]]; then
   exit 0
 fi
 
-app_dest="$HOME/Applications/snd-review.app"
+app_dest="$HOME/Applications/FieldAssist.app"
 bin_dir="$HOME/.local/bin"
-cli_link="$bin_dir/snd-review"
+cli_link="$bin_dir/FieldAssist"
 
 mkdir -p "$HOME/Applications" "$bin_dir"
 rm -rf "$app_dest"
 ditto "$app" "$app_dest"
-ln -sfn "$app_dest/Contents/MacOS/snd-review" "$cli_link"
+ln -sfn "$app_dest/Contents/MacOS/FieldAssist" "$cli_link"
 
 echo "Installed $app_dest"
-echo "Linked $cli_link -> $app_dest/Contents/MacOS/snd-review"
+echo "Linked $cli_link -> $app_dest/Contents/MacOS/FieldAssist"
 
 case ":$PATH:" in
   *":$bin_dir:"*)
