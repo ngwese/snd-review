@@ -1,6 +1,6 @@
 # Scripting
 
-FieldAssist embeds Lua 5.4. Scripts run in the **Script** panel (View → Script)
+FieldAssist embeds Lua 5.4. Scripts run in the **Script** panel (View → Show Script)
 and from `init.lua` in the app config directory:
 
 - macOS: `~/Library/Application Support/snd-review/init.lua`
@@ -208,7 +208,7 @@ Anywhere a channel scope is accepted (`select`, `add_region`, `selection.channel
 **Help:** `help.about`
 
 **View:** `view.fit_all`, `view.frame`, `view.zoom_in`, `view.zoom_out`,
-`view.explorer`, `view.history`, `view.script`
+`view.explorer`, `view.detail`, `view.script`
 
 **Transport:** `transport.home`, `transport.previous`, `transport.start`,
 `transport.play_pause`, `transport.stop`, `transport.next`, `transport.end`,

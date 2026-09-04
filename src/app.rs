@@ -36,7 +36,7 @@ use crate::commands::{
     MarkerTypeYellow, Open, Quit, Render as RenderFile, Save, SaveAs, SelectAll, SelectNone,
     TransportEnd, TransportHome, TransportLoop, TransportNext, TransportPlayPause,
     TransportPrevious, TransportStart, TransportStop, ViewExplorer, ViewFitAll, ViewFrame,
-    ViewHistory, ViewScript, ViewZoomIn, ViewZoomOut,
+    ViewDetail, ViewScript, ViewZoomIn, ViewZoomOut,
 };
 use crate::components::dock_skin::{CenterTabCloseHandler, CompactDockSkin};
 use crate::components::edits::EditsPanel;
@@ -232,8 +232,8 @@ impl AppView {
             area.set_dock(
                 DockPlacement::Right,
                 DockLayout::tabs()
-                    .panel_view(edits_handle, cx)
-                    .panel_view(markers_handle, cx),
+                    .panel_view(markers_handle, cx)
+                    .panel_view(edits_handle, cx),
                 window,
                 cx,
             );
@@ -681,7 +681,7 @@ impl AppView {
         cx.notify();
     }
 
-    fn toggle_edits_dock(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    fn toggle_detail_dock(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.dock_area.update(cx, |area, cx| {
             area.toggle_dock(DockPlacement::Right, window, cx);
         });
@@ -697,7 +697,7 @@ impl AppView {
         cx.notify();
     }
 
-    fn edits_dock_open(&self, cx: &App) -> bool {
+    fn detail_dock_open(&self, cx: &App) -> bool {
         self.dock_area.read(cx).is_dock_open(DockPlacement::Right)
     }
 
@@ -720,7 +720,7 @@ impl AppView {
     fn sync_view_menus(&self, cx: &mut Context<Self>) {
         apply_app_menus(
             self.explorer_dock_open(cx),
-            self.edits_dock_open(cx),
+            self.detail_dock_open(cx),
             self.script_dock_open(cx),
             &self.active_marker_type,
             self.add_marker_at_hover,
@@ -942,7 +942,7 @@ impl AppView {
                 }
             }
             "view.explorer" => self.toggle_explorer_dock(window, cx),
-            "view.history" => self.toggle_edits_dock(window, cx),
+            "view.detail" => self.toggle_detail_dock(window, cx),
             "view.script" => self.toggle_script_dock(window, cx),
             "edit.undo" => self.run_edit(cx, |doc| {
                 doc.edit_undo();
@@ -1746,16 +1746,16 @@ impl Render for AppView {
         } else {
             "Show Script"
         };
-        let edits_open = self.edits_dock_open(cx);
-        let edits_icon = if edits_open {
+        let detail_open = self.detail_dock_open(cx);
+        let detail_icon = if detail_open {
             IconName::PanelRight
         } else {
             IconName::PanelRightOpen
         };
-        let edits_tooltip = if edits_open {
-            "Hide History"
+        let detail_tooltip = if detail_open {
+            "Hide Detail"
         } else {
-            "Show History"
+            "Show Detail"
         };
 
         div()
@@ -1846,15 +1846,15 @@ impl Render for AppView {
                                                     )),
                                             )
                                             .child(
-                                                Button::new("toggle-edits-dock")
+                                                Button::new("toggle-detail-dock")
                                                     .ghost()
                                                     .small()
-                                                    .icon(edits_icon)
-                                                    .tooltip(edits_tooltip)
-                                                    .selected(edits_open)
+                                                    .icon(detail_icon)
+                                                    .tooltip(detail_tooltip)
+                                                    .selected(detail_open)
                                                     .on_click(cx.listener(
                                                         |this, _, window, cx| {
-                                                            this.toggle_edits_dock(window, cx);
+                                                            this.toggle_detail_dock(window, cx);
                                                         },
                                                     )),
                                             ),
@@ -2004,8 +2004,8 @@ fn view_explorer(_: &ViewExplorer, cx: &mut App) {
     let _ = crate::commands::dispatch("view.explorer", cx);
 }
 
-fn view_history(_: &ViewHistory, cx: &mut App) {
-    let _ = crate::commands::dispatch("view.history", cx);
+fn view_detail(_: &ViewDetail, cx: &mut App) {
+    let _ = crate::commands::dispatch("view.detail", cx);
 }
 
 fn view_script(_: &ViewScript, cx: &mut App) {
@@ -2094,7 +2094,7 @@ fn delete_marker(_: &DeleteMarker, cx: &mut App) {
 
 fn app_menus(
     explorer: bool,
-    history: bool,
+    detail: bool,
     script: bool,
     marker_type: &str,
     add_at_hover: bool,
@@ -2146,9 +2146,9 @@ fn app_menus(
             MenuItem::action("Delete Marker", DeleteMarker),
         ]),
         Menu::new("View").items([
-            MenuItem::action("Explorer", ViewExplorer).checked(explorer),
-            MenuItem::action("History", ViewHistory).checked(history),
-            MenuItem::action("Script", ViewScript).checked(script),
+            MenuItem::action("Show Explorer", ViewExplorer).checked(explorer),
+            MenuItem::action("Show Detail", ViewDetail).checked(detail),
+            MenuItem::action("Show Script", ViewScript).checked(script),
             MenuItem::separator(),
             MenuItem::action("Zoom In", ViewZoomIn),
             MenuItem::action("Zoom Out", ViewZoomOut),
@@ -2160,7 +2160,7 @@ fn app_menus(
 
 fn apply_app_menus(
     explorer: bool,
-    history: bool,
+    detail: bool,
     script: bool,
     marker_type: &str,
     add_at_hover: bool,
@@ -2168,12 +2168,12 @@ fn apply_app_menus(
 ) {
     cx.set_menus(app_menus(
         explorer,
-        history,
+        detail,
         script,
         marker_type,
         add_at_hover,
     ));
-    let owned = app_menus(explorer, history, script, marker_type, add_at_hover)
+    let owned = app_menus(explorer, detail, script, marker_type, add_at_hover)
         .into_iter()
         .map(|menu| menu.owned())
         .collect();
@@ -2201,7 +2201,7 @@ fn install_app_menu(cx: &mut App) {
     cx.on_action(view_zoom_in);
     cx.on_action(view_zoom_out);
     cx.on_action(view_explorer);
-    cx.on_action(view_history);
+    cx.on_action(view_detail);
     cx.on_action(view_script);
     cx.on_action(edit_undo);
     cx.on_action(edit_redo);

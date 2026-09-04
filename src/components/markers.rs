@@ -139,7 +139,7 @@ impl BasePanel for MarkersPanel {
 
 impl Panel for MarkersPanel {
     fn title(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-        "Markers"
+        "Marker"
     }
 
     fn inner_padding(&self, _: &App) -> bool {
