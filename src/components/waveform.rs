@@ -1189,7 +1189,7 @@ impl Render for WaveformDisplay {
                             } else {
                                 ZOOM_FACTOR
                             };
-                            let anchor = this.anchor_sample(cx);
+                            let anchor = this.sample_at_x(event.position.x.as_f32());
                             this.zoom_at(factor, anchor, cx);
                         } else {
                             let pan = if dx.abs() > dy.abs() { dx } else { dy };
