@@ -1,6 +1,6 @@
 # Scripting
 
-snd-review embeds Lua 5.4. Scripts run in the **Script** panel (View → Script)
+FieldAssist embeds Lua 5.4. Scripts run in the **Script** panel (View → Script)
 and from `init.lua` in the app config directory:
 
 - macOS: `~/Library/Application Support/snd-review/init.lua`
@@ -202,7 +202,8 @@ Anywhere a channel scope is accepted (`select`, `add_region`, `selection.channel
 
 `app:command(id)` runs the same actions as menus and key bindings:
 
-**File:** `file.open`, `file.save`, `file.save_as`, `file.render`, `file.quit`
+**File:** `file.open`, `file.save`, `file.save_as`, `file.close`, `file.render`,
+`file.quit`
 
 **Help:** `help.about`
 

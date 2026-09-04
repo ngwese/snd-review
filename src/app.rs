@@ -17,6 +17,7 @@ use gpui::{
 };
 use gpui_component::{
     button::{Button, ButtonVariants as _},
+    dialog::DialogFooter,
     dock::{
         panel_handle, DockArea, DockEvent, DockLayout, DockPlacement, InsertTarget, NodeId,
         PaneRef, PanelId, PanelStyle,
@@ -29,13 +30,13 @@ use gpui_component::{
 
 use crate::assets::AppAssets;
 use crate::commands::{
-    install_keybindings, About, AddMarker, AddMarkerAtHover, DeleteMarker, EditCopy, EditCut,
-    EditDelete, EditDuplicate, EditPaste, EditRedo, EditRemove, EditRollLeft, EditRollRight,
-    EditTrim, EditUndo, InvertSelection, MarkerTypeBlue, MarkerTypePurple, MarkerTypeYellow, Open,
-    Quit, Render as RenderFile, Save, SaveAs, SelectAll, SelectNone, TransportEnd, TransportHome,
-    TransportLoop, TransportNext, TransportPlayPause, TransportPrevious, TransportStart,
-    TransportStop, ViewExplorer, ViewFitAll, ViewFrame, ViewHistory, ViewScript, ViewZoomIn,
-    ViewZoomOut,
+    install_keybindings, About, AddMarker, AddMarkerAtHover, Close, DeleteMarker, EditCopy,
+    EditCut, EditDelete, EditDuplicate, EditPaste, EditRedo, EditRemove, EditRollLeft,
+    EditRollRight, EditTrim, EditUndo, InvertSelection, MarkerTypeBlue, MarkerTypePurple,
+    MarkerTypeYellow, Open, Quit, Render as RenderFile, Save, SaveAs, SelectAll, SelectNone,
+    TransportEnd, TransportHome, TransportLoop, TransportNext, TransportPlayPause,
+    TransportPrevious, TransportStart, TransportStop, ViewExplorer, ViewFitAll, ViewFrame,
+    ViewHistory, ViewScript, ViewZoomIn, ViewZoomOut,
 };
 use crate::components::dock_skin::{CenterTabCloseHandler, CompactDockSkin};
 use crate::components::edits::EditsPanel;
@@ -43,6 +44,7 @@ use crate::components::empty_pane::EmptyPane;
 use crate::components::explorer::{ExplorerEvent, ExplorerPanel};
 use crate::components::header_meta::HeaderMeta;
 use crate::components::markers::MarkersPanel;
+use crate::components::quit_unsaved::{QuitUnsavedAction, QuitUnsavedList};
 use crate::components::render_sheet::RenderSheet;
 use crate::components::repl::ReplPanel;
 use crate::components::status_bar::{FileStatus, FileStatusBar};
@@ -70,6 +72,13 @@ struct DocumentViews {
     workspace: Entity<WorkspacePanel>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AfterWrite {
+    None,
+    Close,
+    ContinueQuit,
+}
+
 pub struct AppView {
     session: DocumentSession,
     views: HashMap<DocumentId, DocumentViews>,
@@ -90,6 +99,7 @@ pub struct AppView {
     pending_loaded_scripts: Vec<DocumentId>,
     render_sheet: Entity<RenderSheet>,
     render_sheet_open: bool,
+    quit_save_queue: Vec<DocumentId>,
     focus_handle: FocusHandle,
     last_progress: Option<ProgressState>,
     script_dock_size: Pixels,
@@ -264,6 +274,7 @@ impl AppView {
             pending_loaded_scripts: Vec::new(),
             render_sheet,
             render_sheet_open: false,
+            quit_save_queue: Vec::new(),
             focus_handle: cx.focus_handle(),
             last_progress: None,
             script_dock_size: px(160.),
@@ -345,7 +356,7 @@ impl AppView {
         self.views
             .get(&id)
             .map(|views| Self::composition_title(&views.composition.read().unwrap()))
-            .unwrap_or_else(|| "snd-review".into())
+            .unwrap_or_else(|| crate::APP_NAME.into())
     }
 
     fn refresh_explorer(&self, cx: &mut Context<Self>) {
@@ -357,7 +368,7 @@ impl AppView {
                 let modified = self
                     .views
                     .get(&doc.id)
-                    .is_some_and(|views| views.composition.read().unwrap().edit_cursor() > 0);
+                    .is_some_and(|views| views.composition.read().unwrap().is_modified());
                 (doc.id, self.display_title(doc.id, cx), modified)
             })
             .collect();
@@ -372,7 +383,7 @@ impl AppView {
             .session
             .active()
             .map(|id| self.display_title(id, cx))
-            .unwrap_or_else(|| "snd-review".into());
+            .unwrap_or_else(|| crate::APP_NAME.into());
         window.set_window_title(&title);
     }
 
@@ -631,7 +642,7 @@ impl AppView {
             ExplorerEvent::Activate(id) | ExplorerEvent::OpenTab(id) => {
                 self.ensure_tab(id, window, cx);
             }
-            ExplorerEvent::Close(id) => self.close_document(id, window, cx),
+            ExplorerEvent::Close(id) => self.request_close_document(id, window, cx),
         }
     }
 
@@ -874,17 +885,10 @@ impl AppView {
             "file.open" => self.prompt_open_file(window, cx),
             "file.save" => self.save_active(window, cx),
             "file.save_as" => self.prompt_save_as(window, cx),
+            "file.close" => self.request_close_active(window, cx),
             "file.render" => self.open_render_sheet(window, cx),
-            "file.quit" => cx.quit(),
-            "help.about" => {
-                window.open_alert_dialog(cx, |alert, _, _| {
-                    alert.title("About snd-review").description(format!(
-                        "{}\n\nVersion {}",
-                        env!("CARGO_PKG_DESCRIPTION"),
-                        env!("CARGO_PKG_VERSION"),
-                    ))
-                });
-            }
+            "file.quit" => self.request_quit(window, cx),
+            "help.about" => self.show_about(window, cx),
             "transport.home" => {
                 self.playback.home();
                 self.sync_playback_to_document(cx);
@@ -1122,7 +1126,7 @@ impl AppView {
             .get(id)
             .and_then(|doc| doc.project_path.clone())
         {
-            self.write_project(id, path, window, cx);
+            self.write_project(id, path, AfterWrite::None, window, cx);
         } else {
             self.prompt_save_as(window, cx);
         }
@@ -1133,6 +1137,20 @@ impl AppView {
             self.show_save_error("No composition is open.", window, cx);
             return;
         };
+        self.prompt_save_as_for(id, AfterWrite::None, window, cx);
+    }
+
+    fn prompt_save_as_for(
+        &mut self,
+        id: DocumentId,
+        after: AfterWrite,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.session.get(id).is_none() {
+            self.show_save_error("Composition is not open.", window, cx);
+            return;
+        }
         let directory = self.suggested_save_directory(id, cx);
         let suggested = self
             .views
@@ -1144,11 +1162,20 @@ impl AppView {
         cx.spawn_in(window, async move |_, cx| {
             let path = match receiver.await {
                 Ok(Ok(Some(path))) => path,
-                _ => return,
+                _ => {
+                    if after == AfterWrite::ContinueQuit {
+                        let _ = cx.update(|_, cx| {
+                            view.update(cx, |this, _| {
+                                this.quit_save_queue.clear();
+                            });
+                        });
+                    }
+                    return;
+                }
             };
             let _ = cx.update(|window, cx| {
                 view.update(cx, |this, cx| {
-                    this.write_project(id, path, window, cx);
+                    this.write_project(id, path, after, window, cx);
                 });
             });
         })
@@ -1159,25 +1186,262 @@ impl AppView {
         &mut self,
         id: DocumentId,
         path: PathBuf,
+        after: AfterWrite,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let Some(views) = self.views.get(&id) else {
             self.show_save_error("Composition is not open.", window, cx);
+            if after == AfterWrite::ContinueQuit {
+                self.quit_save_queue.clear();
+            }
             return;
         };
-        let result = views.composition.read().unwrap().save_to_path(&path);
+        let result = views.composition.write().unwrap().save_to_path(&path);
         match result {
             Ok(()) => {
                 if let Some(doc) = self.session.get_mut(id) {
                     doc.project_path = Some(path);
                 }
-                self.refresh_explorer(cx);
-                self.update_window_title(window, cx);
-                cx.notify();
+                match after {
+                    AfterWrite::None => {
+                        self.refresh_explorer(cx);
+                        self.update_window_title(window, cx);
+                        cx.notify();
+                    }
+                    AfterWrite::Close => self.close_document(id, window, cx),
+                    AfterWrite::ContinueQuit => {
+                        self.quit_save_queue.retain(|queued| *queued != id);
+                        self.refresh_explorer(cx);
+                        self.update_window_title(window, cx);
+                        self.pump_quit_saves(window, cx);
+                    }
+                }
             }
-            Err(err) => self.show_save_error(&format!("{err:#}"), window, cx),
+            Err(err) => {
+                if after == AfterWrite::ContinueQuit {
+                    self.quit_save_queue.clear();
+                }
+                self.show_save_error(&format!("{err:#}"), window, cx);
+            }
         }
+    }
+
+    fn request_close_active(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(id) = self.session.active() else {
+            return;
+        };
+        self.request_close_document(id, window, cx);
+    }
+
+    fn request_close_document(
+        &mut self,
+        id: DocumentId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.session.get(id).is_none() {
+            return;
+        }
+        let modified = self
+            .views
+            .get(&id)
+            .is_some_and(|views| views.composition.read().unwrap().is_modified());
+        if !modified {
+            self.close_document(id, window, cx);
+            return;
+        }
+        self.prompt_unsaved_close(id, window, cx);
+    }
+
+    fn prompt_unsaved_close(
+        &mut self,
+        id: DocumentId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let name = self.display_title(id, cx);
+        let view = cx.entity();
+        window.open_alert_dialog(cx, move |alert, _, _| {
+            alert
+                .title("Unsaved changes")
+                .description(format!("Save changes to {name} before closing?"))
+                .footer(
+                    DialogFooter::new()
+                        .child(
+                            Button::new("close-dont-save")
+                                .outline()
+                                .label("Don't Save")
+                                .on_click({
+                                    let view = view.clone();
+                                    move |_, window, cx| {
+                                        window.close_dialog(cx);
+                                        view.update(cx, |this, cx| {
+                                            this.close_document(id, window, cx);
+                                        });
+                                    }
+                                }),
+                        )
+                        .child(
+                            Button::new("close-cancel")
+                                .outline()
+                                .label("Cancel")
+                                .on_click(|_, window, cx| {
+                                    window.close_dialog(cx);
+                                }),
+                        )
+                        .child(Button::new("close-save").primary().label("Save").on_click({
+                            let view = view.clone();
+                            move |_, window, cx| {
+                                window.close_dialog(cx);
+                                view.update(cx, |this, cx| {
+                                    this.save_then_close(id, window, cx);
+                                });
+                            }
+                        })),
+                )
+        });
+    }
+
+    fn save_then_close(&mut self, id: DocumentId, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(path) = self
+            .session
+            .get(id)
+            .and_then(|doc| doc.project_path.clone())
+        {
+            self.write_project(id, path, AfterWrite::Close, window, cx);
+        } else {
+            self.prompt_save_as_for(id, AfterWrite::Close, window, cx);
+        }
+    }
+
+    fn modified_compositions(&self, cx: &App) -> Vec<(DocumentId, SharedString)> {
+        self.session
+            .documents()
+            .iter()
+            .filter_map(|doc| {
+                let modified = self
+                    .views
+                    .get(&doc.id)
+                    .is_some_and(|views| views.composition.read().unwrap().is_modified());
+                modified.then(|| (doc.id, self.display_title(doc.id, cx)))
+            })
+            .collect()
+    }
+
+    fn request_quit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let modified = self.modified_compositions(cx);
+        if modified.is_empty() {
+            cx.quit();
+            return;
+        }
+        self.prompt_quit_unsaved(modified, window, cx);
+    }
+
+    fn prompt_quit_unsaved(
+        &mut self,
+        items: Vec<(DocumentId, SharedString)>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let list = cx.new(|cx| QuitUnsavedList::new(items, cx));
+        let view = cx.entity();
+        list.update(cx, |list, _| {
+            let view = view.clone();
+            list.set_handler(Rc::new(move |action, ids, window, cx| {
+                window.close_dialog(cx);
+                let _ = view.update(cx, |this, cx| match action {
+                    QuitUnsavedAction::Discard => cx.quit(),
+                    QuitUnsavedAction::SaveAll | QuitUnsavedAction::SaveSelected => {
+                        this.start_quit_saves(ids, window, cx);
+                    }
+                });
+            }));
+        });
+        window.open_alert_dialog(cx, move |alert, _, _| {
+            alert
+                .title("Unsaved changes")
+                .description("Save changes to these compositions before quitting?")
+                .width(px(520.))
+                .child(list.clone())
+                .footer(div())
+        });
+    }
+
+    fn start_quit_saves(
+        &mut self,
+        ids: Vec<DocumentId>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.quit_save_queue = ids;
+        self.pump_quit_saves(window, cx);
+    }
+
+    fn pump_quit_saves(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        loop {
+            let Some(id) = self.quit_save_queue.first().copied() else {
+                cx.quit();
+                return;
+            };
+            if self.session.get(id).is_none() {
+                self.quit_save_queue.remove(0);
+                continue;
+            }
+            if let Some(path) = self
+                .session
+                .get(id)
+                .and_then(|doc| doc.project_path.clone())
+            {
+                self.write_project(id, path, AfterWrite::ContinueQuit, window, cx);
+                return;
+            }
+            self.prompt_save_as_for(id, AfterWrite::ContinueQuit, window, cx);
+            return;
+        }
+    }
+
+    fn show_about(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        window.open_alert_dialog(cx, |alert, _, cx| {
+            let muted = cx.theme().muted_foreground;
+            alert.width(px(460.)).child(
+                v_flex()
+                    .w_full()
+                    .gap_4()
+                    .child(
+                        h_flex()
+                            .w_full()
+                            .items_start()
+                            .gap_3()
+                            .child(img("icons/app-mark.svg").size(px(128.)).flex_none())
+                            .child(
+                                v_flex()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .gap_1()
+                                    .child(div().font_semibold().text_lg().child(crate::APP_NAME))
+                                    .child(
+                                        div().text_sm().text_color(muted).child(format!(
+                                            "Version {}",
+                                            env!("CARGO_PKG_VERSION")
+                                        )),
+                                    ),
+                            ),
+                    )
+                    .child(
+                        v_flex()
+                            .w_full()
+                            .gap_1()
+                            .child(div().child(env!("CARGO_PKG_DESCRIPTION")))
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .text_color(muted)
+                                    .child(crate::APP_COPYRIGHT),
+                            ),
+                    ),
+            )
+        });
     }
 
     fn open_render_sheet(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1527,9 +1791,7 @@ impl Render for AppView {
                                 .items_center()
                                 .gap_2()
                                 .when(!cfg!(target_os = "macos"), |this| {
-                                    this.child(
-                                        img("icons/app-mark.svg").size(px(16.)).flex_none(),
-                                    )
+                                    this.child(img("icons/app-mark.svg").size(px(16.)).flex_none())
                                 })
                                 .when_some(self.app_menu_bar.clone(), |this, menu_bar| {
                                     this.child(menu_bar)
@@ -1641,11 +1903,11 @@ impl AppView {
 }
 
 pub(crate) fn dispatch_command(command_id: &str, cx: &mut App) -> Result<(), String> {
-    if command_id == "file.quit" {
-        cx.quit();
-        return Ok(());
-    }
     let Some(view) = cx.try_global::<OpenTarget>().map(|target| target.0.clone()) else {
+        if command_id == "file.quit" {
+            cx.quit();
+            return Ok(());
+        }
         return Err("application is not ready".into());
     };
     let Some(window) = cx.active_window() else {
@@ -1676,6 +1938,10 @@ fn save(_: &Save, cx: &mut App) {
 
 fn save_as(_: &SaveAs, cx: &mut App) {
     let _ = crate::commands::dispatch("file.save_as", cx);
+}
+
+fn close(_: &Close, cx: &mut App) {
+    let _ = crate::commands::dispatch("file.close", cx);
 }
 
 fn render_cmd(_: &RenderFile, cx: &mut App) {
@@ -1838,6 +2104,7 @@ fn app_menus(
             MenuItem::action("Open...", Open),
             MenuItem::action("Save", Save),
             MenuItem::action("Save As...", SaveAs),
+            MenuItem::action("Close", Close),
             MenuItem::separator(),
             MenuItem::action("Render...", RenderFile),
             MenuItem::separator(),
@@ -1917,6 +2184,7 @@ fn install_app_menu(cx: &mut App) {
     cx.on_action(open);
     cx.on_action(save);
     cx.on_action(save_as);
+    cx.on_action(close);
     cx.on_action(render_cmd);
     cx.on_action(quit);
     cx.on_action(about);

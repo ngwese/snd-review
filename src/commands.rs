@@ -13,6 +13,7 @@ actions!(
         Open,
         Save,
         SaveAs,
+        Close,
         Render,
         About,
         Quit,
@@ -70,6 +71,7 @@ const KNOWN_COMMANDS: &[&str] = &[
     "file.open",
     "file.save",
     "file.save_as",
+    "file.close",
     "file.render",
     "file.quit",
     "help.about",
@@ -306,6 +308,7 @@ fn binding_in(command_id: &str, keystrokes: &str, context: &str) -> Option<KeyBi
         "file.open" => KeyBinding::new(keystrokes, Open, Some(context)),
         "file.save" => KeyBinding::new(keystrokes, Save, Some(context)),
         "file.save_as" => KeyBinding::new(keystrokes, SaveAs, Some(context)),
+        "file.close" => KeyBinding::new(keystrokes, Close, Some(context)),
         "file.render" => KeyBinding::new(keystrokes, Render, Some(context)),
         "file.quit" => KeyBinding::new(keystrokes, Quit, Some(context)),
         "help.about" => KeyBinding::new(keystrokes, About, Some(context)),
@@ -421,6 +424,7 @@ mod tests {
             map.get("cmd-shift-s").map(String::as_str),
             Some("file.save_as")
         );
+        assert_eq!(map.get("cmd-w").map(String::as_str), Some("file.close"));
         assert_eq!(map.get("cmd-z").map(String::as_str), Some("edit.undo"));
         assert_eq!(map.get("cmd-x").map(String::as_str), Some("edit.cut"));
         assert_eq!(map.get("cmd-c").map(String::as_str), Some("edit.copy"));
