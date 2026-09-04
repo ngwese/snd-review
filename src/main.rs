@@ -8,6 +8,9 @@ use std::path::PathBuf;
 use anyhow::{Context as _, Result};
 use clap::Parser;
 
+pub const APP_NAME: &str = "FieldAssist";
+pub const APP_COPYRIGHT: &str = "Copyright © 2026 Greg Wuller";
+
 mod app;
 mod assets;
 mod audio;
@@ -22,8 +25,8 @@ mod session;
 
 #[derive(Parser, Debug)]
 #[command(
-    name = "snd-review",
-    about = "Display an audio file as a scrollable, zoomable multi-channel waveform",
+    name = env!("CARGO_PKG_NAME"),
+    about = env!("CARGO_PKG_DESCRIPTION"),
     after_help = "Supports WAV, FLAC, MP3, OGG, M4A, and other formats enabled by Symphonia."
 )]
 struct Args {

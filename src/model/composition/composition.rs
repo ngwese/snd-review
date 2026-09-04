@@ -8,7 +8,7 @@ use anyhow::{bail, Context, Result};
 
 use super::clip::{Clip, ClipId, ClipSpan};
 use super::edl::{EditId, EditOp, Edl, InitialState, ProjectEnvelope, ProjectFile};
-use super::markers::{MarkerId, MarkerList};
+use super::markers::{Marker, MarkerId, MarkerList};
 use super::media::{MediaId, MediaPool, MediaRef};
 use super::pager::BlockPager;
 use super::tree::ClipTree;
@@ -43,12 +43,14 @@ pub struct Composition {
     clipboard: Clipboard,
     initial: InitialState,
     markers: MarkerList,
+    clean_edit_id: EditId,
+    clean_markers: Vec<Marker>,
 }
 
 impl Composition {
     pub fn new(sample_rate: u32, channel_count: usize) -> Self {
         let tree = ClipTree::empty();
-        Self {
+        let mut composition = Self {
             sample_rate,
             channel_count,
             edl: Edl::new(tree.clone()),
@@ -63,7 +65,11 @@ impl Composition {
             },
             initial: InitialState::Empty,
             markers: MarkerList::new(),
-        }
+            clean_edit_id: EditId(0),
+            clean_markers: Vec::new(),
+        };
+        composition.mark_clean();
+        composition
     }
 
     pub fn from_media(media: MediaRef) -> Result<Self> {
@@ -99,6 +105,8 @@ impl Composition {
                 media_id: media_id.0,
             },
             markers: MarkerList::new(),
+            clean_edit_id: EditId(0),
+            clean_markers: Vec::new(),
         };
         let peaked = composed
             .pool
@@ -108,6 +116,7 @@ impl Composition {
             composed.ensure_clip_peaks().ok();
             composed.edl = Edl::new(composed.tree.clone());
         }
+        composed.mark_clean();
         Ok(composed)
     }
 
@@ -192,8 +201,19 @@ impl Composition {
         format!("{}.facomp", self.display_name())
     }
 
-    pub fn save_to_path(&self, path: &Path) -> Result<()> {
-        write_atomic(path, &self.to_json()?)
+    pub fn save_to_path(&mut self, path: &Path) -> Result<()> {
+        write_atomic(path, &self.to_json()?)?;
+        self.mark_clean();
+        Ok(())
+    }
+
+    pub fn is_modified(&self) -> bool {
+        self.edl.current_id() != self.clean_edit_id || self.markers.to_vec() != self.clean_markers
+    }
+
+    fn mark_clean(&mut self) {
+        self.clean_edit_id = self.edl.current_id();
+        self.clean_markers = self.markers.to_vec();
     }
 
     pub fn with_spill_dir(mut self, dir: impl AsRef<Path>) -> Result<Self> {
@@ -207,7 +227,7 @@ impl Composition {
             .and_then(|media| media.path.file_name())
             .map(|name| name.to_string_lossy().into_owned())
             .filter(|name| !name.is_empty())
-            .unwrap_or_else(|| "snd-review".into())
+            .unwrap_or_else(|| crate::APP_NAME.into())
     }
 
     pub fn sample_rate(&self) -> u32 {
@@ -1102,6 +1122,7 @@ impl Composition {
             composition.adopt_tree(tree);
         }
         composition.markers = MarkerList::from_vec(file.markers);
+        composition.mark_clean();
         Ok(composition)
     }
 
@@ -1312,6 +1333,7 @@ impl Iterator for FramesIter<'_> {
 
 #[cfg(test)]
 mod tests {
+    use super::super::markers::{marker_type_color, MARKER_TYPE_BLUE};
     use super::*;
 
     fn sine_media(frames: usize, channels: usize, rate: u32) -> MediaRef {
@@ -1463,6 +1485,68 @@ mod tests {
         assert_eq!(comp.frames(), frames);
         assert!(comp.clip_at(0).is_some());
         assert!(!comp.clip_at(0).unwrap().clip.cache.peaks.is_empty());
+    }
+
+    #[test]
+    fn new_composition_is_clean() {
+        let comp = Composition::new(44100, 2);
+        assert!(!comp.is_modified());
+        let from_media = Composition::from_media(sine_media(12, 1, 44100)).unwrap();
+        assert!(!from_media.is_modified());
+    }
+
+    #[test]
+    fn edit_then_undo_to_init_is_clean() {
+        let mut comp = Composition::from_media(sine_media(12, 1, 44100)).unwrap();
+        assert!(!comp.is_modified());
+        comp.remove(2, 4);
+        assert!(comp.is_modified());
+        assert!(comp.undo());
+        assert!(!comp.is_modified());
+    }
+
+    #[test]
+    fn load_with_history_is_clean_until_edited() {
+        let mut live = Composition::from_media(sine_media(12, 1, 44100)).unwrap();
+        live.remove(2, 2);
+        assert!(live.edit_cursor() > 0);
+        let json = live.to_json().unwrap();
+        let mut restored = Composition::from_json(&json).unwrap();
+        assert!(restored.edit_cursor() > 0);
+        assert!(!restored.is_modified());
+        restored.remove(0, 1);
+        assert!(restored.is_modified());
+        assert!(restored.undo());
+        assert!(!restored.is_modified());
+    }
+
+    #[test]
+    fn marker_add_and_remove_are_dirty() {
+        let mut comp = Composition::from_media(sine_media(12, 1, 44100)).unwrap();
+        let color = marker_type_color(MARKER_TYPE_BLUE).unwrap();
+        let id = comp.add_marker(0, MARKER_TYPE_BLUE, color, None).unwrap();
+        assert!(comp.is_modified());
+        assert!(comp.remove_marker(id));
+        assert!(!comp.is_modified());
+        comp.add_marker(4, MARKER_TYPE_BLUE, color, None);
+        assert!(comp.is_modified());
+    }
+
+    #[test]
+    fn save_clears_dirty() {
+        let mut live = Composition::from_media(sine_media(12, 1, 44100)).unwrap();
+        live.remove(2, 2);
+        live.add_marker(
+            0,
+            MARKER_TYPE_BLUE,
+            marker_type_color(MARKER_TYPE_BLUE).unwrap(),
+            None,
+        );
+        assert!(live.is_modified());
+        let path = std::env::temp_dir().join("snd-composition-dirty-save.facomp");
+        live.save_to_path(&path).unwrap();
+        assert!(!live.is_modified());
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
