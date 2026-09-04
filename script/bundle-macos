@@ -74,6 +74,13 @@ printf 'APPL????' > "$contents/PkgInfo"
 cp "$binary" "$macos_dir/snd-review"
 chmod +x "$macos_dir/snd-review"
 
+icon="$root/assets/app-icon/AppIcon.icns"
+if [[ ! -f "$icon" ]]; then
+  echo "error: missing $icon; run python script/generate-app-icon.py" >&2
+  exit 1
+fi
+cp "$icon" "$resources/AppIcon.icns"
+
 if ! plutil -lint "$contents/Info.plist" >/dev/null; then
   echo "error: generated Info.plist is invalid" >&2
   exit 1

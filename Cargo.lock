@@ -6600,6 +6600,7 @@ dependencies = [
  "anyhow",
  "clap",
  "cpal",
+ "embed-resource",
  "flacenc",
  "gpui",
  "gpui-component",

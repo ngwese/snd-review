@@ -101,6 +101,7 @@ $shortcut = $wsh.CreateShortcut($shortcutPath)
 $shortcut.TargetPath = $appDest
 $shortcut.WorkingDirectory = $appDestDir
 $shortcut.Description = "Scrollable, zoomable multi-channel waveform display"
+$shortcut.IconLocation = "$appDest,0"
 $shortcut.Save()
 
 Write-Host "Installed $appDest"

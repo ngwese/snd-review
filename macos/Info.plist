@@ -8,6 +8,8 @@
 	<string>snd-review</string>
 	<key>CFBundleExecutable</key>
 	<string>snd-review</string>
+	<key>CFBundleIconFile</key>
+	<string>AppIcon</string>
 	<key>CFBundleIdentifier</key>
 	<string>com.afofo.app.snd-review</string>
 	<key>CFBundleInfoDictionaryVersion</key>

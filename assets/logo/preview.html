@@ -1,0 +1,187 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>FieldAssist logo studies</title>
+    <style>
+      :root {
+        --light-bg: #f2f2f2;
+        --light-fg: #111111;
+        --dark-bg: #222222;
+        --dark-fg: #f2f2f2;
+        --rule: #7a7a7a;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        font-family: ui-sans-serif, system-ui, sans-serif;
+        color: var(--light-fg);
+        background: #d8d8d8;
+      }
+
+      header {
+        padding: 32px 24px 8px;
+        max-width: 1100px;
+        margin: 0 auto;
+      }
+
+      h1 {
+        margin: 0 0 8px;
+        font-size: 1.35rem;
+        font-weight: 600;
+      }
+
+      p {
+        margin: 0;
+        color: #3a3a3a;
+        max-width: 42rem;
+        line-height: 1.45;
+      }
+
+      .variant {
+        margin: 24px auto;
+        max-width: 1100px;
+        padding: 0 24px 32px;
+      }
+
+      .variant h2 {
+        margin: 0 0 4px;
+        font-size: 1rem;
+        font-weight: 600;
+      }
+
+      .variant .file {
+        margin: 0 0 12px;
+        font-size: 0.8rem;
+        color: #3a3a3a;
+        font-family: ui-monospace, monospace;
+      }
+
+      .boards {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 12px;
+      }
+
+      .board {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: end;
+        gap: 28px;
+        padding: 28px;
+        border-radius: 12px;
+      }
+
+      .board.light {
+        background: var(--light-bg);
+        color: var(--light-fg);
+      }
+
+      .board.dark {
+        background: var(--dark-bg);
+        color: var(--dark-fg);
+      }
+
+      .board.dark img.current-color {
+        filter: invert(1);
+      }
+
+      .mark {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        gap: 8px;
+      }
+
+      .mark img,
+      .mark svg {
+        display: block;
+      }
+
+      .mark span {
+        font-size: 0.7rem;
+        letter-spacing: 0.04em;
+        text-transform: uppercase;
+        color: var(--rule);
+      }
+
+      @media (max-width: 720px) {
+        .boards {
+          grid-template-columns: 1fr;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <header>
+      <h1>FieldAssist logo studies</h1>
+      <p>
+        Shared outer circle and two-wave geometry. Lower path stays nearly
+        horizontal; upper path rises to the right. Grayscale only. The live
+        title-bar mark is unchanged.
+      </p>
+    </header>
+
+    <section class="variant" data-file="01-stroke.svg" data-current-color="true">
+      <h2>01 Stroke</h2>
+      <p class="file">01-stroke.svg — currentColor ring and waves</p>
+      <div class="boards"></div>
+    </section>
+    <section class="variant" data-file="03-negative.svg">
+      <h2>03 Negative space</h2>
+      <p class="file">03-negative.svg — solid disc, waves cut out</p>
+      <div class="boards"></div>
+    </section>
+    <section class="variant" data-file="04-bands.svg">
+      <h2>04 Bands</h2>
+      <p class="file">04-bands.svg — two filled river channels</p>
+      <div class="boards"></div>
+    </section>
+    <section class="variant" data-file="05-gradient-disc.svg" data-current-color="true">
+      <h2>05 Wave gradient</h2>
+      <p class="file">05-gradient-disc.svg — ring, gradient on the waves</p>
+      <div class="boards"></div>
+    </section>
+    <section class="variant" data-file="06-flow-gradient.svg">
+      <h2>06 Flow waves</h2>
+      <p class="file">06-flow-gradient.svg — dark disc, flow gradient on the waves</p>
+      <div class="boards"></div>
+    </section>
+
+    <script>
+      const sizes = [24, 64, 256];
+
+      for (const section of document.querySelectorAll(".variant")) {
+        const file = section.dataset.file;
+        const currentColor = section.dataset.currentColor === "true";
+        const boards = section.querySelector(".boards");
+        for (const tone of ["light", "dark"]) {
+          const board = document.createElement("div");
+          board.className = `board ${tone}`;
+          for (const size of sizes) {
+            const mark = document.createElement("div");
+            mark.className = "mark";
+            const img = document.createElement("img");
+            img.src = file;
+            img.alt = `${file} at ${size}px`;
+            img.width = size;
+            img.height = size;
+            if (currentColor) {
+              img.className = "current-color";
+            }
+            const label = document.createElement("span");
+            label.textContent = `${size}px`;
+            mark.append(img, label);
+            board.append(mark);
+          }
+          boards.append(board);
+        }
+      }
+    </script>
+  </body>
+</html>

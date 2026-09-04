@@ -9,11 +9,11 @@ use std::time::Duration;
 
 use cpal::Device;
 use gpui::{
-    div, hsla, point, prelude::FluentBuilder as _, px, rems, size, App, AppContext as _, Bounds,
-    Context, Entity, ExternalPaths, FocusHandle, Focusable, Global, InteractiveElement as _,
-    IntoElement, KeyContext, Menu, MenuItem, ParentElement as _, PathPromptOptions, Pixels, Render,
-    SharedString, StatefulInteractiveElement as _, Styled as _, TitlebarOptions, WeakEntity,
-    Window, WindowBounds, WindowOptions,
+    div, hsla, img, point, prelude::FluentBuilder as _, px, rems, size, App, AppContext as _,
+    Bounds, Context, Entity, ExternalPaths, FocusHandle, Focusable, Global,
+    InteractiveElement as _, IntoElement, KeyContext, Menu, MenuItem, ParentElement as _,
+    PathPromptOptions, Pixels, Render, SharedString, StatefulInteractiveElement as _, Styled as _,
+    TitlebarOptions, WeakEntity, Window, WindowBounds, WindowOptions,
 };
 use gpui_component::{
     button::{Button, ButtonVariants as _},
@@ -23,7 +23,7 @@ use gpui_component::{
     },
     h_flex,
     menu::AppMenuBar,
-    v_flex, ActiveTheme as _, Disableable as _, GlobalState, Icon, IconName, Root, Selectable as _,
+    v_flex, ActiveTheme as _, Disableable as _, GlobalState, IconName, Root, Selectable as _,
     Sizable as _, StyledExt as _, Theme, ThemeMode, TitleBar, WindowExt as _,
 };
 
@@ -1528,10 +1528,7 @@ impl Render for AppView {
                                 .gap_2()
                                 .when(!cfg!(target_os = "macos"), |this| {
                                     this.child(
-                                        Icon::empty()
-                                            .path("icons/app-mark.svg")
-                                            .with_size(px(16.))
-                                            .text_color(theme.foreground),
+                                        img("icons/app-mark.svg").size(px(16.)).flex_none(),
                                     )
                                 })
                                 .when_some(self.app_menu_bar.clone(), |this, menu_bar| {
